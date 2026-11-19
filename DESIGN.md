@@ -575,7 +575,18 @@ df2bctl config check | reload
   admin token cannot plant replacements that outlive its revocation; tokens
   can list and revoke (also themselves). Tokens record their creator
   (`created_by`, absent for host-created ones). Audited without secrets.
-- Not yet: front-channel logout,
+- **Front-channel logout** (OIDC Front-Channel Logout 1.0, for providers
+  without back-channel logout): the provider's logout page loads
+  `/api/v1/oidc/frontchannel-logout?iss=&sid=` in an iframe. The request is
+  unauthenticated, so it needs the exact issuer and ends only sessions with
+  that `sid` (the provider must send it: "session required"); the session
+  cookie (SameSite=Strict) is not sent in the frame and not needed. This
+  one response carries `frame-ancestors <issuer origin>` instead of
+  `'none'` and no `X-Frame-Options` (the middleware leaves handlers' own
+  CSP alone), plus `Cache-Control: no-cache, no-store`. Only effective
+  logouts are audited, so junk requests cannot fill the audit log. The
+  provider's logout page must be served from the issuer's origin.
+- Not yet:
   observation timelines and sample log lines (needs observation reporting),
   ASN/GeoIP, "allow for X" after unban, policies/jails and allowlist editing,
   changing an agent's group.

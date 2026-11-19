@@ -977,3 +977,89 @@ async fn junk_tokens_do_not_hammer_the_provider() {
     );
     let _ = std::fs::remove_dir_all(&e.dir);
 }
+
+#[tokio::test]
+async fn frontchannel_logout_by_sid() {
+    let e = env("fcl", |_| {}).await;
+    let user = |sid: &str| json!({ "sub": "alice", "sid": sid, "preferred_username": "alice", "groups": ["noc"] });
+    let (_, s1) = e.login(user("fc-1")).await;
+    let (_, s2) = e.login(user("fc-2")).await;
+    let (s1, s2) = (s1.unwrap(), s2.unwrap());
+    let fcl = |q: Vec<(&'static str, String)>| {
+        let e = &e;
+        async move {
+            e.http
+                .get(format!("{}{FRONTCHANNEL_PATH}", e.base))
+                .query(&q)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let iss = e.mock.base.clone();
+
+    // what the provider's iframe loads
+    let r = fcl(vec![("iss", iss.clone()), ("sid", "fc-1".into())]).await;
+    assert_eq!(r.status(), S::OK);
+    let h = r.headers();
+    assert_eq!(
+        h["content-security-policy"],
+        format!("default-src 'none'; frame-ancestors {iss}")
+    );
+    assert!(
+        h.get("x-frame-options").is_none(),
+        "the provider must be able to frame it"
+    );
+    assert_eq!(h["cache-control"], "no-cache, no-store");
+    assert_eq!(e.get("/api/v1/whoami", &s1).await.0, S::UNAUTHORIZED);
+    assert_eq!(
+        e.get("/api/v1/whoami", &s2).await.0,
+        S::OK,
+        "other provider session untouched"
+    );
+
+    // refused: another issuer, missing parameters, oversized sid
+    for q in [
+        vec![
+            ("iss", "https://evil.example".to_string()),
+            ("sid", "fc-2".into()),
+        ],
+        vec![("iss", format!("{iss}/")), ("sid", "fc-2".into())],
+        vec![("sid", "fc-2".to_string())],
+        vec![("iss", iss.clone())],
+        vec![("iss", iss.clone()), ("sid", "x".repeat(300))],
+    ] {
+        assert_eq!(fcl(q.clone()).await.status(), S::BAD_REQUEST, "{q:?}");
+    }
+    assert_eq!(e.get("/api/v1/whoami", &s2).await.0, S::OK);
+    // unknown sid: fine, but nothing to audit
+    assert_eq!(
+        fcl(vec![("iss", iss.clone()), ("sid", "nope".into())])
+            .await
+            .status(),
+        S::OK
+    );
+
+    let n = e
+        .ctl
+        .audit_log(50, u64::MAX)
+        .unwrap()
+        .iter()
+        .filter(|a| a.action == "session.frontchannel_logout")
+        .count();
+    assert_eq!(n, 1, "only the effective logout is audited");
+
+    // everything else stays unframable
+    let r = e
+        .http
+        .get(format!("{}/api/v1/health", e.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers()["x-frame-options"], "DENY");
+    assert!(r.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("frame-ancestors 'none'"));
+    let _ = std::fs::remove_dir_all(&e.dir);
+}

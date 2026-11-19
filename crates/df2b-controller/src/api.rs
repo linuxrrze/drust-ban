@@ -323,6 +323,10 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/oidc/login", get(oidc_login))
         .route("/api/v1/oidc/callback", get(oidc_callback))
         .route(crate::oidc::BACKCHANNEL_PATH, post(oidc_backchannel_logout))
+        .route(
+            crate::oidc::FRONTCHANNEL_PATH,
+            get(oidc_frontchannel_logout),
+        )
         .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/status", get(status))
         .route("/api/v1/stats", get(stats))
@@ -1139,6 +1143,61 @@ async fn oidc_backchannel_logout(
         warn!("back-channel logout: audit log write failed");
     }
     StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct FrontchannelQuery {
+    iss: Option<String>,
+    sid: Option<String>,
+}
+
+/// Loaded by the provider's logout page in an iframe (user's browser). Not
+/// authenticated: acts only on our exact issuer and the `sid` of a live
+/// session; only effective logouts are audited, so junk requests cannot
+/// fill the audit log.
+async fn oidc_frontchannel_logout(
+    State(ctl): State<Arc<Controller>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(q): Query<FrontchannelQuery>,
+) -> Response {
+    let Some(o) = ctl.settings.oidc.clone() else {
+        return ApiError::not_found("single sign-on is not configured").into_response();
+    };
+    // the provider may frame this endpoint, nobody else; never cached
+    let headers = [
+        (
+            header::CONTENT_SECURITY_POLICY,
+            format!("default-src 'none'; frame-ancestors {}", o.issuer_origin()),
+        ),
+        (header::CACHE_CONTROL, "no-cache, no-store".to_owned()),
+        (header::PRAGMA, "no-cache".to_owned()),
+    ];
+    let (Some(iss), Some(sid)) = (q.iss.as_deref(), q.sid.as_deref()) else {
+        warn!(%addr, "front-channel logout without iss and sid (configure the provider to send them)");
+        return (StatusCode::BAD_REQUEST, headers, "iss and sid required").into_response();
+    };
+    if !o.is_issuer(iss) || sid.is_empty() || sid.len() > 256 {
+        warn!(%addr, "front-channel logout refused: wrong issuer or bad sid");
+        return (StatusCode::BAD_REQUEST, headers, "invalid request").into_response();
+    }
+    let ended = ctl.sessions.end_oidc(None, Some(sid));
+    if ended > 0 {
+        let c = ctl.clone();
+        let s = sid.to_owned();
+        let audited = tokio::task::spawn_blocking(move || {
+            c.audit(
+                "oidc-provider",
+                Some(addr.to_string()),
+                "session.frontchannel_logout",
+                json!({ "sid": s, "sessions_ended": ended }),
+            )
+        })
+        .await;
+        if !matches!(audited, Ok(Ok(()))) {
+            warn!("front-channel logout: audit log write failed");
+        }
+    }
+    (StatusCode::OK, headers, "").into_response()
 }
 
 async fn oidc_callback(

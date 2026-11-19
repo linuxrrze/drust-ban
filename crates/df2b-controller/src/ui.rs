@@ -79,13 +79,18 @@ pub async fn serve(uri: Uri) -> Response {
 /// Headers for every response (API and UI).
 pub async fn security_headers(mut r: Response) -> Response {
     let h = r.headers_mut();
+    // a handler with its own CSP (front-channel logout: framed by the
+    // identity provider) states frame-ancestors itself
+    let own_csp = h.contains_key("content-security-policy");
     let mut set = |name: &'static str, value: &'static str| {
         h.entry(name).or_insert(HeaderValue::from_static(value));
     };
     set("strict-transport-security", "max-age=31536000");
     set("x-content-type-options", "nosniff");
     set("referrer-policy", "no-referrer");
-    set("x-frame-options", "DENY");
+    if !own_csp {
+        set("x-frame-options", "DENY");
+    }
     set("cross-origin-opener-policy", "same-origin");
     set("cross-origin-resource-policy", "same-origin");
     set("content-security-policy", CSP);

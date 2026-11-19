@@ -21,6 +21,13 @@
 //! provider POSTs a signed `logout_token` to `/api/v1/oidc/backchannel-logout`
 //! when a user logs out there or is disabled; the controller ends the
 //! matching sessions (by `sid`, or all of a `sub`) immediately.
+//!
+//! Front-channel logout (OpenID Connect Front-Channel Logout 1.0): the
+//! provider's logout page loads `/api/v1/oidc/frontchannel-logout?iss=&sid=`
+//! in an iframe. The request is not authenticated, so it only acts on an
+//! exact `iss` and a `sid` of a live session (the session cookie is
+//! SameSite=Strict and not sent in the provider's frame). Back-channel
+//! logout is more reliable (no browser involved) and preferred.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -47,6 +54,7 @@ use crate::files::{self, Role};
 
 pub const CALLBACK_PATH: &str = "/api/v1/oidc/callback";
 pub const BACKCHANNEL_PATH: &str = "/api/v1/oidc/backchannel-logout";
+pub const FRONTCHANNEL_PATH: &str = "/api/v1/oidc/frontchannel-logout";
 const BACKCHANNEL_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
 /// Logout tokens issued longer ago than this are refused.
 const LOGOUT_TOKEN_MAX_AGE: i64 = 600;
@@ -659,6 +667,17 @@ impl Oidc {
             bail!("logout token replayed");
         }
         Ok(target)
+    }
+
+    /// Whether `iss` from a front-channel logout names our provider.
+    pub fn is_issuer(&self, iss: &str) -> bool {
+        iss == self.issuer.as_str()
+    }
+
+    /// Origin of the issuer (scheme://host[:port]): the page that frames
+    /// the front-channel logout.
+    pub fn issuer_origin(&self) -> String {
+        self.issuer.url().origin().ascii_serialization()
     }
 
     /// Drops a login in progress (the provider reported an error).
