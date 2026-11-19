@@ -127,6 +127,8 @@ pub enum AuthError {
     Superseded,
     #[error("agent revoked")]
     Revoked,
+    #[error("certificate expired")]
+    Expired,
 }
 
 #[derive(Default)]
@@ -507,7 +509,17 @@ impl Controller {
         if files::is_revoked(&self.settings.state_dir, &record.id) {
             return Err(AuthError::Revoked);
         }
+        // TLS checked it at the handshake; a long-lived connection may
+        // still carry requests after it ran out
+        if info.not_after <= Utc::now() {
+            return Err(AuthError::Expired);
+        }
         Ok(record)
+    }
+
+    /// Decision streams this agent has open.
+    pub fn agent_streams(&self, id: &str) -> u32 {
+        self.lock().status.get(id).map_or(0, |s| s.streams)
     }
 
     pub fn is_revoked(&self, agent_id: &str) -> bool {
@@ -1545,6 +1557,27 @@ mod tests {
         assert_eq!(a.record.group, "quarantine");
         assert_eq!(a.record.serials, ["02", "01"]);
         assert!(c.renewed("nope", vec![], Utc::now()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (security review): expiry was only checked at the TLS
+    /// handshake, so a connection opened before it kept working.
+    #[test]
+    fn expired_certificates_are_refused() {
+        let (c, dir) = ctl("expired");
+        let key = df2b_tls::AgentKey::generate("h").unwrap();
+        let cert =
+            c.ca.sign_agent_csr(&key.csr_der, "h-000001", Duration::ZERO)
+                .unwrap();
+        let info = df2b_tls::CertInfo::parse(&cert).unwrap();
+        let mut a = agent("h-000001", "web");
+        a.serials = vec![info.serial.clone()];
+        c.put_agent(a).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(matches!(
+            c.authenticate(Some(&cert)),
+            Err(AuthError::Expired)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

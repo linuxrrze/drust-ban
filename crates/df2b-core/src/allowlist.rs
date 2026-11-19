@@ -82,7 +82,7 @@ impl Allowlist {
     pub fn new(nets: impl IntoIterator<Item = IpNet>) -> Self {
         let mut a = Self::default();
         for n in nets {
-            let n = n.trunc();
+            let n = crate::ip::unmap(n);
             let (v6, bits, len) = key(&n);
             if v6 { &mut a.v6 } else { &mut a.v4 }.insert(bits, len);
             a.nets.push(n);
@@ -96,7 +96,7 @@ impl Allowlist {
 
     /// True if banning `net` would affect any allowlisted address.
     pub fn overlaps(&self, net: &IpNet) -> bool {
-        let (v6, bits, len) = key(&net.trunc());
+        let (v6, bits, len) = key(&crate::ip::unmap(*net));
         if v6 { &self.v6 } else { &self.v4 }.overlaps(bits, len)
     }
 

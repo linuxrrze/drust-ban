@@ -67,6 +67,9 @@ fn invalid_token() -> Status {
 
 /// Agents report /32 and /64 keys by default; anything much broader from a
 /// single agent is suspicious (DESIGN.md §4.5).
+/// Decision streams one agent may have open at once.
+const MAX_STREAMS_PER_AGENT: u32 = 4;
+
 /// Active bans one agent's reports may hold (a compromised agent must not
 /// ban the whole address space).
 const MAX_ACTIVE_PER_AGENT: usize = if cfg!(test) { 50 } else { 20_000 };
@@ -532,7 +535,14 @@ impl AgentService for Service {
         &self,
         req: Request<v1::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let (record, _) = self.auth(&req)?;
+        let (record, used) = self.auth(&req)?;
+        // one stream is what an agent needs (a reconnect may overlap)
+        if self.ctl.agent_streams(&record.id) >= MAX_STREAMS_PER_AGENT {
+            return Err(Status::resource_exhausted(
+                "too many open streams for this agent",
+            ));
+        }
+        let not_after = used.not_after;
         let from_seq = req.into_inner().from_seq;
         let ctl = self.ctl.clone();
         let (initial, mut live) = {
@@ -685,6 +695,13 @@ impl AgentService for Service {
                         Err(broadcast::error::RecvError::Closed) => break,
                     },
                     _ = check.tick() => {
+                        // the certificate was checked when the stream
+                        // opened; it must not outlive it
+                        if Utc::now() >= not_after {
+                            info!(agent = %id, "certificate expired, closing stream");
+                            let _ = tx.send(Err(Status::unauthenticated("certificate expired"))).await;
+                            break;
+                        }
                         if ctl.is_revoked(&id) {
                             warn!(agent = %id, "agent revoked, closing stream");
                             let _ = tx.send(Err(Status::permission_denied("agent revoked"))).await;

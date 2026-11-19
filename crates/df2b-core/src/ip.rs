@@ -64,7 +64,22 @@ impl IpKey {
 
 impl From<IpNet> for IpKey {
     fn from(net: IpNet) -> Self {
-        Self(net.trunc())
+        Self(unmap(net))
+    }
+}
+
+/// An IPv4-mapped IPv6 prefix (`::ffff:10.0.0.0/104`) as the IPv4 prefix
+/// it means (`10.0.0.0/8`): packets carry IPv4 addresses, so a ban or an
+/// allowlist entry in the mapped form would miss them. Truncated.
+pub fn unmap(net: IpNet) -> IpNet {
+    match net {
+        IpNet::V6(n) if n.prefix_len() >= 96 => match n.network().to_ipv4_mapped() {
+            Some(v4) => ipnet::Ipv4Net::new(v4, n.prefix_len() - 96)
+                .map(|n| IpNet::V4(n.trunc()))
+                .unwrap_or(net.trunc()),
+            None => net.trunc(),
+        },
+        n => n.trunc(),
     }
 }
 
@@ -78,10 +93,10 @@ impl fmt::Display for IpKey {
 /// or a single address (`203.0.113.7`, interpreted as /32 or /128).
 pub fn parse_target(s: &str) -> Result<IpNet, String> {
     if let Ok(net) = s.parse::<IpNet>() {
-        return Ok(net.trunc());
+        return Ok(unmap(net));
     }
     s.parse::<IpAddr>()
-        .map(IpNet::from)
+        .map(|a| unmap(IpNet::from(a)))
         .map_err(|_| format!("not an IP address or prefix: {s}"))
 }
 
@@ -171,5 +186,28 @@ mod tests {
         for n in ["192.0.2.1/32", "203.0.113.0/24", "2001:db8::/48"] {
             assert!(!reserved(&n.parse().unwrap()), "{n}");
         }
+    }
+
+    /// Regression (security review): mapped forms were kept as IPv6, so an
+    /// allowlist entry ::ffff:10.0.0.0/104 did not protect 10.0.0.1 and a
+    /// ban of ::ffff:198.51.100.7 blocked nothing.
+    #[test]
+    fn mapped_prefixes_are_ipv4() {
+        let n = |s: &str| s.parse::<IpNet>().unwrap();
+        assert_eq!(unmap(n("::ffff:10.0.0.0/104")), n("10.0.0.0/8"));
+        assert_eq!(
+            parse_target("::ffff:198.51.100.7").unwrap(),
+            n("198.51.100.7/32")
+        );
+        assert_eq!(unmap(n("::ffff:0:0/96")), n("0.0.0.0/0"));
+        assert_eq!(
+            unmap(n("::/64")),
+            n("::/64"),
+            "wider than the mapped range: kept"
+        );
+        assert_eq!(unmap(n("2001:db8::1/64")), n("2001:db8::/64"));
+        let a = crate::Allowlist::new([n("::ffff:10.0.0.0/104")]);
+        assert!(a.contains_addr(&"10.0.0.1".parse().unwrap()));
+        assert!(crate::Allowlist::new([n("10.0.0.0/8")]).overlaps(&n("::ffff:10.1.0.0/112")));
     }
 }
