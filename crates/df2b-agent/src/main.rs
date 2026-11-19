@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
     let mut remote = RemoteBans::default();
     // failures for the controller's correlation rules (DESIGN.md §4.1)
     if link.is_some() {
-        engine.collect_observations();
+        engine.collect_observations(cfg.agent.send_samples);
     }
     let mut observe = tokio::time::interval(OBSERVATION_INTERVAL);
     observe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -229,6 +229,11 @@ async fn main() -> anyhow::Result<()> {
                                 last_seen_unix_ms: now.timestamp_millis(),
                                 locally_banned: true,
                                 local_ban_expires_unix_ms: action.until.timestamp_millis(),
+                                sample: if cfg.agent.send_samples {
+                                    df2b_core::sample_line(&action.sample)
+                                } else {
+                                    String::new()
+                                },
                                 ..Default::default()
                             };
                             if l.reports.try_send(obs).is_err() {
@@ -323,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
                             count: o.failures,
                             first_seen_unix_ms: o.first.timestamp_millis(),
                             last_seen_unix_ms: o.last.timestamp_millis(),
+                            sample: o.sample.unwrap_or_default(),
                             ..Default::default()
                         };
                         if l.reports.try_send(obs).is_err() {

@@ -26,7 +26,7 @@ pub struct BanAction {
     pub until: DateTime<Utc>,
     /// Failures that triggered the ban (the jail's maxretry).
     pub failures: u32,
-    #[allow(dead_code)] // not reported to the controller (privacy) yet
+    /// The line that triggered the ban.
     pub sample: String,
 }
 
@@ -110,11 +110,13 @@ impl JailParams {
 }
 
 /// Failures of one key in one jail during a report interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
     pub failures: u32,
     pub first: DateTime<Utc>,
     pub last: DateTime<Utc>,
+    /// The latest matching line (if samples are sent).
+    pub sample: Option<String>,
 }
 
 /// Keys per report interval (memory bound).
@@ -170,6 +172,8 @@ pub struct Engine {
     /// Failures per (jail, key) since the last `take_observations`, for
     /// the controller's correlation (only with a controller).
     observations: Option<HashMap<(String, IpKey), Observed>>,
+    /// Keep the latest matching line per observation.
+    samples: bool,
     /// From the agent's configuration.
     allowlist: Allowlist,
     /// The controller's allowlist (replaced on every update).
@@ -208,6 +212,7 @@ impl Engine {
             filter_dir: cfg.agent.filter_dir.clone(),
             central_errors: Vec::new(),
             observations: None,
+            samples: false,
             allowlist: Allowlist::new(cfg.agent.allowlist.iter().copied()),
             central: Allowlist::default(),
             prefix: PrefixPolicy {
@@ -279,9 +284,13 @@ impl Engine {
             }
             if let Some(obs) = self.observations.as_mut() {
                 let k = (jail.name.clone(), key);
+                let sample = self.samples.then(|| df2b_core::sample_line(&line.line));
                 if let Some(o) = obs.get_mut(&k) {
                     o.failures = o.failures.saturating_add(1);
                     o.first = o.first.min(ts);
+                    if ts >= o.last && sample.is_some() {
+                        o.sample = sample;
+                    }
                     o.last = o.last.max(ts);
                 } else if obs.len() < MAX_OBSERVED {
                     obs.insert(
@@ -290,6 +299,7 @@ impl Engine {
                             failures: 1,
                             first: ts,
                             last: ts,
+                            sample,
                         },
                     );
                 }
@@ -373,9 +383,11 @@ impl Engine {
         }
     }
 
-    /// Starts counting failures for the controller.
-    pub fn collect_observations(&mut self) {
+    /// Starts counting failures for the controller; with `samples`, the
+    /// latest matching line is kept as well.
+    pub fn collect_observations(&mut self, samples: bool) {
         self.observations.get_or_insert_with(HashMap::new);
+        self.samples = samples;
     }
 
     /// Failures counted since the last call.
@@ -940,7 +952,7 @@ mod tests {
         let now = Utc::now();
         e.process(&line("auth", "203.0.113.1"), now);
         assert!(e.take_observations().is_empty(), "off without a controller");
-        e.collect_observations();
+        e.collect_observations(true);
         e.process(&line("auth", "203.0.113.1"), now); // second failure: ban
         e.process(&line("auth", "203.0.113.1"), now); // banned: not counted
         e.process(&line("auth", "198.51.100.2"), now);
@@ -960,6 +972,15 @@ mod tests {
             ]
         );
         assert!(e.take_observations().is_empty(), "drained");
+
+        // the latest line is the sample; none when samples are off
+        e.process(&line("auth", "198.51.100.3"), now);
+        let obs = e.take_observations();
+        let sample = obs[0].2.sample.as_deref().unwrap();
+        assert!(sample.contains("198.51.100.3"), "{sample}");
+        e.collect_observations(false);
+        e.process(&line("auth", "198.51.100.3"), now);
+        assert_eq!(e.take_observations()[0].2.sample, None);
     }
 
     #[test]

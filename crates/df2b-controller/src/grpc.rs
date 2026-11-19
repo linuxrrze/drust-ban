@@ -114,6 +114,8 @@ impl Service {
                 at,
                 if banned { 0 } else { o.count },
                 banned,
+                // untrusted: cleaned and cut again
+                (!o.sample.trim().is_empty()).then(|| df2b_core::sample_line(&o.sample)),
             ));
         }
         let mut c = self
@@ -123,7 +125,7 @@ impl Service {
             .unwrap_or_else(|e| e.into_inner());
         let mut triggers = Vec::new();
         let mut dropped = 0;
-        for (jail, net, at, failures, banned) in parsed {
+        for (jail, net, at, failures, banned, sample) in parsed {
             if !c.admit(&record.id, now) {
                 dropped += 1;
                 continue;
@@ -134,6 +136,7 @@ impl Service {
                 at,
                 failures,
                 banned,
+                sample,
             };
             if c.record(&jail, net, seen) {
                 triggers.extend(c.evaluate(&rules, &jail, net, &record.group, now));

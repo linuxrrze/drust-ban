@@ -91,6 +91,8 @@ export interface History {
   correlation_offenses: number;
   offense_memory: string;
   observations: { jail: string; key: string; agent: string; at: string; failures: number; banned: boolean }[];
+  /** log lines agents sent with their reports, newest first */
+  samples: { jail: string; key: string; agent: string; at: string; line: string }[];
   active: Decision[];
   history: Decision[];
 }

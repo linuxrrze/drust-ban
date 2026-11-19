@@ -712,7 +712,17 @@ df2bctl config check | reload
     allowlists (also below their own threshold; not for addresses they
     already ban) per jail and key and send the counts every 5 s (at most
     50 000 keys per interval). When the report queue is full, failure
-    counts are dropped before ban reports. No log lines are sent.
+    counts are dropped before ban reports.
+  - **Sample log lines**: with each count the agent sends the latest
+    matching line for that jail and key, and with a local ban the line
+    that triggered it (`send_samples = false` in agent.toml: counts only,
+    no log content leaves the host). Lines are cleaned (control characters
+    and escape sequences become spaces) and cut to 512 bytes by the agent
+    and again by the controller, which keeps the latest 10 per jail and
+    key (at most 100 000 in all, about 50 MB), prunes and persists them
+    with the observations and shows them on the address page (newest 50,
+    `samples` in `GET /api/v1/history`). They are only as private as the
+    logs: sshd lines name the attempted user, web logs URLs.
   - The controller rate-limits each agent (20 000 observations per minute;
     `retry_after_ms` tells it to slow down), ignores malformed, too broad
     and allowlisted keys, and places each observation by the agent's
@@ -752,8 +762,7 @@ df2bctl config check | reload
     append), so it survives controller restarts; the reason says "offense n" and the address page shows the count.
     When several rules fire for the same address in one report, only the
     longest ban is recorded.
-- Not yet:
-  sample log lines (agents send counts only), ASN/GeoIP.
+- Not yet: ASN/GeoIP; redaction rules for sample lines.
 
 Pages:
 

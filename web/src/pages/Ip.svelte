@@ -145,7 +145,25 @@
           </tbody>
         </table>
       </div>
-      <p class="faint small note">Kept in the controller's memory for the longest rule window (at least an hour).</p>
+      <p class="faint small note">Kept for the longest rule window (at least an hour), also across controller restarts.</p>
+    </div>
+  {/if}
+
+  {#if data.samples.length}
+    <div class="card">
+      <h2>Sample log lines</h2>
+      <ul class="samples">
+        {#each data.samples as s, i (i)}
+          <li>
+            <div class="small muted">
+              <span title={dateTime(s.at)}>{relative(s.at)}</span> · {s.agent} · {s.jail}{#if s.key !== data.target}
+                · <span class="mono">{target(s.key)}</span>{/if}
+            </div>
+            <code class="logline">{s.line}</code>
+          </li>
+        {/each}
+      </ul>
+      <p class="faint small note">The latest lines per host and jail, as the agents sent them (agents with <code>send_samples = false</code> send counts only).</p>
     </div>
   {/if}
 
@@ -177,7 +195,6 @@
       </ol>
       {#if data.history.length >= 200}<div class="faint small">Showing the newest 200 decisions.</div>{/if}
     {/if}
-    <p class="faint small note">Sample log lines are not collected centrally (privacy).</p>
   </div>
 
   <BanDialog bind:open={banOpen} initialTarget={addr} ondone={load} />
@@ -199,4 +216,9 @@
   .timeline li.ban::before { border-color: var(--bad); }
   .timeline li.unban::before { border-color: var(--good); }
   .note { margin: 16px 0 0; }
+  .samples { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+  .logline {
+    display: block; margin-top: 3px; padding: 6px 8px; border-radius: 6px;
+    background: var(--surface-2); white-space: pre-wrap; overflow-wrap: anywhere;
+  }
 </style>

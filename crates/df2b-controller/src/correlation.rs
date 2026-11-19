@@ -34,6 +34,10 @@ const MAX_KEYS: usize = 200_000;
 pub const MAX_PER_AGENT_MINUTE: u32 = 20_000;
 /// Monitor-mode hits kept for the UI.
 const MAX_HITS: usize = 200;
+/// Sample log lines kept per (jail, address), and in all (memory bound:
+/// at most about 50 MB of lines).
+const SAMPLES_PER_KEY: usize = 10;
+const MAX_SAMPLES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -155,6 +159,17 @@ pub struct Seen {
     pub failures: u32,
     /// a local ban (a quorum vote)
     pub banned: bool,
+    /// the agent's sample log line (moved to the sample store on record)
+    #[serde(skip)]
+    pub sample: Option<String>,
+}
+
+/// A log line an agent sent with an observation (address page).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sample {
+    pub agent: String,
+    pub at: DateTime<Utc>,
+    pub line: String,
 }
 
 /// An observation as stored in the database.
@@ -167,6 +182,8 @@ pub struct Stored {
     pub at: DateTime<Utc>,
     pub failures: u32,
     pub banned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<String>,
 }
 
 /// Firing pauses and monitor hits, stored as one value.
@@ -192,6 +209,10 @@ pub struct Trigger {
 #[derive(Default)]
 pub struct Correlator {
     seen: HashMap<(String, IpNet), VecDeque<Seen>>,
+    /// the latest sample lines per (jail, key), oldest first
+    samples: HashMap<(String, IpNet), VecDeque<Sample>>,
+    /// lines in `samples`
+    sample_count: usize,
     /// (rule, jail, key) → not before (no repeated firing)
     fired: HashMap<(String, String, IpNet), DateTime<Utc>>,
     /// per agent: (minute, observations in it)
@@ -226,6 +247,7 @@ impl Correlator {
             at: s.at,
             failures: s.failures,
             banned: s.banned,
+            sample: s.sample.clone(),
         };
         if !self.insert(jail, key, s) {
             return false;
@@ -234,7 +256,7 @@ impl Correlator {
         true
     }
 
-    fn insert(&mut self, jail: &str, key: IpNet, s: Seen) -> bool {
+    fn insert(&mut self, jail: &str, key: IpNet, mut s: Seen) -> bool {
         let k = (jail.to_owned(), key);
         if !self.seen.contains_key(&k) && self.seen.len() >= MAX_KEYS {
             self.dropped += 1;
@@ -246,12 +268,36 @@ impl Correlator {
             }
             return false;
         }
+        if let Some(line) = s.sample.take() {
+            self.add_sample(
+                k.clone(),
+                Sample {
+                    agent: s.agent.clone(),
+                    at: s.at,
+                    line,
+                },
+            );
+        }
         let q = self.seen.entry(k).or_default();
         // agents report in order, but several agents interleave: keep the
         // queue sorted so pruning from the front stays correct
         let pos = q.iter().rposition(|e| e.at <= s.at).map_or(0, |i| i + 1);
         q.insert(pos, s);
         true
+    }
+
+    fn add_sample(&mut self, k: (String, IpNet), sample: Sample) {
+        let full = self.samples.get(&k).map_or(0, VecDeque::len) >= SAMPLES_PER_KEY;
+        if !full && self.sample_count >= MAX_SAMPLES {
+            return;
+        }
+        let q = self.samples.entry(k).or_default();
+        if full {
+            q.pop_front();
+        } else {
+            self.sample_count += 1;
+        }
+        q.push_back(sample);
     }
 
     /// Replays stored observations and state (startup). Observations
@@ -272,6 +318,7 @@ impl Correlator {
                 at: o.at,
                 failures: o.failures,
                 banned: o.banned,
+                sample: o.sample,
             };
             if self.insert(&o.jail, o.key, seen) {
                 n += 1;
@@ -386,6 +433,13 @@ impl Correlator {
             }
             !q.is_empty()
         });
+        let mut count = 0;
+        self.samples.retain(|_, q| {
+            q.retain(|s| s.at >= since);
+            count += q.len();
+            !q.is_empty()
+        });
+        self.sample_count = count;
         self.fired.retain(|_, t| *t > now);
         let minute = now.timestamp().div_euclid(60);
         self.rate.retain(|_, (m, _)| *m == minute);
@@ -401,6 +455,19 @@ impl Correlator {
             .collect();
         out.sort_by_key(|o| std::cmp::Reverse(o.2.at));
         out.truncate(500);
+        out
+    }
+
+    /// Sample log lines for addresses overlapping `net`, newest first.
+    pub fn samples(&self, net: &IpNet) -> Vec<(String, IpNet, Sample)> {
+        let mut out: Vec<(String, IpNet, Sample)> = self
+            .samples
+            .iter()
+            .filter(|((_, k), _)| k.contains(net) || net.contains(k))
+            .flat_map(|((jail, k), q)| q.iter().map(move |s| (jail.clone(), *k, s.clone())))
+            .collect();
+        out.sort_by_key(|o| std::cmp::Reverse(o.2.at));
+        out.truncate(50);
         out
     }
 
@@ -425,6 +492,7 @@ impl Correlator {
                     at: s.at,
                     failures: s.failures,
                     banned: s.banned,
+                    sample: None,
                 })
             })
             .collect()
@@ -471,6 +539,7 @@ pub(crate) mod tests {
             at,
             failures,
             banned,
+            sample: None,
         }
     }
 
@@ -480,7 +549,9 @@ pub(crate) mod tests {
         let key: IpNet = "198.51.100.7/32".parse().unwrap();
         let mut c = Correlator::default();
         // out of order across agents: kept sorted
-        c.record("sshd", key, seen("a2", "web", now, 3, false));
+        let mut with_line = seen("a2", "web", now, 3, false);
+        with_line.sample = Some("Failed password for root".into());
+        c.record("sshd", key, with_line);
         c.record(
             "sshd",
             key,
@@ -507,6 +578,8 @@ pub(crate) mod tests {
         let n = r.restore(obs.into_iter().chain([old]), Some(meta), now, MIN_KEEP);
         assert_eq!(n, 2, "the old one is skipped");
         assert_eq!(r.recent(&key).len(), 2);
+        assert_eq!(r.samples(&key).len(), 1, "sample lines restored");
+        assert_eq!(r.samples(&key)[0].2.line, "Failed password for root");
         assert_eq!(r.hits().len(), 1);
         assert!(
             r.evaluate(&[monitor.clone()], "sshd", key, "web", now)
@@ -526,6 +599,32 @@ pub(crate) mod tests {
         r.prune(now, Duration::from_secs(60));
         assert_eq!(r.recent(&key).len(), 1);
         assert_eq!(r.recent(&key)[0].2.agent, "a2");
+    }
+
+    #[test]
+    fn samples_bounded_and_pruned() {
+        let now = Utc::now();
+        let key: IpNet = "198.51.100.8/32".parse().unwrap();
+        let mut c = Correlator::default();
+        for i in 0..15 {
+            let mut s = seen("a1", "web", now - TimeDelta::minutes(20 - i), 1, false);
+            s.sample = Some(format!("line {i}"));
+            c.record("sshd", key, s);
+        }
+        c.record("sshd", key, seen("a2", "web", now, 1, false)); // no line
+        let got = c.samples(&key);
+        assert_eq!(got.len(), SAMPLES_PER_KEY, "only the latest per address");
+        assert_eq!(got[0].2.line, "line 14", "newest first");
+        assert_eq!(c.sample_count, SAMPLES_PER_KEY);
+        // observations without a line keep no sample; the queue has them all
+        assert_eq!(c.recent(&key).len(), 16);
+        assert!(c.recent(&key).iter().all(|o| o.2.sample.is_none()));
+        // pruned with the observations
+        c.prune(now, Duration::from_secs(10 * 60));
+        assert_eq!(c.samples(&key).len(), 5, "lines 10..14 are within 10 min");
+        c.prune(now + TimeDelta::hours(1), Duration::from_secs(60));
+        assert!(c.samples(&key).is_empty());
+        assert_eq!(c.sample_count, 0);
     }
 
     #[test]

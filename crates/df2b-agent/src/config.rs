@@ -53,6 +53,11 @@ pub struct AgentSection {
     /// Central jails may read the systemd journal.
     #[serde(default = "yes")]
     pub central_journald: bool,
+    /// Send the latest matching log line with the failure counts (shown on
+    /// the controller's address page). Off: counts only, no log content
+    /// leaves the host.
+    #[serde(default = "yes")]
+    pub send_samples: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]

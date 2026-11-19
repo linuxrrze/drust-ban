@@ -1528,6 +1528,7 @@ mod tests {
                         at: now,
                         failures: 2,
                         banned: false,
+                        sample: None,
                     },
                 );
             }

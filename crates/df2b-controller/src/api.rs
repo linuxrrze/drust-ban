@@ -2170,7 +2170,18 @@ async fn history(
         // earlier correlation bans of this exact target (escalation)
         "correlation_offenses": ctl.correlation_offenses(&net),
         "offense_memory": humantime::format_duration(crate::state::OFFENSE_MEMORY).to_string(),
-        // what agents reported recently (memory; since the controller started)
+        // log lines agents sent with their reports (latest per host first)
+        "samples": ctl
+            .correlator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .samples(&net)
+            .into_iter()
+            .map(|(jail, key, s)| json!({
+                "jail": jail, "key": key, "agent": s.agent, "at": s.at, "line": s.line,
+            }))
+            .collect::<Vec<_>>(),
+        // what agents reported within the longest rule window
         "observations": ctl
             .correlator
             .lock()
@@ -4634,6 +4645,7 @@ mod tests {
                 at: Utc::now(),
                 failures: 3,
                 banned: false,
+                sample: Some("sshd[1]: Failed password for root from 203.0.113.4".into()),
             },
         );
         let (_, v) = env
@@ -4650,6 +4662,16 @@ mod tests {
                 v["observations"][0]["failures"].as_u64()
             ),
             (Some("web-1"), Some(3))
+        );
+        assert_eq!(
+            (
+                v["samples"][0]["agent"].as_str(),
+                v["samples"][0]["line"].as_str()
+            ),
+            (
+                Some("web-1"),
+                Some("sshd[1]: Failed password for root from 203.0.113.4")
+            )
         );
 
         let del = |n: &str| {

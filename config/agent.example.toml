@@ -34,6 +34,11 @@ allowlist = ["127.0.0.0/8", "::1/128"]
 # central_journald = true         # central jails may read the journal
 # A local jail with the same name always wins.
 
+# With a controller: send the latest matching log line with the failure
+# counts (shown on the address page). false: counts only, no log content
+# leaves this host.
+# send_samples = true
+
 [[source]]
 name = "sshd-journal"
 type = "journald"
