@@ -118,6 +118,12 @@ enum Command {
     /// Show jails.
     #[command(subcommand)]
     Jails(JailsCmd),
+    /// Show or set (admin) where agents' local bans apply: global, group or
+    /// off.
+    Propagate {
+        #[arg(value_enum)]
+        mode: Option<PropagateArg>,
+    },
     /// Work with filters.
     #[command(subcommand)]
     Filter(FilterCmd),
@@ -206,7 +212,46 @@ enum AllowlistCmd {
 
 #[derive(Debug, Subcommand)]
 enum JailsCmd {
+    /// Jails reported by the agents, with effective and central settings.
     List,
+    /// Set a jail's limits centrally (admin), for all agents or one group.
+    /// Replaces earlier settings for that scope; options left out keep each
+    /// agent's own configuration.
+    Set {
+        jail: String,
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long)]
+        maxretry: Option<u32>,
+        /// e.g. 10m
+        #[arg(long)]
+        findtime: Option<String>,
+        /// e.g. 1h
+        #[arg(long)]
+        bantime: Option<String>,
+        #[arg(long)]
+        bantime_factor: Option<f64>,
+        /// e.g. 30d
+        #[arg(long)]
+        max_bantime: Option<String>,
+    },
+    /// Remove a jail's central settings (all agents, or --group).
+    Reset {
+        jail: String,
+        #[arg(long)]
+        group: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PropagateArg {
+    Global,
+    Group,
+    Off,
 }
 
 #[derive(Debug, Subcommand)]
@@ -319,6 +364,38 @@ async fn run() -> anyhow::Result<()> {
                 } => commands::allowlist_add(&c, target, comment, !keep_bans, ttl, json).await,
                 AllowlistCmd::Rm { target } => commands::allowlist_rm(&c, target, json).await,
             }
+        }
+        Command::Jails(cmd) => {
+            let c = client()?;
+            match cmd {
+                JailsCmd::List => commands::jails_list(&c, json).await,
+                JailsCmd::Set {
+                    jail,
+                    group,
+                    enable,
+                    disable,
+                    maxretry,
+                    findtime,
+                    bantime,
+                    bantime_factor,
+                    max_bantime,
+                } => {
+                    let enabled = (enable || disable).then_some(enable);
+                    let body = serde_json::json!({
+                        "group": group, "enabled": enabled, "maxretry": maxretry,
+                        "findtime": findtime, "bantime": bantime,
+                        "bantime_factor": bantime_factor, "max_bantime": max_bantime,
+                    });
+                    commands::jails_set(&c, &jail, body, json).await
+                }
+                JailsCmd::Reset { jail, group } => {
+                    commands::jails_reset(&c, &jail, group, json).await
+                }
+            }
+        }
+        Command::Propagate { mode } => {
+            let mode = mode.map(|m| format!("{m:?}").to_lowercase());
+            commands::propagate(&client()?, mode, json).await
         }
         Command::Sessions(cmd) => {
             let c = client()?;

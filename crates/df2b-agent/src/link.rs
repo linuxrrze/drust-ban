@@ -59,6 +59,9 @@ pub struct LinkStats {
     pub active_bans: AtomicU64,
     /// Version of the central allowlist the main loop has applied.
     pub allowlist_version: std::sync::Mutex<String>,
+    /// Effective jail settings and the policy version applied.
+    pub jails: std::sync::Mutex<Vec<v1::JailStatus>>,
+    pub jail_policies_version: std::sync::Mutex<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +90,48 @@ pub enum FromController {
     Decision(RemoteDecision),
     /// The complete central allowlist (replaces the previous one).
     Allowlist(crate::state::CentralAllowlist),
+    /// Central jail settings for this agent (replace earlier ones).
+    JailPolicies(crate::state::JailPolicies),
+}
+
+/// Converts jail policies; implausible entries are dropped (logged), the
+/// rest applies.
+pub fn parse_jail_policies(p: v1::JailPolicies) -> crate::state::JailPolicies {
+    let dur = |ms: Option<i64>| -> Result<Option<Duration>, ()> {
+        match ms {
+            None => Ok(None),
+            Some(ms) if ms > 0 => Ok(Some(Duration::from_millis(ms as u64))),
+            Some(_) => Err(()),
+        }
+    };
+    let mut jails = Vec::new();
+    for j in p.jails {
+        let parsed = (|| {
+            if j.maxretry == Some(0) {
+                return Err(());
+            }
+            if j.bantime_factor.is_some_and(|f| !f.is_finite() || f < 1.0) {
+                return Err(());
+            }
+            Ok(crate::engine::JailOverride {
+                jail: j.jail.clone(),
+                enabled: j.enabled,
+                maxretry: j.maxretry,
+                findtime: dur(j.findtime_ms)?,
+                bantime: dur(j.bantime_ms)?,
+                factor: j.bantime_factor,
+                max_bantime: dur(j.max_bantime_ms)?,
+            })
+        })();
+        match parsed {
+            Ok(o) => jails.push(o),
+            Err(()) => warn!(jail = %j.jail, "ignoring implausible jail policy"),
+        }
+    }
+    crate::state::JailPolicies {
+        version: p.version,
+        jails,
+    }
 }
 
 /// Parses an allowlist update; `None` if any entry is malformed (a partial
@@ -490,6 +535,7 @@ impl Task {
                                 None => { warn!("ignoring malformed decision"); continue; }
                             }
                         }
+                        Some(Event::JailPolicies(p)) => FromController::JailPolicies(parse_jail_policies(p)),
                         Some(Event::Allowlist(a)) => match parse_allowlist(a) {
                             Some(ev) => ev,
                             None => { warn!("ignoring malformed allowlist update, keeping the previous one"); continue; }
@@ -515,6 +561,8 @@ impl Task {
                         firewall_healthy: true, // TODO: backend health check
                         last_applied_seq: self.last_seq,
                         allowlist_version: self.stats.allowlist_version.lock().map(|v| v.clone()).unwrap_or_default(),
+                        jails: self.stats.jails.lock().map(|v| v.clone()).unwrap_or_default(),
+                        jail_policies_version: self.stats.jail_policies_version.lock().map(|v| v.clone()).unwrap_or_default(),
                     }).await?.into_inner();
                     // the controller decides the group (it filters the
                     // decisions); keep the local copy for logs up to date
@@ -712,5 +760,44 @@ mod tests {
             .is_none(),
             "mismatched lengths"
         );
+    }
+
+    #[test]
+    fn jail_policies() {
+        let p = parse_jail_policies(v1::JailPolicies {
+            version: "v1".into(),
+            jails: vec![
+                v1::JailPolicy {
+                    jail: "sshd".into(),
+                    maxretry: Some(3),
+                    bantime_ms: Some(7_200_000),
+                    ..Default::default()
+                },
+                v1::JailPolicy {
+                    jail: "bad1".into(),
+                    maxretry: Some(0),
+                    ..Default::default()
+                },
+                v1::JailPolicy {
+                    jail: "bad2".into(),
+                    bantime_ms: Some(-5),
+                    ..Default::default()
+                },
+                v1::JailPolicy {
+                    jail: "bad3".into(),
+                    bantime_factor: Some(f64::NAN),
+                    ..Default::default()
+                },
+                v1::JailPolicy {
+                    jail: "nginx".into(),
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            ],
+        });
+        let names: Vec<_> = p.jails.iter().map(|j| j.jail.as_str()).collect();
+        assert_eq!(names, ["sshd", "nginx"], "implausible entries dropped");
+        assert_eq!(p.jails[0].bantime, Some(Duration::from_secs(7200)));
+        assert_eq!(p.jails[0].findtime, None);
     }
 }

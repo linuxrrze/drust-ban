@@ -518,3 +518,138 @@ pub async fn agents_set_group(c: &Client, id: &str, group: &str, json: bool) -> 
     }
     Ok(())
 }
+
+fn secs(v: &Value) -> String {
+    match v.as_u64() {
+        Some(0) | None => "-".into(),
+        Some(s) => fmt_secs(s as i64),
+    }
+}
+
+pub async fn jails_list(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/policies").await?;
+    if json {
+        return json_out(&v);
+    }
+    let jails = v["jails"].as_array().cloned().unwrap_or_default();
+    if jails.is_empty() {
+        println!("no jails reported yet");
+        return Ok(());
+    }
+    println!(
+        "{:<16} {:<28} {:<7} {:>5} {:>7} {:>7} {:>6} {:>7}  CENTRAL",
+        "JAIL", "AGENT", "STATE", "FAILS", "WITHIN", "BAN", "FACTOR", "MAX"
+    );
+    for j in &jails {
+        let name = s(j, &["name"]);
+        let central: Vec<String> = j["overrides"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|o| {
+                let scope = o["group"]
+                    .as_str()
+                    .map_or("all".to_owned(), |g| format!("group {g}"));
+                let mut kv = Vec::new();
+                for k in [
+                    "enabled",
+                    "maxretry",
+                    "findtime",
+                    "bantime",
+                    "bantime_factor",
+                    "max_bantime",
+                ] {
+                    if !o[k].is_null() {
+                        kv.push(format!("{k}={}", o[k].to_string().trim_matches('"')));
+                    }
+                }
+                format!("{scope}: {}", kv.join(" "))
+            })
+            .collect();
+        let agents = j["agents"].as_array().cloned().unwrap_or_default();
+        if agents.is_empty() {
+            println!(
+                "{name:<16} {:<28} {:<7} {:>5} {:>7} {:>7} {:>6} {:>7}  {}",
+                "(none yet)",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                central.join("; ")
+            );
+        }
+        for (i, a) in agents.iter().enumerate() {
+            let jv = &a["jail"];
+            println!(
+                "{:<16} {:<28} {:<7} {:>5} {:>7} {:>7} {:>6} {:>7}  {}",
+                if i == 0 { name } else { "" },
+                s(a, &["agent"]),
+                if jv["enabled"] == true { "on" } else { "off" },
+                jv["maxretry"].to_string(),
+                secs(&jv["findtime_secs"]),
+                secs(&jv["bantime_secs"]),
+                jv["bantime_factor"].to_string(),
+                secs(&jv["max_bantime_secs"]),
+                if i == 0 {
+                    central.join("; ")
+                } else {
+                    String::new()
+                },
+            );
+        }
+    }
+    println!("ban propagation: {}", s(&v, &["propagate"]));
+    Ok(())
+}
+
+pub async fn jails_set(c: &Client, jail: &str, body: Value, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .put(&format!("/api/v1/jails/{jail}/policy"), body.clone())
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    let scope = body["group"]
+        .as_str()
+        .map_or("all agents".to_owned(), |g| format!("group {g}"));
+    println!("{jail}: central settings for {scope} saved; connected agents apply them at once");
+    Ok(())
+}
+
+pub async fn jails_reset(
+    c: &Client,
+    jail: &str,
+    group: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let q: Vec<(&str, String)> = group.iter().map(|g| ("group", g.clone())).collect();
+    let v = c
+        .delete(&format!("/api/v1/jails/{jail}/policy"), &q)
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    let scope = group.map_or("all agents".to_owned(), |g| format!("group {g}"));
+    println!("{jail}: central settings for {scope} removed");
+    Ok(())
+}
+
+pub async fn propagate(c: &Client, mode: Option<String>, json: bool) -> anyhow::Result<()> {
+    let v = match mode {
+        Some(m) => {
+            c.put("/api/v1/policies/propagate", json!({ "propagate": m }))
+                .await?
+        }
+        None => c.get("/api/v1/policies").await?,
+    };
+    if json {
+        return json_out(&v);
+    }
+    match v["previous"].as_str() {
+        Some(prev) => println!("ban propagation: {prev} -> {}", s(&v, &["propagate"])),
+        None => println!("ban propagation: {}", s(&v, &["propagate"])),
+    }
+    Ok(())
+}

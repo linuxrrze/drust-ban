@@ -162,6 +162,11 @@ impl Client {
             .await
     }
 
+    pub async fn put(&self, path: &str, body: Value) -> anyhow::Result<Value> {
+        self.send(self.http.put(format!("{}{path}", self.base)).json(&body))
+            .await
+    }
+
     pub async fn patch(&self, path: &str, body: Value) -> anyhow::Result<Value> {
         self.send(self.http.patch(format!("{}{path}", self.base)).json(&body))
             .await

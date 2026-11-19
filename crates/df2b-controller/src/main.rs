@@ -14,6 +14,7 @@ mod files;
 mod grpc;
 mod https;
 mod oidc;
+mod policy;
 mod session;
 mod state;
 mod store;
@@ -87,9 +88,10 @@ struct ServeArgs {
     #[arg(long, default_value = "30d", value_parser = humantime::parse_duration)]
     agent_cert_lifetime: Duration,
 
-    /// What an agent's local ban turns into.
-    #[arg(long, value_enum, default_value_t = Propagate::Global)]
-    propagate: Propagate,
+    /// What an agent's local ban turns into. Also changeable in the web UI
+    /// (stored); when given, this flag wins at startup. Default: global.
+    #[arg(long, value_enum)]
+    propagate: Option<Propagate>,
 
     /// Networks that are never banned centrally (repeatable).
     #[arg(long = "allow")]
@@ -345,7 +347,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         Settings {
             state_dir: dir.clone(),
             cert_lifetime: a.agent_cert_lifetime,
-            propagate: a.propagate,
+            propagate: a.propagate.unwrap_or(Propagate::Global),
             allowlist: Allowlist::new(a.allowlist),
             oidc: oidc.clone(),
             https_internal_ca: a.https_cert.is_none(),
@@ -353,6 +355,12 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         ca,
         store,
     )?);
+    if let Some(p) = a.propagate {
+        if ctl.propagate() != p {
+            info!(propagate = ?p, "--propagate overrides the stored setting");
+        }
+        ctl.set_propagate(p)?;
+    }
 
     // agent service: always the internal CA
     let (chain, key) = ctl.ca.issue_server(&a.names)?;

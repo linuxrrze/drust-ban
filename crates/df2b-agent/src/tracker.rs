@@ -56,6 +56,13 @@ impl Tracker {
         }
     }
 
+    /// New threshold and window (central jail policy); counted failures are
+    /// kept and judged by the new values from the next one on.
+    pub fn set_limits(&mut self, maxretry: u32, findtime: Duration) {
+        self.maxretry = maxretry.max(1) as usize;
+        self.findtime = TimeDelta::from_std(findtime).unwrap_or(TimeDelta::days(365));
+    }
+
     /// Drops expired timestamps and empty keys.
     pub fn prune(&mut self, now: DateTime<Utc>) {
         let cutoff = now - self.findtime;

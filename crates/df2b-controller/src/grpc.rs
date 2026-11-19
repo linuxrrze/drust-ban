@@ -177,6 +177,25 @@ impl AgentService for Service {
             s.firewall_healthy = h.firewall_healthy;
             s.last_applied_seq = h.last_applied_seq;
             s.allowlist_version = h.allowlist_version;
+            s.jail_policies_version = h.jail_policies_version;
+            let secs = |ms: i64| u64::try_from(ms / 1000).unwrap_or(0);
+            s.jails = h
+                .jails
+                .into_iter()
+                .take(256)
+                .map(|j| crate::state::JailView {
+                    name: j.name.chars().take(64).collect(),
+                    filter: j.filter.chars().take(64).collect(),
+                    enabled: j.enabled,
+                    maxretry: j.maxretry,
+                    findtime_secs: secs(j.findtime_ms),
+                    bantime_secs: secs(j.bantime_ms),
+                    bantime_factor: j.bantime_factor,
+                    max_bantime_secs: secs(j.max_bantime_ms),
+                    overridden: j.overridden.into_iter().take(8).collect(),
+                    active_bans: j.active_bans,
+                })
+                .collect();
         });
         Ok(Response::new(v1::HeartbeatResponse {
             controller_time_unix_ms: now_ms,
@@ -197,7 +216,7 @@ impl AgentService for Service {
         }
         self.ctl.update_status(&record.id, |_| {});
         let now = Utc::now();
-        let scope = match self.ctl.settings.propagate {
+        let scope = match self.ctl.propagate() {
             Propagate::Global => Some(Scope::Global),
             Propagate::Group => Some(Scope::Group(record.group.clone())),
             Propagate::Off => None,
@@ -268,6 +287,7 @@ impl AgentService for Service {
         };
         let (tx, rx) = mpsc::channel(256);
         let mut allow = ctl.allowlist_watch();
+        let mut jails = ctl.jail_watch();
         tokio::spawn(async move {
             let id = record.id.clone();
             ctl.update_status(&id, |s| s.streams += 1);
@@ -307,9 +327,39 @@ impl AgentService for Service {
                 ctl.update_status(&id, |s| s.streams = s.streams.saturating_sub(1));
                 return;
             }
+            // then the jail settings for its group (a group change closes
+            // the stream, so `record.group` stays right)
+            let group = record.group.clone();
+            let jail_event = |list: &[crate::policy::JailOverride]| {
+                event(Event::JailPolicies(crate::policy::for_group(list, &group)))
+            };
+            let mut sent_version = {
+                let p = crate::policy::for_group(&jails.borrow_and_update(), &group);
+                let v = p.version.clone();
+                if tx.send(Ok(event(Event::JailPolicies(p)))).await.is_err() {
+                    ctl.update_status(&id, |s| s.streams = s.streams.saturating_sub(1));
+                    return;
+                }
+                v
+            };
             let mut check = tokio::time::interval(REVOCATION_CHECK);
             loop {
                 tokio::select! {
+                    changed = jails.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let ev = jail_event(&jails.borrow_and_update());
+                        // other groups' changes do not concern this agent
+                        let Some(Event::JailPolicies(p)) = &ev.event else { continue };
+                        if p.version == sent_version {
+                            continue;
+                        }
+                        sent_version = p.version.clone();
+                        if tx.send(Ok(ev)).await.is_err() {
+                            break;
+                        }
+                    }
                     changed = allow.changed() => {
                         if changed.is_err() {
                             break;
@@ -475,6 +525,10 @@ mod tests {
             panic!("allowlist expected")
         };
         assert_eq!(first.networks, ["10.0.0.0/8"]);
+        assert!(matches!(
+            next(&mut stream).await,
+            Some(Event::JailPolicies(_))
+        ));
 
         // a change reaches open streams at once, as the complete list
         let entry = |net: &str| crate::store::AllowEntry {
@@ -592,6 +646,11 @@ mod tests {
         };
         assert_eq!(al.networks, ["10.0.0.0/8"]);
         assert_eq!(al.version, ctl.allowlist_version());
+        // and the jail settings (none yet)
+        let Some(Event::JailPolicies(jp)) = stream.message().await.unwrap().unwrap().event else {
+            panic!("expected the jail policies after the allowlist")
+        };
+        assert!(jp.jails.is_empty());
 
         // local ban → decision; allowlisted, too broad and non-ban ignored
         let ack = a
@@ -675,6 +734,10 @@ mod tests {
             .into_inner();
         assert!(matches!(next(&mut stream).await, Some(Event::Snapshot(_))));
         assert!(matches!(next(&mut stream).await, Some(Event::Allowlist(_))));
+        assert!(matches!(
+            next(&mut stream).await,
+            Some(Event::JailPolicies(_))
+        ));
 
         ctl.set_group(&id, "db").unwrap();
         // closed within the check interval (5 s)
@@ -694,6 +757,92 @@ mod tests {
         assert!(matches!(next(&mut stream).await, Some(Event::Snapshot(_))));
         let hb = a.heartbeat(heartbeat()).await.unwrap().into_inner();
         assert_eq!(hb.groups, ["db"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn jail_policies_and_propagation() {
+        use crate::policy::{JailOverride, JailSettings};
+        let dir = std::env::temp_dir().join(format!("df2b-ctl-grpc-jails-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (addr, ctl) = start(&dir).await;
+        let mut a = enrolled(&addr, &ctl, &dir, "host-j").await; // group "web"
+        let mut stream = a
+            .subscribe(v1::SubscribeRequest { from_seq: 0 })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(next(&mut stream).await, Some(Event::Snapshot(_))));
+        assert!(matches!(next(&mut stream).await, Some(Event::Allowlist(_))));
+        let Some(Event::JailPolicies(empty)) = next(&mut stream).await else {
+            panic!("jail policies expected")
+        };
+        assert!(empty.jails.is_empty());
+
+        let ov = |group: Option<&str>, maxretry: u32| JailOverride {
+            jail: "sshd".into(),
+            group: group.map(Into::into),
+            settings: JailSettings {
+                maxretry: Some(maxretry),
+                ..Default::default()
+            },
+            updated_by: "ada".into(),
+            updated_at: Utc::now(),
+        };
+        // another group's change is not sent; this group's is, merged
+        ctl.set_jail_override(ov(Some("db"), 9)).unwrap();
+        ctl.set_jail_override(ov(None, 5)).unwrap();
+        let Some(Event::JailPolicies(p)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        assert_eq!((p.jails.len(), p.jails[0].maxretry), (1, Some(5)));
+        ctl.set_jail_override(ov(Some("web"), 3)).unwrap();
+        let Some(Event::JailPolicies(p)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        assert_eq!(p.jails[0].maxretry, Some(3), "group wins");
+
+        // the agent reports its jails
+        a.heartbeat(v1::HeartbeatRequest {
+            jails: vec![v1::JailStatus {
+                name: "sshd".into(),
+                filter: "sshd".into(),
+                enabled: true,
+                maxretry: 3,
+                bantime_ms: 3_600_000,
+                overridden: vec!["maxretry".into()],
+                ..Default::default()
+            }],
+            jail_policies_version: p.version.clone(),
+            ..heartbeat()
+        })
+        .await
+        .unwrap();
+        let st = ctl.agents()[0].status.clone();
+        assert_eq!(
+            (
+                st.jails[0].maxretry,
+                st.jails[0].bantime_secs,
+                st.jail_policies_version
+            ),
+            (3, 3600, p.version)
+        );
+
+        // propagation off: local bans stay local
+        ctl.set_propagate(crate::state::Propagate::Off).unwrap();
+        a.report(v1::ObservationBatch {
+            observations: vec![obs("203.0.113.50/32", true)],
+        })
+        .await
+        .unwrap();
+        assert_eq!(ctl.last_seq(), 0);
+        ctl.set_propagate(crate::state::Propagate::Global).unwrap();
+        a.report(v1::ObservationBatch {
+            observations: vec![obs("203.0.113.51/32", true)],
+        })
+        .await
+        .unwrap();
+        assert_eq!(ctl.last_seq(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

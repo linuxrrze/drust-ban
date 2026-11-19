@@ -641,9 +641,37 @@ df2bctl config check | reload
   expiry per network. The version hash includes expiries, so extensions
   reach agents too. Offense history is kept, so a returning attacker is
   escalated as before.
+- **Policies** (page "Policies"; `GET /api/v1/policies`):
+  - *Ban propagation* (`global` / `group` / `off`) is changeable at runtime
+    (`PUT /api/v1/policies/propagate`, `df2bctl propagate <mode>`) and stored
+    in redb (table `settings`). `--propagate`, when given, wins at startup
+    (and is stored); without it the stored value applies (default global).
+  - *Jail settings*: jails stay defined in each agent's configuration (log
+    sources and filter files are host-specific); admins override their
+    parameters — enabled, maxretry, findtime, bantime, bantime_factor,
+    max_bantime — for all agents or one group (`PUT|DELETE
+    /api/v1/jails/<name>/policy`, `df2bctl jails set|reset`). A PUT replaces
+    that scope's settings; unset fields fall through (group → all agents →
+    agent configuration), field by field. Bounds: maxretry 1–1000, findtime
+    ≤ 7 days, bans 1 minute–10 years, factor 1–10, max ≥ bantime. Stored in
+    redb (`jail_policies`) and written before they are published. The
+    decision stream sends each agent its group's merged settings
+    (`JailPolicies`, content-hash version) after the allowlist and on every
+    change that affects it; a group change re-sends them (new stream).
+  - Agents apply them on top of their configured values (`base`), so
+    removing a policy restores the configuration; counted failures and
+    offense history are kept; a disabled jail counts and bans nothing while
+    its active bans run out. Implausible entries are dropped. Settings are
+    stored in `agent.redb` and apply after a restart while the controller is
+    unreachable. Heartbeats report each jail's effective values, which
+    fields are overridden and its active bans; the Policies page and
+    `df2bctl jails list` show this inventory (values as ranges across
+    agents). Policies for jails no agent has reported yet are possible
+    (e.g. before rolling out a new jail). Changes are audited.
 - Not yet:
   observation timelines and sample log lines (needs observation reporting),
-  ASN/GeoIP, policies/jails editing.
+  ASN/GeoIP, central jail *definitions* (filters and log sources shipped
+  to agent groups), correlation policies.
 
 Pages:
 
@@ -715,7 +743,7 @@ systemd hardening.
 | Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
 | REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions (password, OIDC) with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
 | gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |
-| Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans and central allowlist applied |
+| Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans, central allowlist and jail settings applied |
 | Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI/browser → controller (HTTPS) done; HA, external actions, local socket TODO |
 | Web UI                       | Svelte, embedded: login, overview, bans, agents, address lookup, audit log; live updates; login with local users or OIDC |
 

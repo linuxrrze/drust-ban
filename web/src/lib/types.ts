@@ -143,3 +143,47 @@ export interface AllowEntry {
   expires_at: string | null;
   active_bans: number;
 }
+
+export type Propagate = 'global' | 'group' | 'off';
+
+export interface JailView {
+  name: string;
+  filter: string;
+  enabled: boolean;
+  maxretry: number;
+  findtime_secs: number;
+  bantime_secs: number;
+  bantime_factor: number;
+  max_bantime_secs: number;
+  overridden: string[];
+  active_bans: number;
+}
+
+export interface JailSettings {
+  enabled?: boolean;
+  maxretry?: number;
+  findtime?: string;
+  bantime?: string;
+  bantime_factor?: number;
+  max_bantime?: string;
+}
+
+export interface JailOverride extends JailSettings {
+  jail: string;
+  group: string | null;
+  updated_by: string;
+  updated_at: string;
+}
+
+export interface JailInfo {
+  name: string;
+  filters: string[];
+  agents: { agent: string; group: string; connected: boolean; jail: JailView }[];
+  overrides: JailOverride[];
+}
+
+export interface Policies {
+  propagate: Propagate;
+  jails: JailInfo[];
+  groups: string[];
+}

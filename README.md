@@ -73,6 +73,9 @@ cargo run -p df2bctl -- unban 203.0.113.7
 cargo run -p df2bctl -- audit
 cargo run -p df2bctl -- allowlist add 192.0.2.0/24 --comment office   # admin
 cargo run -p df2bctl -- allowlist list
+cargo run -p df2bctl -- jails list                # jails on the agents, central settings
+cargo run -p df2bctl -- jails set sshd --maxretry 3 --bantime 2h [--group web]   # admin
+cargo run -p df2bctl -- propagate group           # admin: local bans apply to the host's group
 cargo run -p df2bctl -- sessions list            # web UI sessions (admin)
 cargo run -p df2bctl -- sessions end --user olga # or <id>, or --all
 

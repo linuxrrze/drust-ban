@@ -310,6 +310,15 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/session/password", post(change_own_password))
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/api-tokens", get(list_tokens).post(create_token))
+        .route("/api/v1/policies", get(policies))
+        .route(
+            "/api/v1/policies/propagate",
+            axum::routing::put(set_propagate),
+        )
+        .route(
+            "/api/v1/jails/:name/policy",
+            axum::routing::put(set_jail_policy).delete(delete_jail_policy),
+        )
         .route(
             "/api/v1/allowlist",
             get(list_allow).post(add_allow).delete(remove_allow),
@@ -986,6 +995,201 @@ async fn remove_allow(
     Ok(Json(json!({ "removed": net })))
 }
 
+// --------------------------------------------------------------- policies
+
+/// Ban propagation and the jail inventory: every jail an agent reports
+/// (with its effective settings there) or a policy mentions.
+async fn policies(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    let overrides = ctl.jail_overrides();
+    let agents: Vec<_> = ctl.agents().into_iter().filter(|a| !a.revoked).collect();
+    let mut names: std::collections::BTreeSet<String> =
+        overrides.iter().map(|o| o.jail.clone()).collect();
+    for a in &agents {
+        names.extend(a.status.jails.iter().map(|j| j.name.clone()));
+    }
+    let jails: Vec<Value> = names
+        .into_iter()
+        .map(|name| {
+            let on: Vec<Value> = agents
+                .iter()
+                .filter_map(|a| {
+                    let j = a.status.jails.iter().find(|j| j.name == name)?;
+                    Some(json!({ "agent": a.record.id, "group": a.record.group, "connected": a.connected, "jail": j }))
+                })
+                .collect();
+            let mut filters: Vec<String> = agents
+                .iter()
+                .filter_map(|a| a.status.jails.iter().find(|j| j.name == name).map(|j| j.filter.clone()))
+                .collect();
+            filters.sort();
+            filters.dedup();
+            let mut ov: Vec<_> = overrides.iter().filter(|o| o.jail == name).cloned().collect();
+            ov.sort_by(|a, b| a.group.cmp(&b.group));
+            json!({ "name": name, "filters": filters, "agents": on, "overrides": ov })
+        })
+        .collect();
+    let mut groups: Vec<String> = agents.iter().map(|a| a.record.group.clone()).collect();
+    groups.sort();
+    groups.dedup();
+    Ok(Json(json!({
+        "propagate": ctl.propagate(),
+        "jails": jails,
+        "groups": groups,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PropagateRequest {
+    propagate: crate::state::Propagate,
+}
+
+/// Admin: what an agent's local ban turns into (global, group, off).
+async fn set_propagate(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Json(req): Json<PropagateRequest>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    let old = blocking(move || {
+        let old = c.set_propagate(req.propagate)?;
+        if old != req.propagate {
+            c.audit(
+                &caller.name,
+                caller.addr(),
+                "policy.propagate",
+                json!({ "from": old, "to": req.propagate }),
+            )?;
+        }
+        Ok(old)
+    })
+    .await?;
+    Ok(Json(json!({ "propagate": req.propagate, "previous": old })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JailPolicyRequest {
+    /// none: all agents
+    group: Option<String>,
+    enabled: Option<bool>,
+    maxretry: Option<u32>,
+    /// durations as text, e.g. "10m"
+    findtime: Option<String>,
+    bantime: Option<String>,
+    bantime_factor: Option<f64>,
+    max_bantime: Option<String>,
+}
+
+fn jail_scope(name: &str, group: Option<&str>) -> Result<(), ApiError> {
+    if !crate::policy::valid_jail(name) {
+        return Err(ApiError::bad_request(
+            "invalid jail name (letters, digits, - _ .)",
+        ));
+    }
+    if group.is_some_and(|g| !files::valid_group(g)) {
+        return Err(ApiError::bad_request("invalid group name"));
+    }
+    Ok(())
+}
+
+/// Admin: replaces the settings for a jail, for all agents or one group.
+/// Unset fields keep what is below (the agents' configuration, or the
+/// settings for all agents); all fields unset removes the policy.
+async fn set_jail_policy(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Json(req): Json<JailPolicyRequest>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let group = req
+        .group
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(str::to_owned);
+    jail_scope(&name, group.as_deref())?;
+    let dur =
+        |v: &Option<String>, what: &str| v.as_deref().map(|t| parse_duration(t, what)).transpose();
+    let settings = crate::policy::JailSettings {
+        enabled: req.enabled,
+        maxretry: req.maxretry,
+        findtime: dur(&req.findtime, "findtime")?,
+        bantime: dur(&req.bantime, "bantime")?,
+        bantime_factor: req.bantime_factor,
+        max_bantime: dur(&req.max_bantime, "max_bantime")?,
+    };
+    settings.validate().map_err(ApiError::bad_request)?;
+    let o = crate::policy::JailOverride {
+        jail: name.clone(),
+        group: group.clone(),
+        settings: settings.clone(),
+        updated_by: caller.name.clone(),
+        updated_at: Utc::now(),
+    };
+    let c = ctl.clone();
+    let prev = blocking(move || {
+        let prev = c.set_jail_override(o)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "jail.policy",
+            json!({
+                "jail": name, "group": group, "settings": settings,
+                "previous": prev.as_ref().map(|p| &p.settings),
+            }),
+        )?;
+        Ok(prev)
+    })
+    .await?;
+    Ok(Json(json!({ "previous": prev.map(|p| p.settings) })))
+}
+
+#[derive(Deserialize)]
+struct JailPolicyQuery {
+    group: Option<String>,
+}
+
+/// Admin: removes the settings for a jail (all agents, or `?group=`).
+async fn delete_jail_policy(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Query(q): Query<JailPolicyQuery>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    jail_scope(&name, q.group.as_deref())?;
+    let exists = ctl
+        .jail_overrides()
+        .iter()
+        .any(|o| o.jail == name && o.group == q.group);
+    if !exists {
+        return Err(ApiError::not_found("no such jail policy"));
+    }
+    let c = ctl.clone();
+    let group = q.group.clone();
+    blocking(move || {
+        c.set_jail_override(crate::policy::JailOverride {
+            jail: name.clone(),
+            group: group.clone(),
+            settings: Default::default(),
+            updated_by: caller.name.clone(),
+            updated_at: Utc::now(),
+        })?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "jail.policy_remove",
+            json!({ "jail": name, "group": group }),
+        )
+    })
+    .await?;
+    Ok(Json(json!({ "removed": true })))
+}
+
 // ------------------------------------------------------------- API tokens
 
 /// Longest API token lifetime that can be chosen in the UI/API ("never"
@@ -1625,7 +1829,7 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         },
         "active_decisions": ctl.active_decisions().len(),
         "last_seq": ctl.last_seq(),
-        "propagate": ctl.settings.propagate,
+        "propagate": ctl.propagate(),
         "allowlist": ctl.allowlist().iter().map(|e| e.net).collect::<Vec<_>>(),
         "allowlist_version": ctl.allowlist_version(),
         "sessions": ctl.sessions.count(),
@@ -3586,6 +3790,209 @@ mod tests {
             .unwrap()
             .clone();
         assert!(first_unban["details"]["allowed_until"].is_string());
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn policies_and_jail_settings() {
+        let env = Env::new("policies").await;
+        env.ctl
+            .put_agent(crate::store::AgentRecord {
+                id: "web-01-abc".into(),
+                hostname: "web-01".into(),
+                group: "web".into(),
+                enrolled_at: Utc::now(),
+                serials: vec![],
+                cert_not_after: Utc::now(),
+                resync: false,
+            })
+            .unwrap();
+        env.ctl.update_status("web-01-abc", |s| {
+            s.jails = vec![crate::state::JailView {
+                name: "sshd".into(),
+                filter: "sshd".into(),
+                enabled: true,
+                maxretry: 5,
+                findtime_secs: 600,
+                bantime_secs: 3600,
+                bantime_factor: 2.0,
+                ..Default::default()
+            }];
+        });
+        let viewer = env.token("vic", Role::Viewer);
+        let admin = env.token("ada", Role::Admin);
+        let put = |tok: &str, path: &str, body: Value| {
+            let (env, tok, url) = (&env, tok.to_owned(), format!("{}{path}", env.base));
+            async move {
+                let r = env
+                    .http
+                    .put(url)
+                    .bearer_auth(tok)
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                (r.status(), r.json::<Value>().await.unwrap_or(Value::Null))
+            }
+        };
+
+        let (st, v) = env
+            .call("GET", "/api/v1/policies", &viewer, json!({}))
+            .await;
+        assert_eq!(st, S::OK);
+        assert_eq!(
+            (v["propagate"].as_str(), v["groups"][0].as_str()),
+            (Some("global"), Some("web"))
+        );
+        assert_eq!(v["jails"][0]["name"], "sshd");
+        assert_eq!(v["jails"][0]["agents"][0]["jail"]["maxretry"], 5);
+
+        // ban propagation
+        assert_eq!(
+            put(
+                &viewer,
+                "/api/v1/policies/propagate",
+                json!({ "propagate": "off" })
+            )
+            .await
+            .0,
+            S::FORBIDDEN
+        );
+        assert_eq!(
+            put(
+                &admin,
+                "/api/v1/policies/propagate",
+                json!({ "propagate": "sometimes" })
+            )
+            .await
+            .0,
+            S::UNPROCESSABLE_ENTITY
+        );
+        let (st, v) = put(
+            &admin,
+            "/api/v1/policies/propagate",
+            json!({ "propagate": "group" }),
+        )
+        .await;
+        assert_eq!((st, v["previous"].as_str()), (S::OK, Some("global")));
+        assert_eq!(env.ctl.propagate(), crate::state::Propagate::Group);
+
+        // jail settings
+        assert_eq!(
+            put(
+                &viewer,
+                "/api/v1/jails/sshd/policy",
+                json!({ "maxretry": 3 })
+            )
+            .await
+            .0,
+            S::FORBIDDEN
+        );
+        for (path, body) in [
+            ("/api/v1/jails/sshd/policy", json!({ "maxretry": 0 })),
+            ("/api/v1/jails/sshd/policy", json!({ "bantime": "10s" })),
+            (
+                "/api/v1/jails/sshd/policy",
+                json!({ "bantime": "2h", "max_bantime": "1h" }),
+            ),
+            (
+                "/api/v1/jails/sshd/policy",
+                json!({ "bantime_factor": 50.0 }),
+            ),
+            ("/api/v1/jails/sshd/policy", json!({ "findtime": "soon" })),
+            ("/api/v1/jails/a%20b/policy", json!({ "maxretry": 3 })),
+            (
+                "/api/v1/jails/sshd/policy",
+                json!({ "group": "a b", "maxretry": 3 }),
+            ),
+        ] {
+            let (st, v) = put(&admin, path, body.clone()).await;
+            assert_eq!(st, S::BAD_REQUEST, "{path} {body} {v}");
+        }
+        let (st, v) = put(
+            &admin,
+            "/api/v1/jails/sshd/policy",
+            json!({ "maxretry": 3, "bantime": "2h" }),
+        )
+        .await;
+        assert_eq!((st, v["previous"].is_null()), (S::OK, true));
+        let (st, _) = put(
+            &admin,
+            "/api/v1/jails/sshd/policy",
+            json!({ "group": "web", "enabled": false }),
+        )
+        .await;
+        assert_eq!(st, S::OK);
+        // replacing: fields not given are no longer overridden
+        let (_, v) = put(
+            &admin,
+            "/api/v1/jails/sshd/policy",
+            json!({ "maxretry": 4 }),
+        )
+        .await;
+        assert_eq!(v["previous"]["maxretry"], 3);
+        let merged = crate::policy::merged(&env.ctl.jail_overrides(), "web");
+        assert_eq!(merged[0].1.maxretry, Some(4));
+        assert_eq!(merged[0].1.bantime, None);
+        assert_eq!(merged[0].1.enabled, Some(false));
+        let (_, v) = env
+            .call("GET", "/api/v1/policies", &viewer, json!({}))
+            .await;
+        assert_eq!(v["jails"][0]["overrides"].as_array().unwrap().len(), 2);
+        // a jail no agent has yet can be configured too
+        assert_eq!(
+            put(
+                &admin,
+                "/api/v1/jails/nginx-auth/policy",
+                json!({ "bantime": "1d" })
+            )
+            .await
+            .0,
+            S::OK
+        );
+
+        // removing
+        let del = |q: &str| {
+            let (env, admin, url) = (
+                &env,
+                admin.clone(),
+                format!("{}/api/v1/jails/sshd/policy{q}", env.base),
+            );
+            async move {
+                env.http
+                    .delete(url)
+                    .bearer_auth(admin)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(del("?group=web").await, S::OK);
+        assert_eq!(del("?group=web").await, S::NOT_FOUND);
+        assert_eq!(del("").await, S::OK);
+        assert_eq!(env.ctl.jail_overrides().len(), 1, "only nginx-auth is left");
+
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let actions: Vec<_> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action"].as_str().unwrap().to_owned())
+            .filter(|a| a.starts_with("jail.") || a.starts_with("policy."))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "jail.policy_remove",
+                "jail.policy_remove",
+                "jail.policy",
+                "jail.policy",
+                "jail.policy",
+                "jail.policy",
+                "policy.propagate"
+            ]
+        );
         let _ = std::fs::remove_dir_all(&env.dir);
     }
 

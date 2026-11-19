@@ -56,11 +56,79 @@ struct Offender {
     banned_until: DateTime<Utc>,
 }
 
+/// The tunable settings of a jail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JailParams {
+    pub enabled: bool,
+    pub maxretry: u32,
+    pub findtime: Duration,
+    pub bantime: Duration,
+    pub factor: f64,
+    pub max_bantime: Option<Duration>,
+}
+
+/// Central overrides for one jail (from the controller); `None` keeps the
+/// configured value.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JailOverride {
+    pub jail: String,
+    pub enabled: Option<bool>,
+    pub maxretry: Option<u32>,
+    #[serde(with = "humantime_serde")]
+    pub findtime: Option<Duration>,
+    #[serde(with = "humantime_serde")]
+    pub bantime: Option<Duration>,
+    pub factor: Option<f64>,
+    #[serde(with = "humantime_serde")]
+    pub max_bantime: Option<Duration>,
+}
+
+impl JailParams {
+    fn with(&self, o: Option<&JailOverride>) -> (Self, Vec<&'static str>) {
+        let mut p = self.clone();
+        let mut changed = Vec::new();
+        let Some(o) = o else { return (p, changed) };
+        macro_rules! set {
+            ($field:ident, $src:ident, $name:literal) => {
+                if let Some(v) = o.$src {
+                    p.$field = v;
+                    changed.push($name);
+                }
+            };
+        }
+        set!(enabled, enabled, "enabled");
+        set!(maxretry, maxretry, "maxretry");
+        set!(findtime, findtime, "findtime");
+        set!(bantime, bantime, "bantime");
+        set!(factor, factor, "bantime_factor");
+        if let Some(m) = o.max_bantime {
+            p.max_bantime = Some(m);
+            changed.push("max_bantime");
+        }
+        (p, changed)
+    }
+}
+
+/// Status of a jail for heartbeats.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JailStatus {
+    pub name: String,
+    pub filter: String,
+    pub params: JailParams,
+    pub overridden: Vec<&'static str>,
+    pub active_bans: usize,
+}
+
 #[derive(Debug)]
 struct Jail {
     name: String,
+    filter_name: String,
     sources: Vec<String>,
     filter: Filter,
+    /// From the configuration; central overrides apply on top.
+    base: JailParams,
+    enabled: bool,
+    overridden: Vec<&'static str>,
     tracker: Tracker,
     bantime: Duration,
     factor: f64,
@@ -72,6 +140,7 @@ struct Jail {
     /// unban decision ends the ban but keeps the offense count.
     offenders: HashMap<IpKey, Offender>,
     maxretry: u32,
+    findtime: Duration,
 }
 
 #[derive(Debug)]
@@ -163,7 +232,7 @@ impl Engine {
         let ts = line.ts.unwrap_or(now);
         let mut actions = Vec::new();
         for jail in &mut self.jails {
-            if !jail.sources.iter().any(|s| s.as_str() == &*line.source) {
+            if !jail.enabled || !jail.sources.iter().any(|s| s.as_str() == &*line.source) {
                 continue;
             }
             let Some(m) = jail.filter.match_line(&line.line) else {
@@ -220,6 +289,71 @@ impl Engine {
     }
 
     /// Number of (jail, key) bans currently active.
+    /// Applies the controller's jail settings (replacing earlier ones;
+    /// jails without an entry go back to their configuration). Overrides
+    /// for jails this agent does not have are ignored. Counted failures
+    /// and offense history are kept; a disabled jail stops counting and
+    /// banning, its active bans run out.
+    pub fn apply_jail_overrides(&mut self, overrides: &[JailOverride]) {
+        for j in &mut self.jails {
+            let o = overrides.iter().find(|o| o.jail == j.name);
+            let (p, changed) = j.base.with(o);
+            let current = JailParams {
+                enabled: j.enabled,
+                maxretry: j.maxretry,
+                findtime: j.tracker_findtime(),
+                bantime: j.bantime,
+                factor: j.factor,
+                max_bantime: j.max_bantime,
+            };
+            if p != current {
+                tracing::info!(
+                    jail = %j.name,
+                    enabled = p.enabled,
+                    maxretry = p.maxretry,
+                    findtime = ?p.findtime,
+                    bantime = ?p.bantime,
+                    factor = p.factor,
+                    max_bantime = ?p.max_bantime,
+                    "jail settings changed by the controller"
+                );
+            }
+            j.enabled = p.enabled;
+            j.maxretry = p.maxretry;
+            j.tracker.set_limits(p.maxretry, p.findtime);
+            j.findtime = p.findtime;
+            j.bantime = p.bantime;
+            j.factor = p.factor;
+            j.max_bantime = p.max_bantime;
+            j.overridden = changed;
+        }
+    }
+
+    /// Effective settings per jail (heartbeats).
+    pub fn jail_status(&self, now: DateTime<Utc>) -> Vec<JailStatus> {
+        self.jails
+            .iter()
+            .map(|j| JailStatus {
+                name: j.name.clone(),
+                filter: j.filter_name.clone(),
+                params: JailParams {
+                    enabled: j.enabled,
+                    maxretry: j.maxretry,
+                    findtime: j.tracker_findtime(),
+                    bantime: j.bantime,
+                    factor: j.factor,
+                    max_bantime: j.max_bantime,
+                },
+                overridden: j.overridden.clone(),
+                active_bans: j
+                    .offenders
+                    .values()
+                    .filter(|o| o.banned_until > now)
+                    .count(),
+            })
+            .collect()
+    }
+
     pub fn active_bans(&self, now: DateTime<Utc>) -> usize {
         self.jails
             .iter()
@@ -305,6 +439,17 @@ impl Jail {
     fn new(cfg: &JailConfig, filter: Filter) -> Self {
         Self {
             name: cfg.name.clone(),
+            filter_name: cfg.filter.clone(),
+            base: JailParams {
+                enabled: true,
+                maxretry: cfg.maxretry,
+                findtime: cfg.findtime,
+                bantime: cfg.bantime,
+                factor: cfg.bantime_factor,
+                max_bantime: cfg.max_bantime,
+            },
+            enabled: true,
+            overridden: Vec::new(),
             sources: cfg.sources.clone(),
             filter,
             tracker: Tracker::new(cfg.maxretry, cfg.findtime, cfg.max_tracked),
@@ -313,7 +458,12 @@ impl Jail {
             max_bantime: cfg.max_bantime,
             offenders: HashMap::new(),
             maxretry: cfg.maxretry,
+            findtime: cfg.findtime,
         }
+    }
+
+    fn tracker_findtime(&self) -> Duration {
+        self.findtime
     }
 }
 
@@ -442,6 +592,67 @@ mod tests {
         let a = e.process(&line("auth", "198.51.100.1"), later);
         assert_eq!(a[0].offense, 2);
         assert_eq!(a[0].duration, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn central_jail_settings() {
+        let mut e = engine(); // sshd: maxretry 2, bantime 1h, factor 2
+        let now = Utc::now();
+        let fails = |e: &mut Engine, ip: &str, n: usize| {
+            (0..n)
+                .flat_map(|_| e.process(&line("auth", ip), now))
+                .collect::<Vec<_>>()
+        };
+        let o = |f: fn(&mut JailOverride)| {
+            let mut o = JailOverride {
+                jail: "sshd".into(),
+                ..Default::default()
+            };
+            f(&mut o);
+            o
+        };
+
+        // stricter threshold, longer ban
+        e.apply_jail_overrides(&[
+            o(|o| {
+                o.maxretry = Some(3);
+                o.bantime = Some(Duration::from_secs(7200));
+            }),
+            JailOverride {
+                jail: "unknown".into(),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        ]);
+        assert!(
+            fails(&mut e, "203.0.113.1", 2).is_empty(),
+            "2 failures no longer enough"
+        );
+        let b = fails(&mut e, "203.0.113.1", 1);
+        assert_eq!((b.len(), b[0].duration), (1, Duration::from_secs(7200)));
+        let st = &e.jail_status(now)[0];
+        assert_eq!(
+            (st.name.as_str(), st.filter.as_str(), st.params.maxretry),
+            ("sshd", "sshd", 3)
+        );
+        assert_eq!(st.overridden, ["maxretry", "bantime"]);
+        assert_eq!(st.active_bans, 1);
+
+        // disabled: nothing is counted or banned; active bans stay
+        e.apply_jail_overrides(&[o(|o| o.enabled = Some(false))]);
+        assert!(fails(&mut e, "203.0.113.2", 5).is_empty());
+        assert!(e.is_banned(&"203.0.113.1/32".parse().unwrap(), now));
+        assert!(!e.jail_status(now)[0].params.enabled);
+
+        // no policy: back to the configuration
+        e.apply_jail_overrides(&[]);
+        let st = &e.jail_status(now)[0];
+        assert_eq!(
+            (st.params.maxretry, st.params.bantime, st.params.enabled),
+            (2, Duration::from_secs(3600), true)
+        );
+        assert!(st.overridden.is_empty());
+        assert_eq!(fails(&mut e, "203.0.113.3", 2).len(), 1);
     }
 
     #[test]

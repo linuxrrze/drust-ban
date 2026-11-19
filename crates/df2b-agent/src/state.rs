@@ -30,6 +30,14 @@ const POSITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("positions"
 const OFFENDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("offenders");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const CENTRAL_ALLOWLIST: &str = "central_allowlist";
+const JAIL_POLICIES: &str = "jail_policies";
+
+/// The controller's jail settings as last applied.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JailPolicies {
+    pub version: String,
+    pub jails: Vec<crate::engine::JailOverride>,
+}
 
 /// The controller's allowlist as last applied.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -114,6 +122,7 @@ pub struct Loaded {
     pub positions: HashMap<String, Position>,
     pub offenders: Vec<OffenderRecord>,
     pub central_allowlist: Option<CentralAllowlist>,
+    pub jail_policies: Option<JailPolicies>,
 }
 
 #[derive(Clone)]
@@ -168,6 +177,12 @@ impl State {
                 }
             }
         }
+        if let Some(v) = tx.open_table(META)?.get(JAIL_POLICIES)? {
+            match serde_json::from_slice(v.value()) {
+                Ok(p) => loaded.jail_policies = Some(p),
+                Err(e) => tracing::warn!(error = %e, "ignoring unreadable saved jail policies"),
+            }
+        }
         if let Some(v) = tx.open_table(META)?.get(CENTRAL_ALLOWLIST)? {
             match serde_json::from_slice(v.value()) {
                 Ok(a) => loaded.central_allowlist = Some(a),
@@ -175,6 +190,15 @@ impl State {
             }
         }
         Ok(loaded)
+    }
+
+    /// Saves the jail policies (only when they change). Blocking.
+    pub fn save_jail_policies(&self, p: &JailPolicies) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?
+            .insert(JAIL_POLICIES, serde_json::to_vec(p)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Saves the central allowlist (rare: only when it changes). Blocking.
@@ -316,6 +340,30 @@ mod tests {
         }
         let st = State::open(&dir).unwrap();
         assert_eq!(st.load().unwrap().central_allowlist, Some(a));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jail_policies_persist() {
+        let dir = tmp("jailpol");
+        let p = JailPolicies {
+            version: "v9".into(),
+            jails: vec![crate::engine::JailOverride {
+                jail: "sshd".into(),
+                maxretry: Some(3),
+                bantime: Some(std::time::Duration::from_secs(7200)),
+                ..Default::default()
+            }],
+        };
+        {
+            let st = State::open(&dir).unwrap();
+            assert!(st.load().unwrap().jail_policies.is_none());
+            st.save_jail_policies(&p).unwrap();
+        }
+        assert_eq!(
+            State::open(&dir).unwrap().load().unwrap().jail_policies,
+            Some(p)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

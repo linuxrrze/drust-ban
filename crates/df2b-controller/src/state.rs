@@ -31,7 +31,7 @@ const MAX_BACKLOG: u64 = 10_000;
 const HOURLY_KEEP: i64 = 7 * 24;
 
 /// What happens to an agent's local ban (DESIGN.md §4.2 `propagate_local`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Propagate {
     /// Ban on all agents.
@@ -45,6 +45,7 @@ pub enum Propagate {
 pub struct Settings {
     pub state_dir: PathBuf,
     pub cert_lifetime: Duration,
+    /// Initial value; changed at runtime with [`Controller::set_propagate`].
     pub propagate: Propagate,
     /// Fixed entries (`--allow`); more can be added through the API.
     pub allowlist: Allowlist,
@@ -69,6 +70,10 @@ pub struct AgentStatus {
     pub streams: u32,
     /// Central allowlist version the agent applies ("" = unknown).
     pub allowlist_version: String,
+    /// The agent's jails with their effective settings.
+    pub jails: Vec<JailView>,
+    /// Jail policies version the agent applies ("" = unknown).
+    pub jail_policies_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,6 +149,28 @@ pub struct Controller {
     allow_entries: Mutex<Vec<AllowEntry>>,
     /// The complete allowlist as sent to agents; changes wake up streams.
     allow_tx: tokio::sync::watch::Sender<Arc<AllowSnapshot>>,
+    /// Central jail settings; streams send each agent its group's merge.
+    jail_tx: tokio::sync::watch::Sender<Arc<Vec<crate::policy::JailOverride>>>,
+    /// What an agent's local ban turns into (changeable at runtime).
+    propagate: Mutex<Propagate>,
+    jail_write: Mutex<()>,
+}
+
+/// A jail as an agent reports it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct JailView {
+    pub name: String,
+    pub filter: String,
+    pub enabled: bool,
+    pub maxretry: u32,
+    pub findtime_secs: u64,
+    pub bantime_secs: u64,
+    pub bantime_factor: f64,
+    /// 0 = no maximum
+    pub max_bantime_secs: u64,
+    /// settings that come from a central policy
+    pub overridden: Vec<String>,
+    pub active_bans: u64,
 }
 
 /// The central allowlist as distributed to agents.
@@ -241,6 +268,12 @@ impl Controller {
             last_seq = inner.last_seq,
             "controller state loaded"
         );
+        let jail_tx = tokio::sync::watch::channel(Arc::new(store.jail_overrides()?)).0;
+        // a stored change wins over the default; an explicit flag is
+        // applied by main.rs with set_propagate
+        let propagate = store
+            .setting::<Propagate>("propagate")?
+            .unwrap_or(settings.propagate);
         let allow_tx = tokio::sync::watch::channel(Arc::new(AllowSnapshot::new(
             settings
                 .allowlist
@@ -265,6 +298,9 @@ impl Controller {
             token_last_used: Mutex::new(HashMap::new()),
             allow_tx,
             allow_entries: Mutex::new(allow_entries),
+            jail_tx,
+            propagate: Mutex::new(propagate),
+            jail_write: Mutex::new(()),
         })
     }
 
@@ -608,6 +644,53 @@ impl Controller {
         entries.retain(|e| e.net != *net);
         self.publish_allowlist(&entries);
         Ok(())
+    }
+
+    pub fn propagate(&self) -> Propagate {
+        *self.propagate.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Changes and stores the propagation policy (blocking).
+    pub fn set_propagate(&self, p: Propagate) -> anyhow::Result<Propagate> {
+        let mut cur = self.propagate.lock().unwrap_or_else(|e| e.into_inner());
+        self.store.put_setting("propagate", &p)?;
+        Ok(std::mem::replace(&mut cur, p))
+    }
+
+    pub fn jail_overrides(&self) -> Arc<Vec<crate::policy::JailOverride>> {
+        self.jail_tx.borrow().clone()
+    }
+
+    pub fn jail_watch(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Arc<Vec<crate::policy::JailOverride>>> {
+        self.jail_tx.subscribe()
+    }
+
+    /// Stores an override (replacing the one for the same jail and scope;
+    /// an empty one removes it), then publishes it. Blocking. Returns the
+    /// previous one.
+    pub fn set_jail_override(
+        &self,
+        o: crate::policy::JailOverride,
+    ) -> anyhow::Result<Option<crate::policy::JailOverride>> {
+        // one writer at a time: store and published list stay in step
+        let _write = self.jail_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v = (**self.jail_tx.borrow()).clone();
+        let prev = v
+            .iter()
+            .position(|x| x.jail == o.jail && x.group == o.group)
+            .map(|i| v.remove(i));
+        if o.settings.is_empty() {
+            self.store
+                .delete_jail_override(&o.jail, o.group.as_deref())?;
+        } else {
+            self.store.put_jail_override(&o)?;
+            v.push(o);
+        }
+        // only what is stored reaches the agents
+        self.jail_tx.send_replace(Arc::new(v));
+        Ok(prev)
     }
 
     pub fn token_used(&self, name: &str) {
@@ -1081,6 +1164,46 @@ mod tests {
             .map(|(n, _)| n.to_string())
             .collect();
         assert_eq!(temp, ["203.0.113.0/24"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_settings_persist() {
+        let (c, dir) = ctl("runtime");
+        assert_eq!(c.propagate(), Propagate::Global);
+        assert_eq!(c.set_propagate(Propagate::Off).unwrap(), Propagate::Global);
+        c.set_jail_override(crate::policy::JailOverride {
+            jail: "sshd".into(),
+            group: Some("web".into()),
+            settings: crate::policy::JailSettings {
+                maxretry: Some(3),
+                ..Default::default()
+            },
+            updated_by: "ada".into(),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        drop(c);
+        let settings = Settings {
+            state_dir: dir.clone(),
+            cert_lifetime: Duration::from_secs(3600),
+            propagate: Propagate::Global, // default from the command line
+            allowlist: Allowlist::default(),
+            oidc: None,
+            https_internal_ca: true,
+        };
+        let c = Controller::open(
+            settings,
+            Ca::generate("t").unwrap(),
+            Store::open(&dir).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.propagate(),
+            Propagate::Off,
+            "the stored setting wins over the default"
+        );
+        assert_eq!(c.jail_overrides().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

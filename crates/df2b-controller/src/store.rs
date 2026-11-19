@@ -19,6 +19,9 @@ const AGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("agents");
 const DECISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("decisions");
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 const ALLOWLIST: TableDefinition<&str, &[u8]> = TableDefinition::new("allowlist");
+const JAIL_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_policies");
+/// Runtime settings changed through the API (e.g. "propagate").
+const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
 /// An allowlist entry added through the API (`--allow` entries are not
 /// stored).
@@ -82,6 +85,8 @@ impl Store {
         tx.open_table(DECISIONS)?;
         tx.open_table(AUDIT)?;
         tx.open_table(ALLOWLIST)?;
+        tx.open_table(JAIL_POLICIES)?;
+        tx.open_table(SETTINGS)?;
         tx.commit()?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -170,6 +175,54 @@ impl Store {
             .is_some();
         tx.commit()?;
         Ok(found)
+    }
+
+    pub fn jail_overrides(&self) -> anyhow::Result<Vec<crate::policy::JailOverride>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for item in tx.open_table(JAIL_POLICIES)?.iter()? {
+            let (_, v) = item?;
+            out.push(serde_json::from_slice(v.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn put_jail_override(&self, o: &crate::policy::JailOverride) -> anyhow::Result<()> {
+        let key = crate::policy::JailOverride::key(&o.jail, o.group.as_deref());
+        let tx = self.db.begin_write()?;
+        tx.open_table(JAIL_POLICIES)?
+            .insert(key.as_str(), serde_json::to_vec(o)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_jail_override(&self, jail: &str, group: Option<&str>) -> anyhow::Result<bool> {
+        let key = crate::policy::JailOverride::key(jail, group);
+        let tx = self.db.begin_write()?;
+        let found = tx
+            .open_table(JAIL_POLICIES)?
+            .remove(key.as_str())?
+            .is_some();
+        tx.commit()?;
+        Ok(found)
+    }
+
+    pub fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> anyhow::Result<Option<T>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(SETTINGS)?;
+        let v = t.get(key)?;
+        Ok(match v {
+            Some(v) => Some(serde_json::from_slice(v.value())?),
+            None => None,
+        })
+    }
+
+    pub fn put_setting<T: Serialize>(&self, key: &str, value: &T) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(SETTINGS)?
+            .insert(key, serde_json::to_vec(value)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Newest first, at most `limit`, with `seq < before`.

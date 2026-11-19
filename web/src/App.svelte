@@ -15,6 +15,7 @@
   import Users from './pages/Users.svelte';
   import Tokens from './pages/Tokens.svelte';
   import Allowlist from './pages/Allowlist.svelte';
+  import PoliciesPage from './pages/Policies.svelte';
   import Account from './pages/Account.svelte';
   import ChangePassword from './components/ChangePassword.svelte';
 
@@ -38,6 +39,7 @@
     { id: 'agents', label: 'Agents' },
     { id: 'ip', label: 'Address lookup' },
     { id: 'allowlist', label: 'Allowlist' },
+    { id: 'policies', label: 'Policies' },
   ];
   const adminNav = [
     { id: 'users', label: 'Users' },
@@ -97,6 +99,8 @@
         <Agents selected={route.parts[1] ?? null} />
       {:else if page === 'ip'}
         {#key route.parts[1]}<Ip addr={route.parts.slice(1).join('/')} />{/key}
+      {:else if page === 'policies'}
+        <PoliciesPage />
       {:else if page === 'allowlist'}
         <Allowlist />
       {:else if page === 'account'}

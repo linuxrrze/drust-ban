@@ -70,6 +70,25 @@ message HeartbeatRequest {
   uint64 last_applied_seq = 7;
   // Version of the central allowlist the agent applies ("" = none / old agent).
   string allowlist_version = 8;
+  // The agent's jails with their effective settings.
+  repeated JailStatus jails = 9;
+  // Version of the jail policies the agent applies ("" = none / old agent).
+  string jail_policies_version = 10;
+}
+
+message JailStatus {
+  string name = 1;
+  string filter = 2;
+  bool enabled = 3;
+  uint32 maxretry = 4;
+  int64 findtime_ms = 5;
+  int64 bantime_ms = 6;
+  double bantime_factor = 7;
+  // 0 = no maximum
+  int64 max_bantime_ms = 8;
+  // Settings that come from a central policy, e.g. "maxretry".
+  repeated string overridden = 9;
+  uint64 active_bans = 10;
 }
 
 message HeartbeatResponse {
@@ -142,7 +161,28 @@ message DecisionEvent {
     // The complete central allowlist: sent after the snapshot/backlog and
     // whenever it changes. Replaces the previous one.
     AllowlistUpdate allowlist = 3;
+    // Central jail settings for this agent (its group's merged with the
+    // ones for all agents): sent after the allowlist and on every change.
+    // Replaces the previous ones.
+    JailPolicies jail_policies = 4;
   }
+}
+
+message JailPolicies {
+  string version = 1;
+  repeated JailPolicy jails = 2;
+}
+
+// Overrides for a jail the agent defines; unset fields keep the agent's
+// configuration. Unknown jails are ignored.
+message JailPolicy {
+  string jail = 1;
+  optional bool enabled = 2;
+  optional uint32 maxretry = 3;
+  optional int64 findtime_ms = 4;
+  optional int64 bantime_ms = 5;
+  optional double bantime_factor = 6;
+  optional int64 max_bantime_ms = 7;
 }
 
 message AllowlistUpdate {

@@ -100,6 +100,9 @@ async fn main() -> anyhow::Result<()> {
     let mut pending = Pending::default();
     // the controller's allowlist as last received: applies before the
     // controller is reachable again
+    // the controller's jail settings as last received
+    let mut jail_policies = loaded.jail_policies.clone().unwrap_or_default();
+    engine.apply_jail_overrides(&jail_policies.jails);
     let mut central = loaded.central_allowlist.clone().unwrap_or_default();
     engine.set_central_allowlist(central.live(Utc::now()));
     for r in engine.lift_allowlisted(Utc::now()) {
@@ -152,6 +155,9 @@ async fn main() -> anyhow::Result<()> {
     let stats = Arc::new(LinkStats::default());
     if let Ok(mut v) = stats.allowlist_version.lock() {
         v.clone_from(&central.version);
+    }
+    if let Ok(mut v) = stats.jail_policies_version.lock() {
+        v.clone_from(&jail_policies.version);
     }
     let mut link: Option<Link> = match &cfg.agent.controller {
         Some(url) => Some(link::spawn(
@@ -230,6 +236,23 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 };
                 let now = Utc::now();
+                if let FromController::JailPolicies(p) = ev {
+                    engine.apply_jail_overrides(&p.jails);
+                    if p.version != jail_policies.version {
+                        info!(version = %p.version, jails = p.jails.len(), "jail policies applied");
+                        let (st, saved) = (state.clone(), p.clone());
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = st.save_jail_policies(&saved) {
+                                error!(error = %format!("{e:#}"), "saving the jail policies failed");
+                            }
+                        });
+                    }
+                    if let Ok(mut v) = stats.jail_policies_version.lock() {
+                        v.clone_from(&p.version);
+                    }
+                    jail_policies = p;
+                    continue;
+                }
                 if let FromController::Allowlist(list) = ev {
                     apply_central_allowlist(
                         &mut engine, &remote, &backend, &state, &mut pending, &mut central, list,
@@ -253,6 +276,9 @@ async fn main() -> anyhow::Result<()> {
                     (engine.active_bans(Utc::now()) + remote.len()) as u64,
                     Ordering::Relaxed,
                 );
+                if let Ok(mut j) = stats.jails.lock() {
+                    *j = engine.jail_status(Utc::now()).into_iter().map(jail_status).collect();
+                }
                 if let Err(e) = state.flush_async(std::mem::take(&mut pending)).await {
                     error!(error = %format!("{e:#}"), "saving state failed");
                 }
@@ -322,6 +348,22 @@ fn apply_central_allowlist(
         });
     }
     *current = list;
+}
+
+fn jail_status(j: engine::JailStatus) -> v1::JailStatus {
+    let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
+    v1::JailStatus {
+        name: j.name,
+        filter: j.filter,
+        enabled: j.params.enabled,
+        maxretry: j.params.maxretry,
+        findtime_ms: ms(j.params.findtime),
+        bantime_ms: ms(j.params.bantime),
+        bantime_factor: j.params.factor,
+        max_bantime_ms: j.params.max_bantime.map_or(0, ms),
+        overridden: j.overridden.into_iter().map(str::to_owned).collect(),
+        active_bans: j.active_bans as u64,
+    }
 }
 
 async fn next_event(link: &mut Option<Link>) -> Option<FromController> {

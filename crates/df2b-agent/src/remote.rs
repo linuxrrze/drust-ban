@@ -141,7 +141,7 @@ impl RemoteBans {
                 RemoteKind::Ban | RemoteKind::Allow => {}
             },
             // handled by the main loop (engine + firewall)
-            FromController::Allowlist(_) => {}
+            FromController::Allowlist(_) | FromController::JailPolicies(_) => {}
         }
         c
     }
