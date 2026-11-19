@@ -213,6 +213,8 @@ pub struct Controller {
     pub correlator: Mutex<crate::correlation::Correlator>,
     /// ASN/country databases (optional; display only)
     pub geo: crate::geo::Geo,
+    /// Delivery counters of the external actions (actions.rs).
+    pub actions: crate::actions::Stats,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -468,6 +470,7 @@ impl Controller {
             rules,
             correlator: Mutex::new(correlator),
             geo: Default::default(),
+            actions: Default::default(),
             redaction,
             redaction_tx,
         };

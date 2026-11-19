@@ -10,6 +10,7 @@
 //!
 //! TODO: sqlx storage, log compaction.
 
+mod actions;
 mod api;
 mod central;
 mod correlation;
@@ -116,6 +117,11 @@ struct ServeArgs {
     /// the proxy's address).
     #[arg(long, env = "DF2B_API_RATE", default_value_t = 20)]
     api_rate: u32,
+
+    /// External actions (webhooks, programs) on decisions: TOML file, see
+    /// DESIGN.md §5.
+    #[arg(long, env = "DF2B_ACTIONS")]
+    actions: Option<PathBuf>,
 
     /// How long ended decisions stay in the decision log (address history,
     /// agents resuming without a snapshot), e.g. 90d; at least 31d.
@@ -445,6 +451,10 @@ async fn serve(args: Args) -> anyhow::Result<()> {
 
     if let Some(o) = oidc {
         tokio::spawn(async move { o.warm_up().await });
+    }
+    if let Some(p) = &a.actions {
+        let cfg = actions::ActionsConfig::load(p)?;
+        actions::spawn(ctl.clone(), cfg).with_context(|| format!("actions in {}", p.display()))?;
     }
 
     let housekeeping = {

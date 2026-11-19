@@ -1,0 +1,32 @@
+# External actions of df2b-controller (--actions FILE / DF2B_ACTIONS).
+# The file may contain secrets: make it readable for the controller only.
+#
+# Events: "ban", "unban", "expire" (a ban ran out). For unban and expire,
+# "still_banned" says whether another active ban covers the same target.
+# Filters (all optional): events, scopes ("global", "group:<name>",
+# "group:*", "agents"), origins ("agent", "correlation", "user").
+
+# A chat or SIEM webhook: HTTPS POST of each event as JSON.
+[[webhook]]
+name = "chat"
+url = "https://hooks.example.org/df2b"
+# HMAC-SHA256 signature: X-Df2b-Signature: sha256=<hex> over
+# "<X-Df2b-Timestamp>.<body>"; or secret_file = "/etc/df2b/webhook.secret"
+secret = "change me"
+events = ["ban", "unban"]
+origins = ["correlation", "user"]
+# headers = { authorization = "Bearer ..." }
+# ca_file = "/etc/df2b/hooks-ca.pem"   # instead of the system roots
+# timeout = "5s"
+
+# A program per event (no shell; absolute path; cleared environment).
+# Event JSON on stdin; DF2B_EVENT, DF2B_TARGET, DF2B_SCOPE,
+# DF2B_EXPIRES_AT, DF2B_STILL_BANNED in the environment. Also a "sync"
+# event with all active bans at start and every sync_interval.
+# Example: BGP remotely triggered black hole via GoBGP (contrib/).
+[[exec]]
+name = "rtbh"
+command = ["/usr/local/bin/rtbh-gobgp.sh", "/var/lib/df2b-controller/rtbh.announced", "192.0.2.1"]
+scopes = ["global"]
+sync_interval = "1h"
+timeout = "10s"

@@ -2639,6 +2639,7 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         "redaction_version": ctl.redaction_version(),
         "sessions": ctl.sessions.count(),
         "geoip": ctl.geo.databases(),
+        "actions": ctl.actions.snapshot(),
     })))
 }
 

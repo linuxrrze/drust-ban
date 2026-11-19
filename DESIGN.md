@@ -416,8 +416,27 @@ table inet df2b {
 - Further backends behind the `FirewallBackend` trait: iptables + ipset (legacy),
   `exec` hook (custom scripts), `dry-run` (log only; for rollout).
 
-**Controller-side actions** (network-wide): BGP RTBH / FlowSpec via GoBGP's API,
-cloud firewall APIs, webhooks (chat, SIEM).
+**Controller-side actions** (network-wide; `--actions FILE`, module
+`actions.rs`, example `config/actions.example.toml`):
+- `[[webhook]]`: HTTPS POST of each event as JSON (chat, SIEM, ticketing),
+  optionally signed (`X-Df2b-Signature: sha256=<hex>`, HMAC-SHA256 over
+  `"<X-Df2b-Timestamp>.<body>"`), two retries, no redirects, TLS 1.3 with
+  system roots or `ca_file`; `http://` only with `allow_http`.
+- `[[exec]]`: a program per event (absolute path, no shell, cleared
+  environment, timeout, not retried): event JSON on stdin, `DF2B_EVENT`,
+  `DF2B_TARGET`, `DF2B_SCOPE`, `DF2B_EXPIRES_AT`, `DF2B_STILL_BANNED`.
+  Plus a `sync` event with all active bans at start, every `sync_interval`
+  and after missed events — the hook for BGP RTBH / FlowSpec and cloud
+  firewalls, which keep state elsewhere. `contrib/rtbh-gobgp.sh` announces
+  bans with the BLACKHOLE community via the gobgp CLI and reconciles on
+  sync.
+- Events `ban`, `unban`, `expire` (the controller schedules expiries
+  itself); `still_banned` tells whether another active ban covers the same
+  target (withdraw only when false). Filters: events, scopes, origins.
+- Each action has a bounded queue and its own worker; overflow is counted
+  and logged, never blocks. Counters (delivered, failed, dropped, last
+  error) in `GET /api/v1/status` → `actions`.
+- Not built in: GoBGP's gRPC API and cloud vendors' APIs (via exec).
 
 ---
 
