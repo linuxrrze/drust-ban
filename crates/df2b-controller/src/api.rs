@@ -1235,6 +1235,9 @@ struct RuleBody {
     min_failures: u32,
     window: String,
     bantime: String,
+    /// repeat offenders: bantime × factor^(offense-1) (default 1: none)
+    bantime_factor: Option<f64>,
+    max_bantime: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
     #[serde(default)]
@@ -1263,6 +1266,13 @@ async fn set_rule(
         min_failures: req.min_failures,
         window: parse_duration(&req.window, "window")?,
         bantime: parse_duration(&req.bantime, "bantime")?,
+        bantime_factor: req.bantime_factor.unwrap_or(1.0),
+        max_bantime: req
+            .max_bantime
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| parse_duration(t, "max_bantime"))
+            .transpose()?,
         enabled: req.enabled,
         monitor: req.monitor,
         updated_by: caller.name.clone(),
@@ -2157,6 +2167,9 @@ async fn history(
     Ok(Json(json!({
         "target": net,
         "allowlisted": ctl.allowlisted(&net),
+        // earlier correlation bans of this exact target (escalation)
+        "correlation_offenses": ctl.correlation_offenses(&net),
+        "offense_memory": humantime::format_duration(crate::state::OFFENSE_MEMORY).to_string(),
         // what agents reported recently (memory; since the controller started)
         "observations": ctl
             .correlator

@@ -322,22 +322,41 @@ impl AgentService for Service {
                 if covered {
                     continue;
                 }
+                // repeat offenders: escalated (earlier correlation bans of
+                // this address, any rule, within the offense memory)
+                let offense = self.ctl.correlation_offenses(&t.target) + 1;
                 let bantime = self
                     .ctl
                     .rules()
                     .iter()
                     .find(|r| r.name == t.rule)
-                    .map(|r| r.bantime)
+                    .map(|r| r.bantime_for(offense))
                     .unwrap_or(Duration::from_secs(3600));
+                let nth = if offense > 1 {
+                    format!(", offense {offense}")
+                } else {
+                    String::new()
+                };
+                let expires_at = chrono::Duration::from_std(bantime).ok().map(|d| now + d);
+                // several rules firing for the same address: the longest wins
+                if let Some(i) = new
+                    .iter()
+                    .position(|n: &NewDecision| n.target == t.target && n.scope == scope)
+                {
+                    if new[i].expires_at >= expires_at {
+                        continue;
+                    }
+                    new.remove(i);
+                }
                 new.push(NewDecision {
                     kind: DecisionKind::Ban,
                     target: t.target,
                     scope,
                     jail: Some(t.jail.clone()),
-                    expires_at: chrono::Duration::from_std(bantime).ok().map(|d| now + d),
+                    expires_at,
                     origin: Origin::Correlation(t.rule.clone()),
                     reason: format!(
-                        "correlation rule {}: {what} ({})",
+                        "correlation rule {}: {what} ({}){nth}",
                         t.rule,
                         t.agents.join(", ")
                     ),
@@ -1099,6 +1118,8 @@ mod tests {
                 min_failures,
                 window: Duration::from_secs(600),
                 bantime: Duration::from_secs(7200),
+                bantime_factor: 1.0,
+                max_bantime: None,
                 enabled: true,
                 monitor,
                 updated_by: "ada".into(),
@@ -1173,14 +1194,52 @@ mod tests {
             .iter()
             .any(|d| d.origin == Origin::Correlation("two-agree".into())));
 
+        // escalation: an address banned by correlation before gets
+        // bantime × factor (2h × 3 = 6h)
+        ctl.set_propagate(crate::state::Propagate::Global).unwrap();
+        let mut esc = rule("escalating", RuleKind::Threshold, 2, 4, false);
+        esc.bantime_factor = 3.0;
+        ctl.set_rule(esc).unwrap();
+        ctl.append(vec![NewDecision {
+            kind: DecisionKind::Ban,
+            target: "192.0.2.77/32".parse().unwrap(),
+            scope: Scope::Global,
+            jail: Some("sshd".into()),
+            expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+            origin: Origin::Correlation("distributed".into()),
+            reason: "earlier".into(),
+        }])
+        .unwrap();
+        let before = ctl.last_seq();
+        a.report(report(vec![fails("192.0.2.77/32", 2, 0)]))
+            .await
+            .unwrap();
+        b.report(report(vec![fails("192.0.2.77/32", 2, 0)]))
+            .await
+            .unwrap();
+        assert_eq!(ctl.last_seq(), before + 1);
+        let d = ctl
+            .active_decisions()
+            .into_iter()
+            .find(|d| d.target.to_string() == "192.0.2.77/32")
+            .unwrap();
+        let left = d.expires_at.unwrap() - Utc::now();
+        assert!(
+            left > chrono::Duration::minutes(359) && left <= chrono::Duration::hours(6),
+            "{left}"
+        );
+        assert!(d.reason.ends_with("offense 2"), "{}", d.reason);
+        ctl.remove_rule("escalating").unwrap();
+
         // monitor mode: recorded, not banned
         ctl.remove_rule("distributed").unwrap();
         ctl.set_rule(rule("try-it", RuleKind::Threshold, 1, 3, true))
             .unwrap();
+        let before = ctl.last_seq();
         a.report(report(vec![fails("192.0.2.200/32", 3, 0)]))
             .await
             .unwrap();
-        assert_eq!(ctl.last_seq(), 2);
+        assert_eq!(ctl.last_seq(), before);
         let hits = ctl.correlator.lock().unwrap().hits();
         assert_eq!(
             (

@@ -782,8 +782,18 @@ pub async fn correlation_list(c: &Client, json: bool) -> anyhow::Result<()> {
         } else {
             "active"
         };
+        let esc = match r["bantime_factor"].as_f64() {
+            Some(f) if f > 1.0 => format!(
+                ", x{f} per repeat{}",
+                r["max_bantime"]
+                    .as_str()
+                    .map(|m| format!(" up to {m}"))
+                    .unwrap_or_default()
+            ),
+            _ => String::new(),
+        };
         println!(
-            "{:<20} {:<8} {cond} within {} -> ban {}  (jail {}, agents {})",
+            "{:<20} {:<8} {cond} within {} -> ban {}{esc}  (jail {}, agents {})",
             s(r, &["name"]),
             mode,
             s(r, &["window"]),

@@ -309,6 +309,12 @@ enum CorrelationCmd {
         /// e.g. 1h
         #[arg(long)]
         bantime: String,
+        /// Repeat offenders: bantime × factor^(offense-1) (default 1).
+        #[arg(long)]
+        bantime_factor: Option<f64>,
+        /// Upper bound for escalated bans, e.g. 30d.
+        #[arg(long)]
+        max_bantime: Option<String>,
         /// Only this jail (default: all).
         #[arg(long)]
         jail: Option<String>,
@@ -550,12 +556,15 @@ async fn run() -> anyhow::Result<()> {
                     min_agents,
                     window,
                     bantime,
+                    bantime_factor,
+                    max_bantime,
                     jail,
                     group,
                     monitor,
                     disabled,
                 } => {
                     let body = serde_json::json!({
+                        "bantime_factor": bantime_factor, "max_bantime": max_bantime,
                         "kind": format!("{kind:?}").to_lowercase(),
                         "min_failures": min_failures.unwrap_or(0), "min_agents": min_agents,
                         "window": window, "bantime": bantime, "jail": jail, "group": group,

@@ -55,8 +55,18 @@ pub struct Rule {
     pub min_failures: u32,
     #[serde(with = "humantime_serde")]
     pub window: Duration,
+    /// First ban; repeat offenders get bantime × factor^(offense-1)
     #[serde(with = "humantime_serde")]
     pub bantime: Duration,
+    #[serde(default = "one")]
+    pub bantime_factor: f64,
+    /// upper bound for escalated bans (always at most 10 years)
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "humantime_serde"
+    )]
+    pub max_bantime: Option<Duration>,
     #[serde(default = "yes")]
     pub enabled: bool,
     /// only record what would be banned
@@ -68,6 +78,9 @@ pub struct Rule {
 
 fn yes() -> bool {
     true
+}
+fn one() -> f64 {
+    1.0
 }
 
 impl Rule {
@@ -97,7 +110,30 @@ impl Rule {
         if self.bantime < policy::MIN_BANTIME || self.bantime > policy::MAX_BANTIME {
             return Err("bantime must be between 1 minute and 10 years".into());
         }
+        if !(1.0..=policy::MAX_FACTOR).contains(&self.bantime_factor)
+            || self.bantime_factor.is_nan()
+        {
+            return Err(format!(
+                "bantime_factor must be between 1 and {}",
+                policy::MAX_FACTOR
+            ));
+        }
+        if let Some(m) = self.max_bantime {
+            if m < self.bantime || m > policy::MAX_BANTIME {
+                return Err("max_bantime must be between bantime and 10 years".into());
+            }
+        }
         Ok(())
+    }
+
+    /// Ban duration for the `offense`-th correlation ban of an address.
+    pub fn bantime_for(&self, offense: u32) -> Duration {
+        df2b_core::escalated_bantime(
+            self.bantime,
+            self.bantime_factor,
+            Some(self.max_bantime.unwrap_or(policy::MAX_BANTIME)),
+            offense,
+        )
     }
 
     fn applies(&self, jail: &str, group: &str) -> bool {
@@ -304,6 +340,8 @@ mod tests {
             min_failures,
             window: Duration::from_secs(600),
             bantime: Duration::from_secs(3600),
+            bantime_factor: 1.0,
+            max_bantime: None,
             enabled: true,
             monitor: false,
             updated_by: "ada".into(),
@@ -434,5 +472,25 @@ mod tests {
         assert!(r.validate().is_err());
         r.window = Duration::from_secs(10);
         assert!(r.validate().is_err());
+        let mut r = rule(RuleKind::Threshold, 2, 5);
+        r.bantime_factor = 0.5;
+        assert!(r.validate().is_err());
+        r.bantime_factor = 2.0;
+        r.max_bantime = Some(Duration::from_secs(60));
+        assert!(r.validate().is_err(), "max below bantime");
+        r.max_bantime = Some(Duration::from_secs(4 * 3600));
+        assert!(r.validate().is_ok());
+        let h = |n: u64| Duration::from_secs(n * 3600);
+        assert_eq!(
+            [1, 2, 3, 4].map(|o| r.bantime_for(o)),
+            [h(1), h(2), h(4), h(4)]
+        );
+        r.max_bantime = None;
+        r.bantime_factor = 10.0;
+        assert_eq!(
+            r.bantime_for(40),
+            policy::MAX_BANTIME,
+            "capped without a maximum"
+        );
     }
 }

@@ -73,6 +73,11 @@
         {:else}
           <span class="pill good">not banned</span>
         {/if}
+        {#if data.correlation_offenses}
+          <span class="pill warn" title="Correlation bans in the last {data.offense_memory}; rules with an escalation factor ban longer each time">
+            {data.correlation_offenses} correlation {data.correlation_offenses === 1 ? 'ban' : 'bans'} in {data.offense_memory}
+          </span>
+        {/if}
         {#if data.allowlisted}
           {@const temp = data.allow_entries.filter((e) => e.expires_at)}
           {@const permanent = data.allow_entries.length > temp.length}

@@ -20,6 +20,8 @@
   let minFailures = $state('10');
   let window_ = $state('10m');
   let bantime = $state('1h');
+  let factor = $state('1');
+  let maxBantime = $state('');
   let mode = $state<'enforce' | 'monitor' | 'off'>('monitor');
   let error = $state('');
   let busy = $state(false);
@@ -35,6 +37,8 @@
       minFailures = String(rule?.min_failures || 10);
       window_ = rule?.window ?? '10m';
       bantime = rule?.bantime ?? '1h';
+      factor = String(rule?.bantime_factor ?? 1);
+      maxBantime = rule?.max_bantime ?? '';
       // new rules start in monitor mode: see what they would do first
       mode = !rule ? 'monitor' : !rule.enabled ? 'off' : rule.monitor ? 'monitor' : 'enforce';
     }
@@ -52,6 +56,8 @@
         min_failures: kind === 'threshold' ? Number(minFailures) : 0,
         window: window_.trim(),
         bantime: bantime.trim(),
+        bantime_factor: Number(factor),
+        max_bantime: maxBantime.trim() || null,
         enabled: mode !== 'off',
         monitor: mode === 'monitor',
       });
@@ -90,6 +96,17 @@
     <label class="field">within <input bind:value={window_} required /><span class="hint">1m to 24h</span></label>
     <label class="field">ban for <input bind:value={bantime} required /></label>
   </div>
+  <div class="grid">
+    <label class="field">Repeat offenders × <input bind:value={factor} required inputmode="decimal" /><span class="hint">1 = same each time</span></label>
+    <label class="field">Longest ban <input bind:value={maxBantime} placeholder="10 years" /></label>
+  </div>
+  {#if Number(factor) > 1}
+    <p class="faint small">
+      An address banned by any correlation rule in the last 30 days gets {bantime} × {factor} the second
+      time, × {Number(factor) ** 2} the third, and so on{maxBantime.trim() ? `, at most ${maxBantime.trim()}` : ''}.
+      Bans lifted by a person do not count.
+    </p>
+  {/if}
   <div class="grid">
     <label class="field">
       Jail <input bind:value={jail} list="rule-jails" placeholder="all jails" />

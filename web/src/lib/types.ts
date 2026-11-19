@@ -88,6 +88,8 @@ export interface History {
   target: string;
   allowlisted: boolean;
   allow_entries: { net: string; expires_at: string | null }[];
+  correlation_offenses: number;
+  offense_memory: string;
   observations: { jail: string; key: string; agent: string; at: string; failures: number; banned: boolean }[];
   active: Decision[];
   history: Decision[];
@@ -228,6 +230,8 @@ export interface CorrelationRule {
   min_failures: number;
   window: string;
   bantime: string;
+  bantime_factor: number;
+  max_bantime?: string;
   enabled: boolean;
   monitor: boolean;
   updated_by: string;

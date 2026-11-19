@@ -733,10 +733,21 @@ df2bctl config check | reload
     the UI. Anti-poisoning setup: propagation "Only locally" plus a quorum
     rule — one compromised agent then cannot ban anything elsewhere.
   - The address page shows the recent observations per host.
+  - **Escalation**: rules have `bantime_factor` (default 1) and an optional
+    `max_bantime` (always at most 10 years); the n-th correlation ban of an
+    address gets `bantime × factor^(n-1)` (the agents' formula). Offenses
+    are the address's earlier correlation bans from *any* rule within 30
+    days (exact target), also ended ones; bans a person lifted (unban by a
+    user, e.g. a false positive or an allowlist entry) are forgiven. The
+    count is kept from the decision log (rebuilt at start, updated on every
+    append), so it survives controller restarts although observations do
+    not; the reason says "offense n" and the address page shows the count.
+    When several rules fire for the same address in one report, only the
+    longest ban is recorded.
 - Not yet:
   observation timelines and sample log lines (needs observation reporting),
-  ASN/GeoIP, escalation of correlation bans for repeat offenders,
-  observations kept across controller restarts, sample log lines.
+  ASN/GeoIP, observations kept across controller restarts, sample log
+  lines.
 
 Pages:
 

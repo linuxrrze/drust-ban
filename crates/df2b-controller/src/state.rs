@@ -125,15 +125,37 @@ struct Inner {
     status: HashMap<String, AgentStatus>,
     /// New bans per hour (unix time / 3600), for the dashboard.
     hourly: BTreeMap<i64, u32>,
+    /// Correlation bans per target (id, created), for escalation; rebuilt
+    /// from the log at start. Bans a user lifted are forgiven.
+    offenses: HashMap<IpNet, Vec<(Uuid, DateTime<Utc>)>>,
 }
+
+/// Correlation bans older than this no longer escalate (like the agents'
+/// default `offense_memory`).
+pub const OFFENSE_MEMORY: Duration = Duration::from_secs(30 * 86400);
 
 impl Inner {
     fn count(&mut self, d: &Decision) {
-        if matches!(d.kind, DecisionKind::Ban) {
-            *self
-                .hourly
-                .entry(d.created_at.timestamp().div_euclid(3600))
-                .or_default() += 1;
+        match (&d.kind, &d.origin) {
+            (DecisionKind::Ban, origin) => {
+                *self
+                    .hourly
+                    .entry(d.created_at.timestamp().div_euclid(3600))
+                    .or_default() += 1;
+                if matches!(origin, Origin::Correlation(_)) {
+                    self.offenses
+                        .entry(d.target)
+                        .or_default()
+                        .push((d.id, d.created_at));
+                }
+            }
+            // a person lifted it (false positive, allowlisted): forgiven
+            (DecisionKind::Unban { revokes }, Origin::User(_)) => {
+                if let Some(v) = self.offenses.get_mut(&d.target) {
+                    v.retain(|(id, _)| id != revokes);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -517,6 +539,11 @@ impl Controller {
         inner.active.retain(|_, d| d.is_active(now));
         let oldest = now.timestamp().div_euclid(3600) - HOURLY_KEEP;
         inner.hourly.retain(|h, _| *h >= oldest);
+        let forget = now - chrono::Duration::from_std(OFFENSE_MEMORY).unwrap_or_default();
+        inner.offenses.retain(|_, v| {
+            v.retain(|(_, at)| *at > forget);
+            !v.is_empty()
+        });
         drop(inner);
         self.sessions.prune();
         let keep = crate::correlation::keep_for(&self.rules());
@@ -754,6 +781,16 @@ impl Controller {
         v.retain(|x| x.name != name);
         *rules = Arc::new(v);
         Ok(true)
+    }
+
+    /// Earlier correlation bans of exactly this target within
+    /// [`OFFENSE_MEMORY`] (not counting those a user lifted).
+    pub fn correlation_offenses(&self, target: &IpNet) -> u32 {
+        let since = Utc::now() - chrono::Duration::from_std(OFFENSE_MEMORY).unwrap_or_default();
+        self.lock()
+            .offenses
+            .get(target)
+            .map_or(0, |v| v.iter().filter(|(_, at)| *at > since).count() as u32)
     }
 
     /// controller time - agent time, from the last heartbeat.
@@ -1343,6 +1380,86 @@ mod tests {
             "the stored setting wins over the default"
         );
         assert_eq!(c.jail_overrides().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn correlation_offenses_for_escalation() {
+        let (c, dir) = ctl("offenses");
+        let t: IpNet = "203.0.113.5/32".parse().unwrap();
+        let mk = |origin: Origin, expires: chrono::Duration| NewDecision {
+            kind: DecisionKind::Ban,
+            target: t,
+            scope: Scope::Global,
+            jail: Some("sshd".into()),
+            expires_at: Some(Utc::now() + expires),
+            origin,
+            reason: String::new(),
+        };
+        // an earlier correlation ban that already ended, and other origins
+        c.append(vec![mk(
+            Origin::Correlation("r".into()),
+            chrono::Duration::seconds(-60),
+        )])
+        .unwrap();
+        c.append(vec![mk(
+            Origin::Agent(df2b_core::AgentId("a".into())),
+            chrono::Duration::hours(1),
+        )])
+        .unwrap();
+        c.append(vec![mk(
+            Origin::User("ada".into()),
+            chrono::Duration::hours(2),
+        )])
+        .unwrap();
+        assert_eq!(
+            c.correlation_offenses(&t),
+            1,
+            "only correlation bans count, ended ones too"
+        );
+        assert_eq!(
+            c.correlation_offenses(&"203.0.113.6/32".parse().unwrap()),
+            0
+        );
+
+        // a second one, lifted by a person: forgiven
+        let d = c
+            .append(vec![mk(
+                Origin::Correlation("other".into()),
+                chrono::Duration::hours(3),
+            )])
+            .unwrap();
+        assert_eq!(c.correlation_offenses(&t), 2);
+        let id = d[0].id;
+        c.append(vec![NewDecision {
+            kind: DecisionKind::Unban { revokes: id },
+            target: t,
+            scope: Scope::Global,
+            jail: None,
+            expires_at: None,
+            origin: Origin::User("ada".into()),
+            reason: "false positive".into(),
+        }])
+        .unwrap();
+        assert_eq!(c.correlation_offenses(&t), 1);
+        // an unban by a rule (e.g. allowlist expiry) would not forgive; and
+        // the count survives a restart (rebuilt from the log)
+        drop(c);
+        let settings = Settings {
+            state_dir: dir.clone(),
+            cert_lifetime: Duration::from_secs(3600),
+            propagate: Propagate::Global,
+            allowlist: Allowlist::default(),
+            oidc: None,
+            https_internal_ca: true,
+        };
+        let c = Controller::open(
+            settings,
+            Ca::generate("t").unwrap(),
+            Store::open(&dir).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(c.correlation_offenses(&t), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

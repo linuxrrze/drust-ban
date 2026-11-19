@@ -105,7 +105,8 @@
   function describe(r: CorrelationRule): string {
     const who = `${r.min_agents} agent${r.min_agents === 1 ? '' : 's'}`;
     const cond = r.kind === 'threshold' ? `≥ ${r.min_failures} failures from ≥ ${who}` : `banned locally by ≥ ${who}`;
-    return `${cond} within ${r.window} → ban ${r.bantime}`;
+    const esc = r.bantime_factor > 1 ? `, ×${r.bantime_factor} each repeat${r.max_bantime ? ` up to ${r.max_bantime}` : ''}` : '';
+    return `${cond} within ${r.window} → ban ${r.bantime}${esc}`;
   }
 
   function removeRule(r: CorrelationRule) {
