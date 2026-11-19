@@ -7,6 +7,8 @@
 //!   active bans are re-applied after a restart and escalation continues;
 //! - the **central allowlist** last received from the controller, so it
 //!   applies after a restart even while the controller is unreachable;
+//! - **manual bans** made with `df2bctl --local ban` (re-applied after a
+//!   restart; they are not reported to the controller);
 //! - **unsent reports** for the controller (see `outbox.rs`), so bans and
 //!   failure counts from an offline period survive a restart.
 //!
@@ -37,6 +39,19 @@ const CENTRAL_ALLOWLIST: &str = "central_allowlist";
 const JAIL_POLICIES: &str = "jail_policies";
 const CENTRAL_JAILS: &str = "central_jails";
 const CENTRAL_REDACTION: &str = "central_redaction";
+const MANUAL_BANS: &str = "manual_bans";
+
+/// A ban made on this host with `df2bctl --local ban`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManualBan {
+    pub target: ipnet::IpNet,
+    /// `None` = permanent.
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    pub reason: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Who made it: "uid 0".
+    pub by: String,
+}
 
 /// The controller's redaction rules as last applied.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -138,6 +153,7 @@ pub struct Loaded {
     pub jail_policies: Option<JailPolicies>,
     pub central_jails: Option<crate::central::CentralJails>,
     pub central_redaction: Option<CentralRedaction>,
+    pub manual_bans: Vec<ManualBan>,
 }
 
 #[derive(Clone)]
@@ -211,6 +227,12 @@ impl State {
                 Err(e) => tracing::warn!(error = %e, "ignoring unreadable saved redaction rules"),
             }
         }
+        if let Some(v) = tx.open_table(META)?.get(MANUAL_BANS)? {
+            match serde_json::from_slice(v.value()) {
+                Ok(m) => loaded.manual_bans = m,
+                Err(e) => tracing::warn!(error = %e, "ignoring unreadable saved manual bans"),
+            }
+        }
         if let Some(v) = tx.open_table(META)?.get(CENTRAL_ALLOWLIST)? {
             match serde_json::from_slice(v.value()) {
                 Ok(a) => loaded.central_allowlist = Some(a),
@@ -253,6 +275,15 @@ impl State {
         let tx = self.db.begin_write()?;
         tx.open_table(META)?
             .insert(CENTRAL_ALLOWLIST, serde_json::to_vec(a)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Saves all manual bans (when they change). Blocking.
+    pub fn save_manual_bans(&self, m: &[ManualBan]) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?
+            .insert(MANUAL_BANS, serde_json::to_vec(m)?.as_slice())?;
         tx.commit()?;
         Ok(())
     }
@@ -439,6 +470,25 @@ mod tests {
         }
         let st = State::open(&dir).unwrap();
         assert_eq!(st.load().unwrap().central_redaction, Some(r));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_bans_persist() {
+        let dir = tmp("manual");
+        let m = vec![ManualBan {
+            target: "192.0.2.0/24".parse().unwrap(),
+            until: None,
+            reason: "abuse".into(),
+            created_at: Utc::now(),
+            by: "uid 0".into(),
+        }];
+        {
+            let st = State::open(&dir).unwrap();
+            assert!(st.load().unwrap().manual_bans.is_empty());
+            st.save_manual_bans(&m).unwrap();
+        }
+        assert_eq!(State::open(&dir).unwrap().load().unwrap().manual_bans, m);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

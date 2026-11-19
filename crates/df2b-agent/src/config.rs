@@ -67,6 +67,21 @@ pub struct AgentSection {
     /// they hide.
     #[serde(default = "yes")]
     pub central_redaction: bool,
+    /// Unix socket for `df2bctl --local` (default `<state_dir>/agent.sock`,
+    /// mode 0600; "" turns it off).
+    #[serde(default)]
+    pub control_socket: Option<PathBuf>,
+}
+
+impl AgentSection {
+    /// `None`: no control socket.
+    pub fn control_socket_path(&self) -> Option<PathBuf> {
+        match &self.control_socket {
+            None => Some(self.state_dir.join("agent.sock")),
+            Some(p) if p.as_os_str().is_empty() => None,
+            Some(p) => Some(p.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]

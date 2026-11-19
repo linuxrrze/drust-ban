@@ -68,6 +68,8 @@ pub struct LinkStats {
     /// Per-source throughput, lag and errors.
     pub sources: crate::health::SourceHealth,
     pub firewall: Arc<crate::health::FirewallHealth>,
+    /// A session with the controller is up.
+    pub connected: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,7 +465,9 @@ impl Task {
                 return;
             }
             let mut connected = false;
-            match self.session(&mut identity, &mut connected).await {
+            let result = self.session(&mut identity, &mut connected).await;
+            self.stats.connected.store(false, Ordering::Relaxed);
+            match result {
                 Ok(End::Shutdown) => return,
                 Ok(End::Renewed) => continue,
                 Err(e) => {
@@ -575,6 +579,7 @@ impl Task {
             .await?
             .into_inner();
         *connected = true;
+        self.stats.connected.store(true, Ordering::Relaxed);
         info!(from_seq = self.last_seq, "connected to controller");
         let own_origin = format!("agent:{}", id.agent_id);
         let mut heartbeat = tokio::time::interval(HEARTBEAT);

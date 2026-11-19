@@ -4,7 +4,9 @@
 //! (status, whoami, agents, bans, ban, unban, audit, sessions, allowlist) over
 //! the HTTPS
 //! REST API.
-//! TODO: `--local` (agent control socket), ip, allowlist, jails, config.
+//! `--local` talks to the agent on this host over its control socket
+//! (status, jails list, bans list, ban, unban).
+//! TODO: ip, config.
 
 // Stub commands carry arguments that are only read once implemented.
 #![allow(dead_code)]
@@ -12,6 +14,7 @@
 mod client;
 mod commands;
 mod filter_test;
+mod local;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,9 +46,14 @@ struct Cli {
     #[arg(long, global = true, env = "DF2B_CTL_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Talk to the local agent's control socket instead of the controller.
+    /// Talk to the agent on this host instead of the controller (status,
+    /// jails list, bans list, ban, unban; root or the agent's user).
     #[arg(long, global = true)]
     local: bool,
+
+    /// The agent's control socket (with --local).
+    #[arg(long, global = true, env = "DF2B_AGENT_SOCKET", default_value = local::DEFAULT_SOCKET)]
+    socket: PathBuf,
 
     #[arg(long, short, global = true, value_enum, default_value_t = Output::Text)]
     output: Output,
@@ -423,6 +431,46 @@ enum ConfigCmd {
     Reload,
 }
 
+async fn run_local(cmd: Command, socket: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    match cmd {
+        Command::Status => local::status(socket, json).await,
+        Command::Jails(JailsCmd::List) => local::jails(socket, json).await,
+        Command::Bans(BansCmd::List {
+            jail,
+            agent: None,
+            target,
+        }) => local::bans(socket, target, jail, json).await,
+        Command::Bans(BansCmd::List { agent: Some(_), .. }) => {
+            bail!("--agent does not apply with --local (this host only)")
+        }
+        Command::Ban {
+            target,
+            duration,
+            scope,
+            jail,
+            reason,
+        } => {
+            if scope != "global" || jail.is_some() {
+                bail!("--scope and --jail do not apply with --local (this host only)");
+            }
+            local::ban(socket, target, duration, reason, json).await
+        }
+        Command::Unban {
+            target,
+            reason: _,
+            allow_for,
+        } => {
+            if allow_for.is_some() {
+                bail!("--allow-for needs the controller (it is a central allowlist entry)");
+            }
+            local::unban(socket, target, json).await
+        }
+        _ => bail!(
+            "not available with --local; the agent answers: status, jails list, bans list, ban, unban"
+        ),
+    }
+}
+
 fn parse_target(s: &str) -> Result<IpNet, String> {
     df2b_core::parse_target(s)
 }
@@ -448,7 +496,7 @@ async fn run() -> anyhow::Result<()> {
         return filter_test::run(filter, log, *show_matches, *show_missed, json);
     }
     if cli.local {
-        bail!("--local (agent control socket) is not implemented yet");
+        return run_local(cli.command, &cli.socket, json).await;
     }
     let client = || {
         client::Client::new(client::Overrides {

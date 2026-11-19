@@ -60,6 +60,19 @@ impl RemoteBans {
         self.bans.values().filter(|b| !b.own).count()
     }
 
+    /// Active controller bans: (target, expiry, from this agent's report).
+    pub fn list(&self, now: DateTime<Utc>) -> Vec<(IpNet, Option<DateTime<Utc>>, bool)> {
+        let mut out: Vec<_> = self
+            .bans
+            .values()
+            .filter(|b| b.expires_at.map_or(true, |e| e > now))
+            .map(|b| (b.target, b.expires_at, b.own))
+            .collect();
+        out.sort_by_key(|b| b.0);
+        out.dedup_by_key(|b| b.0);
+        out
+    }
+
     /// Whether a controller ban (including this agent's own, propagated
     /// ones) still covers exactly this prefix.
     pub fn covers(&self, net: &IpNet) -> bool {

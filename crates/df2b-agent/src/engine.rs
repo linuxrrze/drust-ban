@@ -352,6 +352,27 @@ impl Engine {
         })
     }
 
+    /// Active bans: (jail, key, offense count, until), by jail and key.
+    pub fn bans(&self, now: DateTime<Utc>) -> Vec<(String, IpKey, u32, DateTime<Utc>)> {
+        let mut out: Vec<_> = self
+            .jails
+            .iter()
+            .flat_map(|j| {
+                j.offenders
+                    .iter()
+                    .filter(|(_, o)| o.banned_until > now)
+                    .map(|(k, o)| (j.name.clone(), *k, o.offenses, o.banned_until))
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.0, a.1.to_string()).cmp(&(&b.0, b.1.to_string())));
+        out
+    }
+
+    /// Whether `net` overlaps the configured or the central allowlist.
+    pub fn allowlisted(&self, net: &IpNet) -> bool {
+        self.allowlist.overlaps(net) || self.central.overlaps(net)
+    }
+
     /// Number of (jail, key) bans currently active.
     /// Applies the controller's jail settings (replacing earlier ones;
     /// jails without an entry go back to their configuration). Overrides

@@ -44,6 +44,10 @@ allowlist = ["127.0.0.0/8", "::1/128"]
 # here (the controller still redacts on arrival).
 # central_redaction = true
 
+# Unix socket for `df2bctl --local` on this host (mode 0600; root or the
+# agent's user). Default: <state_dir>/agent.sock; "" turns it off.
+# control_socket = "/var/lib/df2b/agent.sock"
+
 # Rewrite those lines before they leave this host (in order; regular
 # expression, replacement with $1 for groups, default "[redacted]"). The
 # controller's rules (Policies page) apply after these, here as well.

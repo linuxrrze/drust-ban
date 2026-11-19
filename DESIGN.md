@@ -462,7 +462,20 @@ Implemented: `status`, `whoami`, `agents …`, `bans list`, `ban`, `unban`,
 target (e.g. the /64 containing an IPv6 address) in the scope it was made.
 Added later (see §9): `unban --allow-for`, `lookup` (the address page),
 `allowlist`, `jails`, `filters`, `correlation`, `propagate`. Not
-implemented yet: `config` and `--local`.
+implemented yet: `config`.
+
+`--local` (socket `--socket`, default `/var/lib/df2b/agent.sock`; agent
+setting `control_socket`, "" = off) answers `status` (controller link,
+firewall health, ban counts, sources), `jails list`, `bans list` (local,
+manual and controller bans on this host), `ban` and `unban`. The socket
+is mode 0600 and the peer must be root or the agent's user
+(`SO_PEERCRED`); one JSON request per connection, answered with one JSON
+line. A local `ban` is a **manual ban of this host only**: kept in
+`agent.redb`, re-applied after restarts, not reported to the controller
+(at most /8 resp. /16, never on the allowlist; `--scope`, `--jail` are
+refused). A local `unban` lifts this host's jail and manual bans; an
+address a controller ban still covers stays blocked and is named in the
+answer (unban it on the controller).
 
 ```
 df2bctl status
@@ -935,12 +948,12 @@ systemd hardening.
 | Tracker / engine             | implemented + tests; one firewall transaction per batch |
 | nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |
 | Agent state (redb)           | source positions + offender records, flushed every 1 s; bans re-applied on start |
-| `df2bctl`                    | `filter test` + controller commands; `--local`, ip, allowlist, jails, config TODO |
+| `df2bctl`                    | `filter test`, controller commands, `--local` (agent socket); config TODO |
 | Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
 | REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions (password, OIDC) with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
 | gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |
 | Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans, central allowlist, jail settings and central jail definitions applied |
-| Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI/browser → controller (HTTPS) done; HA, external actions, local socket TODO |
+| Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI/browser → controller (HTTPS) and `df2bctl --local` → agent (Unix socket) done; HA, external actions TODO |
 | Web UI                       | Svelte, embedded: login, overview, bans, agents, address lookup, audit log; live updates; login with local users or OIDC |
 
 ---

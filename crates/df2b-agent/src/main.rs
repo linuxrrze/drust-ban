@@ -7,6 +7,7 @@
 
 mod central;
 mod config;
+mod control;
 mod engine;
 mod health;
 mod link;
@@ -165,6 +166,26 @@ async fn main() -> anyhow::Result<()> {
             .context("re-applying saved bans")?;
         info!(count = restored.len(), "re-applied saved bans");
     }
+    // bans made with `df2bctl --local ban`
+    let mut manual = loaded.manual_bans.clone();
+    manual.retain(|m| m.until.map_or(true, |u| u > Utc::now()));
+    if !manual.is_empty() {
+        let now = Utc::now();
+        let entries: Vec<_> = manual
+            .iter()
+            .map(|m| BanEntry {
+                net: m.target,
+                timeout: m
+                    .until
+                    .map(|u| (u - now).to_std().unwrap_or(Duration::from_secs(1))),
+            })
+            .collect();
+        let b = backend.clone();
+        tokio::task::spawn_blocking(move || b.ban(&entries))
+            .await?
+            .context("re-applying manual bans")?;
+        info!(count = manual.len(), "re-applied manual bans");
+    }
 
     // Bounded in batches (each up to BATCH_MAX lines): a slow engine throttles
     // the sources instead of buffering without limit.
@@ -224,6 +245,17 @@ async fn main() -> anyhow::Result<()> {
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut prune = tokio::time::interval(Duration::from_secs(60));
+    let mut control = match cfg.agent.control_socket_path() {
+        Some(p) => match control::spawn(&p) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "no control socket (df2bctl --local)");
+                None
+            }
+        },
+        None => None,
+    };
+    let controller_addr = cfg.agent.controller.clone();
     let mut sigterm = signal(SignalKind::terminate())?;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -411,9 +443,33 @@ async fn main() -> anyhow::Result<()> {
                 // temporary allowlist entries end here as well (also offline)
                 engine.set_central_allowlist(central.live(Utc::now()));
                 remote.prune(Utc::now());
+                let n = manual.len();
+                manual.retain(|m| m.until.map_or(true, |u| u > Utc::now()));
+                if manual.len() != n {
+                    let (st, m) = (state.clone(), manual.clone());
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = st.save_manual_bans(&m) {
+                            error!(error = %format!("{e:#}"), "saving manual bans failed");
+                        }
+                    });
+                }
                 for (jail, key) in engine.prune(Utc::now()) {
                     pending.forget_offender(&jail, &key);
                 }
+            }
+            call = next_call(&mut control) => {
+                let cx = control::Ctx {
+                    engine: &mut engine,
+                    remote: &remote,
+                    backend: &backend,
+                    pending: &mut pending,
+                    state: &state,
+                    stats: &stats,
+                    manual: &mut manual,
+                    controller: controller_addr.as_deref(),
+                };
+                let r = control::handle(call.req, &call.peer, cx).await;
+                let _ = call.reply.send(r);
             }
             _ = &mut ctrl_c => { info!("interrupted, shutting down"); break; }
             _ = sigterm.recv() => { info!("terminated, shutting down"); break; }
@@ -427,6 +483,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("saving state on shutdown")?;
     Ok(())
+}
+
+/// The next `df2bctl --local` request; never, without a control socket.
+async fn next_call(control: &mut Option<control::Socket>) -> control::Call {
+    match control {
+        Some(s) => match s.calls.recv().await {
+            Some(c) => c,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
 }
 
 /// Applies the controller's redaction rules after the local ones; rules

@@ -28,14 +28,14 @@ fn ago(v: &Value) -> String {
     format!("{} ago", fmt_secs(secs))
 }
 
-fn until(v: &Value) -> String {
+pub(crate) fn until(v: &Value) -> String {
     match v.as_str().and_then(|t| t.parse::<DateTime<Utc>>().ok()) {
         None => "permanent".into(),
         Some(t) => format!("{} left", fmt_secs((t - Utc::now()).num_seconds().max(0))),
     }
 }
 
-fn fmt_secs(s: i64) -> String {
+pub(crate) fn fmt_secs(s: i64) -> String {
     match s {
         // rounded: a fresh 4 h session shows "4h", not "3h"
         s if s < 120 => format!("{s}s"),
@@ -143,7 +143,7 @@ fn print_decisions(list: &[Value], geo: &Value) {
     }
 }
 
-fn json_out(v: &Value) -> anyhow::Result<()> {
+pub(crate) fn json_out(v: &Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
@@ -621,7 +621,7 @@ pub async fn agents_set_group(c: &Client, id: &str, group: &str, json: bool) -> 
     Ok(())
 }
 
-fn secs(v: &Value) -> String {
+pub(crate) fn secs(v: &Value) -> String {
     match v.as_u64() {
         Some(0) | None => "-".into(),
         Some(s) => fmt_secs(s as i64),

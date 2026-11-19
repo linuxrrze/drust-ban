@@ -75,13 +75,24 @@ impl SourceHealth {
     /// Status per source since the last call, sorted by name; resets the
     /// counters. A source without lines in the interval is caught up.
     pub fn report(&self) -> Vec<v1::SourceStatus> {
+        self.build(true)
+    }
+
+    /// Like [`Self::report`] without resetting (local status queries).
+    pub fn peek(&self) -> Vec<v1::SourceStatus> {
+        self.build(false)
+    }
+
+    fn build(&self, reset: bool) -> Vec<v1::SourceStatus> {
         let mut g = self.lock();
         let secs = g.0.elapsed().as_secs_f64().max(0.001);
-        g.0 = Instant::now();
+        if reset {
+            g.0 = Instant::now();
+        }
         let mut out: Vec<_> =
             g.1.iter_mut()
                 .map(|(name, c)| {
-                    let taken = std::mem::take(c);
+                    let taken = if reset { std::mem::take(c) } else { *c };
                     v1::SourceStatus {
                         name: name.clone(),
                         lines_per_second: (taken.lines as f64 / secs).round() as u64,
