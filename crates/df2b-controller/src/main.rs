@@ -127,7 +127,7 @@ struct ServeArgs {
     /// agents resuming without a snapshot), e.g. 90d; at least 31d.
     /// Active bans always stay. "never": keep everything.
     #[arg(long, env = "DF2B_LOG_RETENTION", default_value = "90d", value_parser = parse_retention)]
-    log_retention: Option<Duration>,
+    log_retention: Retention,
 
     /// REST API requests per client at once.
     #[arg(long, env = "DF2B_API_BURST", default_value_t = 200)]
@@ -349,15 +349,20 @@ fn user(dir: &std::path::Path, cmd: UserCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_retention(s: &str) -> Result<Option<Duration>, String> {
+/// `--log-retention`: `None` = never compact. (A newtype: clap treats a
+/// bare `Option<_>` field as "the argument is optional".)
+#[derive(Debug, Clone, Copy)]
+struct Retention(Option<Duration>);
+
+fn parse_retention(s: &str) -> Result<Retention, String> {
     if s == "never" {
-        return Ok(None);
+        return Ok(Retention(None));
     }
     let d = humantime::parse_duration(s).map_err(|e| e.to_string())?;
     if d < state::MIN_LOG_RETENTION {
         return Err("at least 31d (offense counts are rebuilt from the log)".into());
     }
-    Ok(Some(d))
+    Ok(Retention(Some(d)))
 }
 
 async fn serve(args: Args) -> anyhow::Result<()> {
@@ -459,7 +464,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
 
     let housekeeping = {
         let ctl = ctl.clone();
-        let retention = a.log_retention;
+        let retention = a.log_retention.0;
         async move {
             let mut t = tokio::time::interval(Duration::from_secs(60));
             // first after a minute, then daily
@@ -526,5 +531,26 @@ async fn shutdown() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the CLI definition was inconsistent (clap panicked at
+    /// start for every subcommand).
+    #[test]
+    fn cli_is_consistent() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+        let a = Args::try_parse_from(["df2b-controller", "serve"]).unwrap();
+        assert_eq!(
+            a.serve.log_retention.0,
+            Some(Duration::from_secs(90 * 86400))
+        );
+        let a = Args::try_parse_from(["df2b-controller", "--log-retention", "never"]).unwrap();
+        assert!(a.serve.log_retention.0.is_none());
+        assert!(Args::try_parse_from(["df2b-controller", "--log-retention", "5d"]).is_err());
     }
 }
