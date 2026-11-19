@@ -638,6 +638,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "libc",
  "maxminddb",
  "openidconnect",
  "redb",
@@ -677,6 +678,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ipnet",
+ "libc",
  "serde_json",
  "tracing",
 ]
