@@ -610,6 +610,19 @@ fn conflict(m: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::CONFLICT, m)
 }
 
+/// User accounts are managed from a browser session or the host CLI:
+/// a leaked API token must not plant access (an admin user, a known
+/// password) that outlives its revocation - as for creating tokens.
+fn no_token(caller: &Caller) -> Result<(), ApiError> {
+    if matches!(caller.auth, Auth::Token(_)) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "API tokens cannot manage users; use the web UI or df2b-controller user",
+        ));
+    }
+    Ok(())
+}
+
 /// Rules that do not need the file system.
 fn check_new_password(name: &str, pw: &str) -> Result<(), ApiError> {
     files::check_password(name, pw).map_err(|e| ApiError::bad_request(e.to_string()))
@@ -768,6 +781,7 @@ async fn create_user(
     Json(req): Json<NewUser>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     caller.require(Role::Admin)?;
+    no_token(&caller)?;
     if !files::valid_name(&req.name) {
         return Err(ApiError::bad_request(
             "invalid user name (letters, digits, - _ . @; at most 64)",
@@ -829,6 +843,7 @@ async fn update_user(
     Json(req): Json<UserUpdate>,
 ) -> ApiResult {
     caller.require(Role::Admin)?;
+    no_token(&caller)?;
     let old = load_existing(&ctl, &name).await?;
     if name == caller.name && req.role < Role::Admin {
         return Err(conflict(
@@ -867,6 +882,7 @@ async fn reset_password(
     Json(req): Json<PasswordReset>,
 ) -> ApiResult {
     caller.require(Role::Admin)?;
+    no_token(&caller)?;
     load_existing(&ctl, &name).await?;
     if name == caller.name {
         return Err(conflict(
@@ -899,6 +915,7 @@ async fn delete_user(
     Path(name): Path<String>,
 ) -> ApiResult {
     caller.require(Role::Admin)?;
+    no_token(&caller)?;
     let old = load_existing(&ctl, &name).await?;
     if name == caller.name {
         return Err(conflict(
@@ -6001,5 +6018,35 @@ mod tests {
             )
             .await;
         assert_eq!(st, S::BAD_REQUEST);
+    }
+
+    /// Regression (security review): a leaked admin token could create an
+    /// admin user or set another admin's password, keeping access after the
+    /// token was revoked.
+    #[tokio::test]
+    async fn tokens_cannot_manage_users() {
+        let env = Env::new("tokenusers").await;
+        let admin = env.token("ada", Role::Admin);
+        let (st, _) = env
+            .call("POST", "/api/v1/users", &admin, json!({ "name": "mallory", "role": "admin", "password": "correct horse battery staple 1", "temporary": false }))
+            .await;
+        assert_eq!(st, S::FORBIDDEN);
+        let (st, _) = env
+            .call(
+                "POST",
+                "/api/v1/users/ada/password",
+                &admin,
+                json!({ "password": "correct horse battery staple 1" }),
+            )
+            .await;
+        assert_eq!(st, S::FORBIDDEN);
+        let r = env
+            .http
+            .delete(format!("{}/api/v1/users/ada", env.base))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::FORBIDDEN);
     }
 }
