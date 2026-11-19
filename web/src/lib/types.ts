@@ -96,3 +96,16 @@ export interface AuditEntry {
   action: string;
   details: Record<string, unknown>;
 }
+
+export interface SessionInfo {
+  id: string;
+  user: string;
+  method: 'password' | 'oidc';
+  role: Role | null;
+  created_at: string;
+  last_used_at: string;
+  expires_at: string;
+  remote_addr: string | null;
+  user_agent: string | null;
+  current: boolean;
+}

@@ -37,10 +37,11 @@ fn until(v: &Value) -> String {
 
 fn fmt_secs(s: i64) -> String {
     match s {
+        // rounded: a fresh 4 h session shows "4h", not "3h"
         s if s < 120 => format!("{s}s"),
-        s if s < 7200 => format!("{}m", s / 60),
-        s if s < 172_800 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86400),
+        s if s < 7200 => format!("{}m", (s + 30) / 60),
+        s if s < 172_800 => format!("{}h", (s + 1800) / 3600),
+        s => format!("{}d", (s + 43_200) / 86400),
     }
 }
 
@@ -345,5 +346,68 @@ pub async fn audit(c: &Client, limit: usize, json: bool) -> anyhow::Result<()> {
             e["details"]
         );
     }
+    Ok(())
+}
+
+pub async fn sessions_list(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/sessions").await?;
+    if json {
+        return json_out(&v);
+    }
+    let list = v["sessions"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("no web UI sessions");
+        return Ok(());
+    }
+    println!(
+        "{:<17} {:<20} {:<9} {:<9} {:<10} {:<10} {:<12} {:<22} BROWSER",
+        "ID", "USER", "ROLE", "METHOD", "SIGNED IN", "ACTIVE", "EXPIRES", "FROM"
+    );
+    for x in &list {
+        let ua = x["user_agent"].as_str().unwrap_or("-");
+        println!(
+            "{:<17} {:<20} {:<9} {:<9} {:<10} {:<10} {:<12} {:<22} {}",
+            s(x, &["id"]),
+            format!(
+                "{}{}",
+                s(x, &["user"]),
+                if x["current"] == true { " *" } else { "" }
+            ),
+            s(x, &["role"]),
+            s(x, &["method"]),
+            ago(&x["created_at"]),
+            ago(&x["last_used_at"]),
+            ago(&x["expires_at"]),
+            s(x, &["remote_addr"]),
+            ua.chars().take(60).collect::<String>(),
+        );
+    }
+    Ok(())
+}
+
+pub async fn sessions_end(
+    c: &Client,
+    id: Option<String>,
+    user: Option<String>,
+    all: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let v = match (id, user) {
+        (Some(id), _) => c.delete(&format!("/api/v1/sessions/{id}"), &[]).await?,
+        (None, Some(u)) => c.delete("/api/v1/sessions", &[("user", u)]).await?,
+        (None, None) if all => {
+            c.delete("/api/v1/sessions", &[("all", "true".into())])
+                .await?
+        }
+        (None, None) => anyhow::bail!("give a session id, --user or --all"),
+    };
+    if json {
+        return json_out(&v);
+    }
+    println!("ended {} session(s)", v["ended"]);
+    eprintln!(
+        "note: users can sign in again; to lock someone out, delete the local user \
+         (df2b-controller user delete) or disable them at the identity provider"
+    );
     Ok(())
 }

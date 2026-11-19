@@ -35,6 +35,10 @@
     'agent.revoke': 'agent revoked',
     'enroll_token.create': 'enrollment token created',
     'session.login': 'logged in',
+    'session.end': 'session ended',
+    'session.end_user': "user's sessions ended",
+    'session.end_all': 'all sessions ended',
+    'session.backchannel_logout': 'logged out by provider',
   };
 
   function details(e: AuditEntry): string {

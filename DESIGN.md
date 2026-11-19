@@ -535,8 +535,19 @@ df2bctl config check | reload
   denied, conflict, unavailable, failed); details go to the log only.
 - Dependencies pinned to exact versions at least two weeks old; `npm` runs
   with `ignore-scripts`. The built UI is ~90 KB of JavaScript (31 KB gzip).
-- Not yet: ending sessions from the controller itself (listing and killing
-  sessions), front-channel logout, user management and own password change
+- **Session management** (admin): `GET /api/v1/sessions` lists live
+  browser sessions (user, role, method, sign-in and last use, end of
+  session, client address, browser; the caller's own is marked) with a
+  random public id that is unrelated to the cookie secret; no secrets or
+  CSRF tokens are listed. `DELETE /api/v1/sessions/<id>` ends one,
+  `DELETE /api/v1/sessions?user=<name>` all of a user,
+  `DELETE /api/v1/sessions?all=true` everybody's (incident response,
+  includes the caller). All audited. Also `df2bctl sessions list|end
+  [<id>|--user <name>|--all]` and the "Sessions" page. Ending a session does
+  not lock anybody out: delete the local user or disable them at the
+  provider. User agents are stored without control characters, at most 200
+  characters.
+- Not yet: front-channel logout, user management and own password change
   in the UI,
   observation timelines and sample log lines (needs observation reporting),
   ASN/GeoIP, "allow for X" after unban, policies/jails and allowlist editing,

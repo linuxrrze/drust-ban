@@ -1,7 +1,8 @@
 //! dist-f2b command line tool.
 //!
 //! Implemented: `filter test` (offline) and the controller commands
-//! (status, whoami, agents, bans, ban, unban, audit) over the HTTPS REST API.
+//! (status, whoami, agents, bans, ban, unban, audit, sessions) over the HTTPS
+//! REST API.
 //! TODO: `--local` (agent control socket), ip, allowlist, jails, config.
 
 // Stub commands carry arguments that are only read once implemented.
@@ -72,6 +73,9 @@ enum Command {
     /// Manage agents.
     #[command(subcommand)]
     Agents(AgentsCmd),
+    /// List and end web UI sessions (admin).
+    #[command(subcommand)]
+    Sessions(SessionsCmd),
     /// List bans.
     #[command(subcommand)]
     Bans(BansCmd),
@@ -144,6 +148,24 @@ enum BansCmd {
         agent: Option<String>,
         #[arg(long, value_parser = parse_target)]
         target: Option<IpNet>,
+    },
+}
+
+/// Web UI sessions (admin).
+#[derive(Debug, Subcommand)]
+enum SessionsCmd {
+    /// Live browser sessions, most recently used first.
+    List,
+    /// End a session by id, all sessions of a user, or all sessions.
+    End {
+        /// Session id (from `sessions list`).
+        #[arg(required_unless_present_any = ["user", "all"], conflicts_with_all = ["user", "all"])]
+        id: Option<String>,
+        #[arg(long, conflicts_with = "all")]
+        user: Option<String>,
+        /// Everybody, including your own browser sessions.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -261,6 +283,15 @@ async fn run() -> anyhow::Result<()> {
                 reason,
             };
             commands::ban(&client()?, args, json).await
+        }
+        Command::Sessions(cmd) => {
+            let c = client()?;
+            match cmd {
+                SessionsCmd::List => commands::sessions_list(&c, json).await,
+                SessionsCmd::End { id, user, all } => {
+                    commands::sessions_end(&c, id, user, all, json).await
+                }
+            }
         }
         Command::Unban { target, reason } => {
             commands::unban(&client()?, target, reason, json).await

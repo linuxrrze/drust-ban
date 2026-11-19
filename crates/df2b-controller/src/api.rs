@@ -96,6 +96,8 @@ pub enum Auth {
         secret: String,
         csrf: String,
         oidc: bool,
+        /// public session id
+        id: String,
     },
 }
 
@@ -257,6 +259,7 @@ impl FromRequestParts<Arc<Controller>> for Caller {
                 secret,
                 csrf: sess.csrf,
                 oidc: matches!(sess.kind, session::Kind::Oidc { .. }),
+                id: sess.id,
             },
         })
     }
@@ -280,6 +283,8 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/session", post(login).delete(logout))
         .route("/api/v1/auth-methods", get(auth_methods))
+        .route("/api/v1/sessions", get(list_sessions).delete(end_sessions))
+        .route("/api/v1/sessions/:id", axum::routing::delete(end_session))
         .route("/api/v1/oidc/login", get(oidc_login))
         .route("/api/v1/oidc/callback", get(oidc_callback))
         .route(crate::oidc::BACKCHANNEL_PATH, post(oidc_backchannel_logout))
@@ -348,9 +353,14 @@ struct LoginRequest {
     password: String,
 }
 
+fn user_agent(h: &axum::http::HeaderMap) -> Option<&str> {
+    h.get(header::USER_AGENT).and_then(|v| v.to_str().ok())
+}
+
 async fn login(
     State(ctl): State<Arc<Controller>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
     let ip = Some(addr.ip());
@@ -404,6 +414,7 @@ async fn login(
             password_changed_at: user.password_changed_at,
         },
         session::MAX_AGE,
+        session::Client::new(addr, user_agent(&headers)),
     );
     let c = ctl.clone();
     let name = user.name.clone();
@@ -441,6 +452,106 @@ async fn logout(caller: Caller, State(ctl): State<Arc<Controller>>) -> Response 
         Json(json!({ "logged_out": true, "logout_url": logout_url })),
     )
         .into_response()
+}
+
+// ------------------------------------------------------ session management
+
+/// Admin: all live browser sessions (API tokens are not sessions).
+async fn list_sessions(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let own = match &caller.auth {
+        Auth::Session { id, .. } => Some(id.clone()),
+        Auth::Token(_) => None,
+    };
+    let mut list = ctl.sessions.list();
+    // password sessions: the role is the user's current one
+    let c = ctl.clone();
+    let names: Vec<String> = list
+        .iter()
+        .filter(|s| s.role.is_none())
+        .map(|s| s.user.clone())
+        .collect();
+    let roles = blocking(move || {
+        let mut m = std::collections::HashMap::new();
+        for n in names {
+            if let Some(u) = files::load_user(&c.settings.state_dir, &n)? {
+                m.insert(n, u.role);
+            }
+        }
+        Ok(m)
+    })
+    .await?;
+    for s in &mut list {
+        if s.role.is_none() {
+            s.role = roles.get(&s.user).copied();
+        }
+        s.current = own.as_deref() == Some(s.id.as_str());
+    }
+    Ok(Json(json!({ "sessions": list })))
+}
+
+/// Admin: ends one session by its public id.
+async fn end_session(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let user = ctl
+        .sessions
+        .end_by_id(&id)
+        .ok_or_else(|| ApiError::not_found("no such session"))?;
+    let c = ctl.clone();
+    let u = user.clone();
+    let i = id.clone();
+    blocking(move || {
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "session.end",
+            json!({ "session": i, "user": u }),
+        )
+    })
+    .await?;
+    Ok(Json(json!({ "ended": 1, "user": user })))
+}
+
+#[derive(Deserialize)]
+struct EndSessionsQuery {
+    user: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+/// Admin: ends all sessions of `?user=<name>`, or everybody's with
+/// `?all=true` (incident response; includes the caller's own).
+async fn end_sessions(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Query(q): Query<EndSessionsQuery>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let (target, action) = match (&q.user, q.all) {
+        (Some(u), false) => (Some(u.clone()), "session.end_user"),
+        (None, true) => (None, "session.end_all"),
+        _ => {
+            return Err(ApiError::bad_request(
+                "give either ?user=<name> or ?all=true",
+            ))
+        }
+    };
+    let ended = ctl.sessions.end_user(target.as_deref());
+    let c = ctl.clone();
+    blocking(move || {
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            action,
+            json!({ "user": target, "ended": ended }),
+        )
+    })
+    .await?;
+    Ok(Json(json!({ "ended": ended })))
 }
 
 // --------------------------------------------------------------------- OIDC
@@ -591,6 +702,7 @@ async fn oidc_callback(
             sid: ident.sid.clone(),
         },
         o.config.session_lifetime,
+        session::Client::new(addr, user_agent(&headers)),
     );
     let c = ctl.clone();
     let i = ident.clone();
@@ -1495,6 +1607,137 @@ mod tests {
                 "olga:unban",
                 "olga:ban",
                 "olga:session.login"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn admins_list_and_end_sessions() {
+        let env = Env::new("sessmgmt").await;
+        files::create_user(&env.dir, "ada", Role::Admin, "correct horse battery").unwrap();
+        files::create_user(&env.dir, "olga", Role::Operator, "operator password").unwrap();
+        let (_, ada, v) = login(&env, "ada", "correct horse battery").await;
+        let ada_csrf = v["csrf_token"].as_str().unwrap().to_owned();
+        let (_, olga1, v) = login(&env, "olga", "operator password").await;
+        let olga_csrf = v["csrf_token"].as_str().unwrap().to_owned();
+        let (_, olga2, _) = login(&env, "olga", "operator password").await;
+
+        // operators may not
+        let (st, _) = with_cookie(&env, "GET", "/api/v1/sessions", &olga1, None, json!({})).await;
+        assert_eq!(st, S::FORBIDDEN);
+        let (st, _) = with_cookie(
+            &env,
+            "DELETE",
+            "/api/v1/sessions?user=ada",
+            &olga1,
+            Some(&olga_csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, S::FORBIDDEN);
+
+        let (st, v) = with_cookie(&env, "GET", "/api/v1/sessions", &ada, None, json!({})).await;
+        assert_eq!(st, S::OK);
+        let list = v["sessions"].as_array().unwrap();
+        assert_eq!(list.len(), 3);
+        let mine: Vec<_> = list.iter().filter(|s| s["current"] == true).collect();
+        assert_eq!((mine.len(), mine[0]["user"].as_str()), (1, Some("ada")));
+        let olgas: Vec<&Value> = list.iter().filter(|s| s["user"] == "olga").collect();
+        assert!(olgas
+            .iter()
+            .all(|s| s["role"] == "operator" && s["method"] == "password"));
+        assert!(olgas[0]["remote_addr"]
+            .as_str()
+            .unwrap()
+            .starts_with("127.0.0.1:"));
+        assert!(
+            !v.to_string().contains(olga1.split('=').nth(1).unwrap()),
+            "no cookie secrets"
+        );
+
+        // end one of olga's sessions: needs CSRF like every change
+        let id = olgas[0]["id"].as_str().unwrap().to_owned();
+        let path = format!("/api/v1/sessions/{id}");
+        let (st, _) = with_cookie(&env, "DELETE", &path, &ada, None, json!({})).await;
+        assert_eq!(st, S::FORBIDDEN);
+        let (st, v) = with_cookie(&env, "DELETE", &path, &ada, Some(&ada_csrf), json!({})).await;
+        assert_eq!((st, v["user"].as_str()), (S::OK, Some("olga")));
+        let (st, _) = with_cookie(&env, "DELETE", &path, &ada, Some(&ada_csrf), json!({})).await;
+        assert_eq!(st, S::NOT_FOUND);
+        let alive = |c: String| {
+            let env = &env;
+            async move {
+                with_cookie(env, "GET", "/api/v1/whoami", &c, None, json!({}))
+                    .await
+                    .0
+                    == S::OK
+            }
+        };
+        // most recently used first: olga1 made the refused requests above
+        assert_eq!(
+            (alive(olga1.clone()).await, alive(olga2.clone()).await),
+            (false, true)
+        );
+
+        // all of a user's sessions
+        let (_, v) = with_cookie(
+            &env,
+            "DELETE",
+            "/api/v1/sessions?user=olga",
+            &ada,
+            Some(&ada_csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(v["ended"], 1);
+        assert!(!alive(olga2.clone()).await);
+        let (st, _) = with_cookie(
+            &env,
+            "DELETE",
+            "/api/v1/sessions",
+            &ada,
+            Some(&ada_csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, S::BAD_REQUEST, "neither user nor all");
+
+        // an admin API token works too; everybody out (incident response)
+        let token = env.token("ops", Role::Admin);
+        let (_, v) = env.call("GET", "/api/v1/sessions", &token, json!({})).await;
+        assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(v["sessions"][0]["current"], false);
+        let r = env
+            .http
+            .delete(format!("{}/api/v1/sessions?all=true", env.base))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.json::<Value>().await.unwrap()["ended"], 1);
+        assert!(!alive(ada.clone()).await);
+
+        let (_, v) = env.call("GET", "/api/v1/audit", &token, json!({})).await;
+        let actions: Vec<_> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}",
+                    e["actor"].as_str().unwrap(),
+                    e["action"].as_str().unwrap()
+                )
+            })
+            .filter(|a| a.contains("session.end"))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "ops:session.end_all",
+                "ada:session.end_user",
+                "ada:session.end"
             ]
         );
         let _ = std::fs::remove_dir_all(&env.dir);

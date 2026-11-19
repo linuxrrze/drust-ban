@@ -12,15 +12,19 @@
 //! read on every request). OIDC sessions keep the role from the login.
 //!
 //! Failed logins are limited per client (IPv6: per /64) and per user name.
+//!
+//! Admins can list and end sessions (`/api/v1/sessions`). A session is
+//! identified there by a separate random `id`, never by its secret.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::files::Role;
 
@@ -48,11 +52,34 @@ pub enum Kind {
     },
 }
 
+/// Where a session was created (shown to admins).
+#[derive(Debug, Clone, Default)]
+pub struct Client {
+    pub addr: Option<SocketAddr>,
+    pub user_agent: Option<String>,
+}
+
+impl Client {
+    pub fn new(addr: SocketAddr, user_agent: Option<&str>) -> Self {
+        Self {
+            addr: Some(addr),
+            // attacker-controlled: bounded, printable
+            user_agent: user_agent
+                .map(|u| u.chars().filter(|c| !c.is_control()).take(200).collect()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
+    /// Public handle for listing and ending; unrelated to the secret.
+    pub id: String,
     pub user: String,
     pub csrf: String,
     pub kind: Kind,
+    pub client: Client,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
     max_age: Duration,
     created: Instant,
     last_used: Instant,
@@ -62,6 +89,48 @@ impl Session {
     fn expired(&self, now: Instant) -> bool {
         now.duration_since(self.created) > self.max_age || now.duration_since(self.last_used) > IDLE
     }
+
+    /// When the session ends unless it is used again.
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        let to = |d: Duration| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX);
+        (self.created_at + to(self.max_age)).min(self.last_used_at + to(IDLE))
+    }
+
+    pub fn info(&self) -> SessionInfo {
+        let (method, role) = match &self.kind {
+            Kind::Password { .. } => ("password", None),
+            Kind::Oidc { role, .. } => ("oidc", Some(*role)),
+        };
+        SessionInfo {
+            id: self.id.clone(),
+            user: self.user.clone(),
+            method,
+            role,
+            created_at: self.created_at,
+            last_used_at: self.last_used_at,
+            expires_at: self.expires_at(),
+            remote_addr: self.client.addr.map(|a| a.to_string()),
+            user_agent: self.client.user_agent.clone(),
+            current: false,
+        }
+    }
+}
+
+/// A session as admins see it (no secrets).
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub user: String,
+    pub method: &'static str,
+    /// OIDC: role from the login; password: filled in from the user file
+    pub role: Option<Role>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub remote_addr: Option<String>,
+    pub user_agent: Option<String>,
+    /// the caller's own session
+    pub current: bool,
 }
 
 #[derive(Default)]
@@ -160,13 +229,24 @@ impl Sessions {
     }
 
     /// Creates a session; returns the cookie secret and the session.
-    pub fn create(&self, user: &str, kind: Kind, max_age: Duration) -> (String, Session) {
+    pub fn create(
+        &self,
+        user: &str,
+        kind: Kind,
+        max_age: Duration,
+        client: Client,
+    ) -> (String, Session) {
         let secret = random_token();
         let now = Instant::now();
+        let wall = Utc::now();
         let s = Session {
+            id: URL_SAFE_NO_PAD.encode(df2b_tls::random_bytes::<12>()),
             user: user.to_owned(),
             csrf: random_token(),
             kind,
+            client,
+            created_at: wall,
+            last_used_at: wall,
             max_age: max_age.min(MAX_AGE),
             created: now,
             last_used: now,
@@ -186,7 +266,35 @@ impl Sessions {
             return None;
         }
         s.last_used = now;
+        s.last_used_at = Utc::now();
         Some(s.clone())
+    }
+
+    /// Live sessions, most recently used first.
+    pub fn list(&self) -> Vec<SessionInfo> {
+        let now = Instant::now();
+        let mut v: Vec<SessionInfo> = Self::lock(&self.sessions)
+            .values()
+            .filter(|s| !s.expired(now))
+            .map(Session::info)
+            .collect();
+        v.sort_by_key(|s| std::cmp::Reverse(s.last_used_at));
+        v
+    }
+
+    /// Ends the session with this public id; returns its user.
+    pub fn end_by_id(&self, id: &str) -> Option<String> {
+        let mut map = Self::lock(&self.sessions);
+        let k = *map.iter().find(|(_, s)| s.id == id)?.0;
+        map.remove(&k).map(|s| s.user)
+    }
+
+    /// Ends all sessions of a user (`None`: of everybody); returns how many.
+    pub fn end_user(&self, user: Option<&str>) -> usize {
+        let mut map = Self::lock(&self.sessions);
+        let before = map.len();
+        map.retain(|_, s| user.is_some_and(|u| s.user != u));
+        before - map.len()
     }
 
     pub fn remove(&self, secret: &str) {
@@ -266,11 +374,11 @@ mod tests {
     #[test]
     fn sessions() {
         let s = Sessions::default();
-        let (secret, sess) = s.create("alice", pw(), MAX_AGE);
+        let (secret, sess) = s.create("alice", pw(), MAX_AGE, Client::default());
         assert_eq!(s.get(&secret).unwrap().csrf, sess.csrf);
         assert!(s.get("nope").is_none());
-        let (other, _) = s.create("bob", pw(), MAX_AGE);
-        let (short, _) = s.create("carol", pw(), Duration::ZERO);
+        let (other, _) = s.create("bob", pw(), MAX_AGE, Client::default());
+        let (short, _) = s.create("carol", pw(), Duration::ZERO, Client::default());
         std::thread::sleep(Duration::from_millis(5));
         assert!(s.get(&short).is_none(), "per-session maximum age");
         s.remove(&secret);
@@ -287,11 +395,11 @@ mod tests {
             subject: sub.into(),
             sid: sid.map(Into::into),
         };
-        let (a1, _) = s.create("alice", oidc("u-a", Some("s1")), MAX_AGE);
-        let (a2, _) = s.create("alice", oidc("u-a", Some("s2")), MAX_AGE);
-        let (a3, _) = s.create("alice", oidc("u-a", None), MAX_AGE);
-        let (b, _) = s.create("bob", oidc("u-b", Some("s1")), MAX_AGE);
-        let (local, _) = s.create("u-a", pw(), MAX_AGE);
+        let (a1, _) = s.create("alice", oidc("u-a", Some("s1")), MAX_AGE, Client::default());
+        let (a2, _) = s.create("alice", oidc("u-a", Some("s2")), MAX_AGE, Client::default());
+        let (a3, _) = s.create("alice", oidc("u-a", None), MAX_AGE, Client::default());
+        let (b, _) = s.create("bob", oidc("u-b", Some("s1")), MAX_AGE, Client::default());
+        let (local, _) = s.create("u-a", pw(), MAX_AGE, Client::default());
         assert_eq!(s.end_oidc(Some("u-a"), Some("s1")), 1);
         assert!(
             s.get(&a1).is_none() && s.get(&b).is_some(),
@@ -306,8 +414,46 @@ mod tests {
     }
 
     #[test]
+    fn listing_and_ending() {
+        let s = Sessions::default();
+        let ua = "Mozilla/5.0\u{1b}[31m evil".to_owned() + &"x".repeat(500);
+        let addr: SocketAddr = "192.0.2.7:5555".parse().unwrap();
+        let (a1, sa) = s.create("alice", pw(), MAX_AGE, Client::new(addr, Some(&ua)));
+        let (a2, _) = s.create("alice", pw(), MAX_AGE, Client::default());
+        let (b, sb) = s.create("bob", pw(), MAX_AGE, Client::default());
+        assert_ne!(sa.id, sb.id);
+        assert!(
+            !a1.contains(&sa.id) && sa.id.len() == 16,
+            "id unrelated to the secret"
+        );
+
+        let list = s.list();
+        assert_eq!(list.len(), 3);
+        let ia = list.iter().find(|i| i.id == sa.id).unwrap();
+        assert_eq!(ia.remote_addr.as_deref(), Some("192.0.2.7:5555"));
+        let shown = ia.user_agent.as_deref().unwrap();
+        assert!(shown.len() <= 200 && !shown.contains('\u{1b}'), "{shown}");
+        assert!(ia.expires_at > ia.created_at);
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(
+            !json.contains(&a1) && !json.contains(&sa.csrf),
+            "no secrets in the listing"
+        );
+
+        assert_eq!(s.end_by_id(&sb.id).as_deref(), Some("bob"));
+        assert!(s.get(&b).is_none());
+        assert_eq!(s.end_by_id(&sb.id), None);
+        assert_eq!(s.end_user(Some("alice")), 2);
+        assert!(s.get(&a1).is_none() && s.get(&a2).is_none());
+        s.create("carol", pw(), MAX_AGE, Client::default());
+        s.create("dave", pw(), MAX_AGE, Client::default());
+        assert_eq!(s.end_user(None), 2);
+        assert_eq!(s.count(), 0);
+    }
+
+    #[test]
     fn cookies() {
-        let (secret, _) = Sessions::default().create("a", pw(), MAX_AGE);
+        let (secret, _) = Sessions::default().create("a", pw(), MAX_AGE, Client::default());
         let h = format!("theme=dark; {COOKIE}={secret}; x=y");
         assert_eq!(from_cookie_header(&h), Some(secret.as_str()));
         assert_eq!(from_cookie_header("theme=dark"), None);

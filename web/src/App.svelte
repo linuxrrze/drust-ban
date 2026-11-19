@@ -10,6 +10,7 @@
   import Dashboard from './pages/Dashboard.svelte';
   import Ip from './pages/Ip.svelte';
   import Login from './pages/Login.svelte';
+  import Sessions from './pages/Sessions.svelte';
 
   checkSession();
 
@@ -29,6 +30,7 @@
     { id: 'bans', label: 'Bans', show: true },
     { id: 'agents', label: 'Agents', show: true },
     { id: 'ip', label: 'Address lookup', show: true },
+    { id: 'sessions', label: 'Sessions', show: can('admin') },
     { id: 'audit', label: 'Audit log', show: can('admin') },
   ]);
   let menuOpen = $state(false);
@@ -70,6 +72,8 @@
         <Agents selected={route.parts[1] ?? null} />
       {:else if page === 'ip'}
         {#key route.parts[1]}<Ip addr={route.parts.slice(1).join('/')} />{/key}
+      {:else if page === 'sessions' && can('admin')}
+        <Sessions />
       {:else if page === 'audit' && can('admin')}
         <Audit />
       {:else}
