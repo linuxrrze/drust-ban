@@ -332,6 +332,19 @@ impl State {
         Ok(())
     }
 
+    /// The saved source positions (as committed). Blocking.
+    pub fn positions(&self) -> anyhow::Result<HashMap<String, Position>> {
+        let tx = self.db.begin_read()?;
+        let mut out = HashMap::new();
+        for item in tx.open_table(POSITIONS)?.iter()? {
+            let (k, v) = item?;
+            if let Ok(p) = serde_json::from_slice(v.value()) {
+                out.insert(k.value().to_owned(), p);
+            }
+        }
+        Ok(out)
+    }
+
     /// Unsent reports in queue order. Blocking.
     pub fn load_reports(&self) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
         let tx = self.db.begin_read()?;

@@ -123,6 +123,12 @@ impl Tracker {
         self.findtime = TimeDelta::from_std(findtime).unwrap_or(TimeDelta::days(365));
     }
 
+    /// New key limit (configuration reload); a smaller one takes effect
+    /// as new keys arrive.
+    pub fn set_max_keys(&mut self, max_keys: usize) {
+        self.max_keys = max_keys.max(1);
+    }
+
     /// Drops expired timestamps and empty keys.
     pub fn prune(&mut self, now: DateTime<Utc>) {
         let cutoff = now - self.findtime;

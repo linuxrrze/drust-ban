@@ -5,8 +5,8 @@
 //! the HTTPS
 //! REST API.
 //! `--local` talks to the agent on this host over its control socket
-//! (status, jails list, bans list, ban, unban).
-//! TODO: ip, config.
+//! (status, jails list, bans list, ban, unban, config check|reload).
+//! TODO: ip.
 
 // Stub commands carry arguments that are only read once implemented.
 #![allow(dead_code)]
@@ -147,7 +147,7 @@ enum Command {
     /// Work with filters.
     #[command(subcommand)]
     Filter(FilterCmd),
-    /// Configuration management.
+    /// The configuration of the agent on this host (with --local).
     #[command(subcommand)]
     Config(ConfigCmd),
 }
@@ -427,7 +427,10 @@ enum FilterCmd {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCmd {
+    /// Read and check the agent's configuration file and its filters, and
+    /// show what a reload would change; nothing is applied.
     Check,
+    /// Apply the agent's configuration file without a restart (as SIGHUP).
     Reload,
 }
 
@@ -465,8 +468,9 @@ async fn run_local(cmd: Command, socket: &std::path::Path, json: bool) -> anyhow
             }
             local::unban(socket, target, json).await
         }
+        Command::Config(cmd) => local::config(socket, matches!(cmd, ConfigCmd::Reload), json).await,
         _ => bail!(
-            "not available with --local; the agent answers: status, jails list, bans list, ban, unban"
+            "not available with --local; the agent answers: status, jails list, bans list, ban, unban, config check|reload"
         ),
     }
 }
@@ -708,6 +712,10 @@ async fn run() -> anyhow::Result<()> {
             reason,
             allow_for,
         } => commands::unban(&client()?, target, reason, allow_for, json).await,
+        Command::Config(_) => bail!(
+            "config check|reload act on the agent on this host: use --local \
+             (to check a file offline: df2b-agent --check --config FILE)"
+        ),
         other => bail!("not implemented yet: {other:?}"),
     }
 }

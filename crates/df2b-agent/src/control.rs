@@ -45,6 +45,10 @@ pub enum Request {
     Unban {
         target: String,
     },
+    /// Read and check the configuration file without applying it.
+    ConfigCheck,
+    /// Apply the configuration file (also SIGHUP).
+    ConfigReload,
 }
 
 pub struct Call {
@@ -318,6 +322,8 @@ pub async fn handle(req: Request, peer: &str, cx: Ctx<'_>) -> Result<Value, Stri
             info!(target = %net, until = ?until, reason = %ban.reason, %peer, "manual local ban");
             Ok(json!({ "target": net.to_string(), "expires_at": ms(until) }))
         }
+        // the main loop answers these itself (reload.rs)
+        Request::ConfigCheck | Request::ConfigReload => Err("not handled here".into()),
         Request::Unban { target } => {
             let net = parse_target(&target)?;
             let mut nets: Vec<IpNet> = Vec::new();

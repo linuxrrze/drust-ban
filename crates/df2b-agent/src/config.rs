@@ -92,14 +92,14 @@ pub enum FirewallKind {
     DryRun,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SourceConfig {
     pub name: String,
     #[serde(flatten)]
     pub kind: SourceKind,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SourceKind {
     File {
@@ -148,7 +148,7 @@ impl TryFrom<String> for JournalStart {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JailConfig {
     pub name: String,

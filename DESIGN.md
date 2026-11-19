@@ -476,8 +476,8 @@ Implemented: `status`, `whoami`, `agents …`, `bans list`, `ban`, `unban`,
 `audit`, `filter test`. An unban revokes every active ban overlapping the
 target (e.g. the /64 containing an IPv6 address) in the scope it was made.
 Added later (see §9): `unban --allow-for`, `lookup` (the address page),
-`allowlist`, `jails`, `filters`, `correlation`, `propagate`. Not
-implemented yet: `config`.
+`allowlist`, `jails`, `filters`, `correlation`, `propagate`, `config`
+(with `--local`).
 
 `--local` (socket `--socket`, default `/var/lib/df2b/agent.sock`; agent
 setting `control_socket`, "" = off) answers `status` (controller link,
@@ -491,6 +491,24 @@ line. A local `ban` is a **manual ban of this host only**: kept in
 refused). A local `unban` lifts this host's jail and manual bans; an
 address a controller ban still covers stays blocked and is named in the
 answer (unban it on the controller).
+
+`config check` / `config reload` (with `--local`; `reload` also on SIGHUP,
+`systemctl reload df2b-agent`) act on the agent's configuration file.
+`check` reads it and compiles every filter, and shows what a reload would
+change (jails and sources added/removed/changed, allowlist, redaction
+rules, settings that need a restart); nothing is applied. `reload`
+applies it while running: local jails are rebuilt with their filters
+read again, keeping the offense history and counted failures of jails
+that stay; bans of removed jails end (unless something else still bans
+the prefix); local sources that changed or went away stop, new ones
+start, unchanged ones keep running, and restarted ones resume from the
+positions saved up to now; the allowlist (lifting bans overlapping it),
+redaction rules, `send_samples`, `offense_memory` and the `central_*`
+settings apply, and central jails are applied again. An invalid file or
+filter changes nothing. `controller`, `state_dir`, `firewall`,
+`control_socket` and the IPv4/IPv6 prefixes need a restart: they keep
+their running values and the answer names them. Without `--local`, df2bctl
+points there (offline: `df2b-agent --check`).
 
 ```
 df2bctl status
@@ -963,7 +981,7 @@ systemd hardening.
 | Tracker / engine             | implemented + tests; one firewall transaction per batch |
 | nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |
 | Agent state (redb)           | source positions + offender records, flushed every 1 s; bans re-applied on start |
-| `df2bctl`                    | `filter test`, controller commands, `--local` (agent socket); config TODO |
+| `df2bctl`                    | `filter test`, controller commands, `--local` (agent socket) incl. config check/reload |
 | Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
 | REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions (password, OIDC) with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
 | gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |

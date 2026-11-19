@@ -8,6 +8,8 @@ Type=simple
 # DF2B_ENROLL_TOKEN=… for the first start with a controller
 EnvironmentFile=-/etc/df2b/agent.env
 ExecStart=/usr/bin/df2b-agent --config /etc/df2b/agent.toml
+# applies agent.toml without a restart (as df2bctl --local config reload)
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 

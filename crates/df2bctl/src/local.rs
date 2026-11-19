@@ -255,3 +255,83 @@ pub async fn unban(socket: &Path, target: IpNet, json: bool) -> anyhow::Result<(
     }
     Ok(())
 }
+
+/// `config check` (nothing applied) or `config reload`.
+pub async fn config(socket: &Path, reload: bool, json: bool) -> anyhow::Result<()> {
+    let cmd = if reload {
+        "config_reload"
+    } else {
+        "config_check"
+    };
+    let v = call(socket, json!({ "cmd": cmd })).await?;
+    if json {
+        return json_out(&v);
+    }
+    println!(
+        "{} {}: {} jail(s)",
+        if reload { "reloaded" } else { "valid:" },
+        str_or(&v["path"], "?"),
+        v["jails"]
+    );
+    let c = &v["changes"];
+    let names = |v: &Value| -> String {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut any = false;
+    for what in ["jails", "sources"] {
+        for (k, verb) in [
+            ("added", "added"),
+            ("removed", "removed"),
+            ("changed", "changed"),
+        ] {
+            let n = names(&c[what][k]);
+            if !n.is_empty() {
+                any = true;
+                println!("  {what} {verb}: {n}");
+            }
+        }
+    }
+    if c["allowlist"] == true {
+        any = true;
+        println!("  allowlist changed");
+    }
+    if c["redact"] == true {
+        any = true;
+        println!("  redaction rules changed");
+    }
+    if !any {
+        println!(
+            "  no jail, source, allowlist or redaction changes (filters are read again on reload)"
+        );
+    }
+    let restart = names(&c["restart_needed"]);
+    if !restart.is_empty() {
+        println!("  needs a restart (running values kept): {restart}");
+    }
+    if reload {
+        let started = names(&v["sources_started"]);
+        let stopped = names(&v["sources_stopped"]);
+        if !stopped.is_empty() {
+            println!("  sources stopped: {stopped}");
+        }
+        if !started.is_empty() {
+            println!("  sources started: {started}");
+        }
+        for f in v["sources_failed"].as_array().into_iter().flatten() {
+            println!(
+                "  source {} FAILED: {}",
+                str_or(&f["source"], "?"),
+                str_or(&f["error"], "?")
+            );
+        }
+        if let Some(n) = v["bans_lifted"].as_u64().filter(|n| *n > 0) {
+            println!("  {n} ban(s) lifted (removed jails, allowlist)");
+        }
+    }
+    Ok(())
+}

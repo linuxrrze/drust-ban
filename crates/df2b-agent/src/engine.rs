@@ -122,6 +122,15 @@ pub struct Observed {
 /// Keys per report interval (memory bound).
 const MAX_OBSERVED: usize = 50_000;
 
+/// What a configuration reload ended.
+#[derive(Debug, Default, PartialEq)]
+pub struct Reloaded {
+    /// Prefixes whose active bans belonged to removed jails.
+    pub ended: Vec<IpNet>,
+    /// Offender records of removed jails.
+    pub forgotten: Vec<(String, IpKey)>,
+}
+
 /// Status of a jail for heartbeats.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JailStatus {
@@ -198,9 +207,9 @@ fn allowed(local: &Allowlist, central: &Allowlist, ip: &std::net::IpAddr, net: &
 }
 
 impl Engine {
-    pub fn from_config(cfg: &AgentConfig) -> anyhow::Result<Self> {
-        let jails = cfg
-            .jail
+    /// The configured jails with their filters read and compiled.
+    fn local_jails(cfg: &AgentConfig) -> anyhow::Result<Vec<Jail>> {
+        cfg.jail
             .iter()
             .map(|j| {
                 let path = cfg.agent.filter_dir.join(format!("{}.toml", j.filter));
@@ -214,7 +223,61 @@ impl Engine {
                 })?;
                 Ok(Jail::new(j, filter))
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect()
+    }
+
+    /// Applies a changed configuration (reload): local jails are rebuilt
+    /// with their filters read again, keeping the offense history and
+    /// counted failures of jails that stay; allowlist, redaction rules and
+    /// `offense_memory` are replaced. Central jails are left alone (the
+    /// caller applies them again). Nothing changes if a filter fails.
+    /// The prefix policy is not changed (that needs a restart).
+    pub fn reload_local(
+        &mut self,
+        cfg: &AgentConfig,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Reloaded> {
+        let mut fresh = Self::local_jails(cfg)?;
+        let local_redactor =
+            df2b_core::Redactor::new(&cfg.redact).map_err(|e| anyhow::anyhow!("redact: {e}"))?;
+        let (mut old, central): (Vec<Jail>, Vec<Jail>) = std::mem::take(&mut self.jails)
+            .into_iter()
+            .partition(|j| !j.central);
+        for j in &mut fresh {
+            let Some(i) = old.iter().position(|o| o.name == j.name) else {
+                continue;
+            };
+            let prev = old.swap_remove(i);
+            j.offenders = prev.offenders;
+            j.tracker = prev.tracker;
+            j.tracker.set_limits(j.maxretry, j.findtime);
+            if let Some(c) = cfg.jail.iter().find(|c| c.name == j.name) {
+                j.tracker.set_max_keys(c.max_tracked);
+            }
+        }
+        // jails gone: their bans end, their history is forgotten
+        let mut out = Reloaded::default();
+        for j in old {
+            for (key, o) in j.offenders {
+                if o.banned_until > now {
+                    out.ended.push(key.net());
+                }
+                out.forgotten.push((j.name.clone(), key));
+            }
+        }
+        self.jails = fresh;
+        self.jails.extend(central);
+        self.filter_dir = cfg.agent.filter_dir.clone();
+        self.local_redactor = local_redactor;
+        self.redactor = self.local_redactor.clone();
+        self.allowlist = Allowlist::new(cfg.agent.allowlist.iter().copied());
+        self.offense_memory =
+            TimeDelta::from_std(cfg.agent.offense_memory).unwrap_or(TimeDelta::MAX);
+        Ok(out)
+    }
+
+    pub fn from_config(cfg: &AgentConfig) -> anyhow::Result<Self> {
+        let jails = Self::local_jails(cfg)?;
         let local_redactor =
             df2b_core::Redactor::new(&cfg.redact).map_err(|e| anyhow::anyhow!("redact: {e}"))?;
         Ok(Self {
@@ -610,13 +673,17 @@ impl Engine {
         self.central = Allowlist::new(nets);
     }
 
-    /// Lifts active bans that overlap the controller's allowlist (a /64 ban
-    /// containing an allowlisted address included). Offense history is kept.
+    /// Lifts active bans that overlap the controller's or the configured
+    /// allowlist (a /64 ban containing an allowlisted address included).
+    /// Offense history is kept.
     pub fn lift_allowlisted(&mut self, now: DateTime<Utc>) -> Vec<OffenderRecord> {
         let mut changed = Vec::new();
         for j in &mut self.jails {
             for (key, o) in j.offenders.iter_mut() {
-                if o.banned_until > now && self.central.overlaps(&key.net()) {
+                let net = key.net();
+                if o.banned_until > now
+                    && (self.central.overlaps(&net) || self.allowlist.overlaps(&net))
+                {
                     o.banned_until = now;
                     j.tracker.reset(key);
                     changed.push(OffenderRecord {
@@ -1116,5 +1183,69 @@ mod tests {
             assert!(e.process(&line("nginx", "203.0.113.7"), now).is_empty());
             assert!(e.process(&line("auth", "10.1.2.3"), now).is_empty());
         }
+    }
+
+    fn cfg(extra: &str) -> AgentConfig {
+        let mut cfg: AgentConfig = toml::from_str(&format!(
+            r#"
+            [agent]
+            {extra}
+            [[source]]
+            name = "auth"
+            type = "file"
+            paths = ["/dev/null"]
+            [[jail]]
+            name = "sshd"
+            sources = ["auth"]
+            filter = "sshd"
+            maxretry = 3
+            findtime = "10m"
+            bantime = "1h"
+            "#
+        ))
+        .unwrap();
+        cfg.agent.filter_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../filters").into();
+        cfg
+    }
+
+    #[test]
+    fn reload_keeps_history_and_ends_removed_jails() {
+        let mut e = engine();
+        let now = Utc::now();
+        // banned once, one failure counted for another address
+        e.process(&line("auth", "203.0.113.7"), now);
+        assert_eq!(e.process(&line("auth", "203.0.113.7"), now).len(), 1);
+        e.process(&line("auth", "198.51.100.1"), now);
+
+        // same jail, maxretry 3, 198.51.100.0/24 allowlisted now
+        let r = e
+            .reload_local(&cfg(r#"allowlist = ["198.51.100.0/24"]"#), now)
+            .unwrap();
+        assert_eq!(r, Reloaded::default());
+        assert_eq!(e.jail_status(now)[0].params.maxretry, 3);
+        assert_eq!(e.bans(now).len(), 1, "active ban kept");
+        assert!(e.allowlisted(&"198.51.100.1/32".parse().unwrap()));
+        assert!(
+            !e.allowlisted(&"10.1.1.1/32".parse().unwrap()),
+            "old allowlist replaced"
+        );
+        // the counted failure stayed: two more reach 3
+        e.process(&line("auth", "192.0.2.5"), now);
+        e.process(&line("auth", "192.0.2.5"), now);
+        assert_eq!(e.process(&line("auth", "192.0.2.5"), now).len(), 1);
+
+        // a broken filter: nothing changes
+        let mut bad = cfg("");
+        bad.jail[0].filter = "does-not-exist".into();
+        assert!(e.reload_local(&bad, now).is_err());
+        assert_eq!(e.bans(now).len(), 2);
+
+        // the jail removed: its bans end, its history is forgotten
+        let mut none = cfg("");
+        none.jail.clear();
+        let r = e.reload_local(&none, now).unwrap();
+        assert_eq!(r.ended.len(), 2);
+        assert_eq!(r.forgotten.len(), 2);
+        assert_eq!(e.jail_count(), 0);
     }
 }

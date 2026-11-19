@@ -14,6 +14,7 @@ mod health;
 mod link;
 mod outbox;
 mod reconcile;
+mod reload;
 mod remote;
 mod state;
 mod tracker;
@@ -79,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let cfg = AgentConfig::load(&args.config)?;
+    let mut cfg = AgentConfig::load(&args.config)?;
     let mut engine = Engine::from_config(&cfg)?;
     let enroll_token = args
         .enroll_token
@@ -221,8 +222,10 @@ async fn main() -> anyhow::Result<()> {
     // Bounded in batches (each up to BATCH_MAX lines): a slow engine throttles
     // the sources instead of buffering without limit.
     let (tx, mut rx) = mpsc::channel::<SourceBatch>(64);
-    for src in &cfg.source {
-        spawn_source(src, &tx, &loaded.positions, &stats.sources)?;
+    let mut local_sources = LocalSources::default();
+    let started = local_sources.update(&cfg.source, &tx, &loaded.positions, &stats.sources);
+    if let Some((name, e)) = started.failed.first() {
+        anyhow::bail!("source '{name}': {e}");
     }
     // kept: central jails start sources later (and an agent without local
     // sources must keep running)
@@ -294,6 +297,32 @@ async fn main() -> anyhow::Result<()> {
     };
     let controller_addr = cfg.agent.controller.clone();
     let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+    let with_controller = link.is_some();
+    // what a configuration reload works on
+    macro_rules! live {
+        () => {
+            reload::Live {
+                path: &args.config,
+                cfg: &mut cfg,
+                engine: &mut engine,
+                central_jails: &central_jails,
+                jail_policies: &jail_policies,
+                redaction: &redaction,
+                local_sources: &mut local_sources,
+                central_sources: &mut central_sources,
+                src_tx: &src_tx,
+                state: &state,
+                pending: &mut pending,
+                backend: &backend,
+                remote: &remote,
+                manual: &manual,
+                stats: &stats,
+                with_controller,
+                startup_positions: &loaded.positions,
+            }
+        };
+    }
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
@@ -368,7 +397,10 @@ async fn main() -> anyhow::Result<()> {
                     let running = engine.set_central_jails(&accepted, &c.filters, rejected);
                     // the policies apply to central jails as well
                     engine.apply_jail_overrides(&jail_policies.jails);
-                    central_sources.update(&c, &running, &src_tx, &loaded.positions, &stats.sources);
+                    // (re)started sources resume from the positions saved up
+                    // to now, not those loaded at startup
+                    let positions = current_positions(&state, &mut pending, &loaded.positions).await;
+                    central_sources.update(&c, &running, &src_tx, &positions, &stats.sources);
                     if c.version != central_jails.version {
                         info!(version = %c.version, defined = c.jails.len(), running = running.len(), "central jails applied");
                         let (st, saved) = (state.clone(), c.clone());
@@ -499,6 +531,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             call = next_call(&mut control) => {
+                if matches!(call.req, control::Request::ConfigCheck) {
+                    let _ = call.reply.send(reload::check(&args.config, &cfg));
+                    continue;
+                }
+                if matches!(call.req, control::Request::ConfigReload) {
+                    info!(peer = %call.peer, "configuration reload requested");
+                    let r = reload::reload(live!()).await;
+                    if let Err(e) = &r {
+                        error!(error = %e, "configuration reload failed, nothing changed");
+                    }
+                    let _ = call.reply.send(r);
+                    continue;
+                }
                 let cx = control::Ctx {
                     engine: &mut engine,
                     remote: &remote,
@@ -537,6 +582,12 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             _ = &mut ctrl_c => { info!("interrupted, shutting down"); break; }
+            _ = sighup.recv() => {
+                info!("SIGHUP: reloading the configuration");
+                if let Err(e) = reload::reload(live!()).await {
+                    error!(error = %e, "configuration reload failed, nothing changed");
+                }
+            }
             _ = sigterm.recv() => { info!("terminated, shutting down"); break; }
         }
     }
@@ -548,6 +599,30 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("saving state on shutdown")?;
     Ok(())
+}
+
+/// Saves pending changes and reads the source positions as saved now
+/// (startup positions on failure, logged).
+async fn current_positions(
+    state: &State,
+    pending: &mut Pending,
+    fallback: &HashMap<String, Position>,
+) -> HashMap<String, Position> {
+    if let Err(e) = state.flush_async(std::mem::take(pending)).await {
+        error!(error = %format!("{e:#}"), "saving state failed");
+    }
+    let st = state.clone();
+    match tokio::task::spawn_blocking(move || st.positions()).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            error!(error = %format!("{e:#}"), "reading saved positions failed");
+            fallback.clone()
+        }
+        Err(e) => {
+            error!(error = %e, "reading saved positions failed");
+            fallback.clone()
+        }
+    }
 }
 
 /// The next `df2bctl --local` request; never, without a control socket.
@@ -676,13 +751,91 @@ fn apply_remote(backend: &Arc<dyn FirewallBackend>, c: Changes) {
     });
 }
 
-/// Running sources of central jails, by source name: definition and tasks.
-#[derive(Default)]
-struct CentralSources(HashMap<String, (central::CentralSource, Vec<tokio::task::JoinHandle<()>>)>);
+/// Running sources by name: the definition they were started from (to see
+/// changes) and their tasks.
+struct RunningSources<D>(HashMap<String, (D, Vec<tokio::task::JoinHandle<()>>)>);
+
+impl<D> Default for RunningSources<D> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+/// What a source update did, by source name.
+#[derive(Debug, Default)]
+struct SourceChanges {
+    started: Vec<String>,
+    stopped: Vec<String>,
+    /// (name, error)
+    failed: Vec<(String, String)>,
+}
+
+impl<D: PartialEq> RunningSources<D> {
+    /// Stops sources that are gone or changed, starts new ones; unchanged
+    /// sources keep running (and their read position). `what`: "local" or
+    /// "central", for logs.
+    fn sync(
+        &mut self,
+        wanted: Vec<(D, SourceConfig)>,
+        tx: &mpsc::Sender<SourceBatch>,
+        positions: &HashMap<String, Position>,
+        health: &health::SourceHealth,
+        what: &str,
+    ) -> SourceChanges {
+        let mut out = SourceChanges::default();
+        self.0.retain(|name, (def, tasks)| {
+            let keep = wanted.iter().any(|(w, cfg)| cfg.name == *name && w == def);
+            if !keep {
+                for t in tasks.iter() {
+                    t.abort();
+                }
+                health.stop(name);
+                info!(source = %name, "{what} source stopped");
+                out.stopped.push(name.clone());
+            }
+            keep
+        });
+        for (def, cfg) in wanted {
+            if self.0.contains_key(&cfg.name) {
+                continue;
+            }
+            match spawn_owned_source(&cfg, tx, positions, health) {
+                Ok(tasks) => {
+                    info!(source = %cfg.name, "{what} source started");
+                    out.started.push(cfg.name.clone());
+                    self.0.insert(cfg.name, (def, tasks));
+                }
+                Err(e) => {
+                    error!(source = %cfg.name, error = %format!("{e:#}"), "{what} source failed");
+                    health.errors.set(&cfg.name, format!("{e:#}"));
+                    out.failed.push((cfg.name, format!("{e:#}")));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Sources of the local configuration.
+type LocalSources = RunningSources<SourceConfig>;
+
+impl LocalSources {
+    fn update(
+        &mut self,
+        sources: &[SourceConfig],
+        tx: &mpsc::Sender<SourceBatch>,
+        positions: &HashMap<String, Position>,
+        health: &health::SourceHealth,
+    ) -> SourceChanges {
+        let wanted = sources.iter().map(|s| (s.clone(), s.clone())).collect();
+        self.sync(wanted, tx, positions, health, "local")
+    }
+}
+
+/// Sources of central jails.
+type CentralSources = RunningSources<central::CentralSource>;
 
 impl CentralSources {
-    /// Stops sources that are gone or changed, starts new ones; unchanged
-    /// sources keep running (and their read position).
     fn update(
         &mut self,
         jails: &central::CentralJails,
@@ -690,47 +843,27 @@ impl CentralSources {
         tx: &mpsc::Sender<SourceBatch>,
         positions: &HashMap<String, Position>,
         health: &health::SourceHealth,
-    ) {
-        let mut wanted: HashMap<String, (central::CentralSource, SourceConfig)> = HashMap::new();
+    ) -> SourceChanges {
+        let mut wanted = Vec::new();
         for j in jails.jails.iter().filter(|j| running.contains(&j.name)) {
             if let Ok(cfgs) = j.source_configs() {
                 for (def, cfg) in j.sources.iter().zip(cfgs) {
-                    wanted.insert(cfg.name.clone(), (def.clone(), cfg));
+                    if !wanted
+                        .iter()
+                        .any(|(_, c): &(_, SourceConfig)| c.name == cfg.name)
+                    {
+                        wanted.push((def.clone(), cfg));
+                    }
                 }
             }
         }
-        self.0.retain(|name, (def, tasks)| {
-            let keep = wanted.get(name).is_some_and(|(w, _)| w == def);
-            if !keep {
-                for t in tasks.iter() {
-                    t.abort();
-                }
-                health.stop(name);
-                info!(source = %name, "central source stopped");
-            }
-            keep
-        });
-        for (name, (def, cfg)) in wanted {
-            if self.0.contains_key(&name) {
-                continue;
-            }
-            match spawn_central_source(&cfg, tx, positions, health) {
-                Ok(tasks) => {
-                    info!(source = %name, "central source started");
-                    self.0.insert(name, (def, tasks));
-                }
-                Err(e) => {
-                    error!(source = %name, error = %format!("{e:#}"), "central source failed");
-                    health.errors.set(&name, format!("{e:#}"));
-                }
-            }
-        }
+        self.sync(wanted, tx, positions, health, "central")
     }
 }
 
 /// A source with its own channel: aborting the tasks drops the receiver,
 /// which also stops journald readers (they notice the closed channel).
-fn spawn_central_source(
+fn spawn_owned_source(
     src: &SourceConfig,
     tx: &mpsc::Sender<SourceBatch>,
     positions: &HashMap<String, Position>,
