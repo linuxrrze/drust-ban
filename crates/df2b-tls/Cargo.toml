@@ -20,4 +20,5 @@ tonic.workspace = true
 tower.workspace = true
 time.workspace = true
 tracing.workspace = true
+webpki-roots.workspace = true
 x509-parser.workspace = true

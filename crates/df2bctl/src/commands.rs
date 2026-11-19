@@ -1,0 +1,349 @@
+//! Commands that talk to the controller REST API. `--output json` prints the
+//! API response as is; text output is a compact table.
+
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use ipnet::IpNet;
+use serde_json::{json, Value};
+
+use crate::client::Client;
+
+fn s<'a>(v: &'a Value, path: &[&str]) -> &'a str {
+    let mut cur = v;
+    for p in path {
+        cur = &cur[*p];
+    }
+    cur.as_str().unwrap_or("-")
+}
+
+fn ago(v: &Value) -> String {
+    let Some(t) = v.as_str().and_then(|t| t.parse::<DateTime<Utc>>().ok()) else {
+        return "-".into();
+    };
+    let secs = (Utc::now() - t).num_seconds();
+    if secs < 0 {
+        return format!("in {}", fmt_secs(-secs));
+    }
+    format!("{} ago", fmt_secs(secs))
+}
+
+fn until(v: &Value) -> String {
+    match v.as_str().and_then(|t| t.parse::<DateTime<Utc>>().ok()) {
+        None => "permanent".into(),
+        Some(t) => format!("{} left", fmt_secs((t - Utc::now()).num_seconds().max(0))),
+    }
+}
+
+fn fmt_secs(s: i64) -> String {
+    match s {
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s if s < 172_800 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
+}
+
+/// "global", {"type":"group","value":"web"} → "group:web", ...
+fn scope(v: &Value) -> String {
+    match (v["type"].as_str(), &v["value"]) {
+        (Some("global"), _) => "global".into(),
+        (Some("group"), g) => format!("group:{}", g.as_str().unwrap_or("?")),
+        (Some("agents"), ids) => format!(
+            "agent:{}",
+            ids.as_array()
+                .map(|a| a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","))
+                .unwrap_or_default()
+        ),
+        _ => v.to_string(),
+    }
+}
+
+fn origin(v: &Value) -> String {
+    match (v["type"].as_str(), v["value"].as_str()) {
+        (Some(t), Some(val)) => format!("{t}:{val}"),
+        _ => v.to_string(),
+    }
+}
+
+fn print_decisions(list: &[Value]) {
+    if list.is_empty() {
+        println!("no active bans");
+        return;
+    }
+    println!(
+        "{:>6}  {:<22} {:<10} {:<14} {:<26} {:<12} REASON",
+        "SEQ", "TARGET", "JAIL", "SCOPE", "ORIGIN", "EXPIRES"
+    );
+    for d in list {
+        println!(
+            "{:>6}  {:<22} {:<10} {:<14} {:<26} {:<12} {}",
+            d["seq"].to_string(),
+            s(d, &["target"]),
+            d["jail"].as_str().unwrap_or("-"),
+            scope(&d["scope"]),
+            origin(&d["origin"]),
+            until(&d["expires_at"]),
+            s(d, &["reason"]),
+        );
+    }
+}
+
+fn json_out(v: &Value) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+pub async fn whoami(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/whoami").await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("{} ({})", s(&v, &["name"]), s(&v, &["role"]));
+    Ok(())
+}
+
+pub async fn status(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/status").await?;
+    if json {
+        return json_out(&v);
+    }
+    let a = &v["agents"];
+    println!("controller   {}", s(&v, &["version"]));
+    println!(
+        "agents       {} connected / {} enrolled ({} revoked)",
+        a["connected"], a["total"], a["revoked"]
+    );
+    println!("active bans  {}", v["active_decisions"]);
+    println!("decision log seq {}", v["last_seq"]);
+    println!("propagate    {}", s(&v, &["propagate"]));
+    Ok(())
+}
+
+pub async fn agents_list(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/agents").await?;
+    if json {
+        return json_out(&v);
+    }
+    let list = v["agents"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("no agents enrolled");
+        return Ok(());
+    }
+    println!(
+        "{:<28} {:<10} {:<10} {:<12} {:>5}  {:<10} CERT EXPIRES",
+        "AGENT", "GROUP", "STATE", "LAST SEEN", "BANS", "VERSION"
+    );
+    for a in &list {
+        let state = if a["revoked"].as_bool() == Some(true) {
+            "revoked"
+        } else if a["connected"].as_bool() == Some(true) {
+            "online"
+        } else {
+            "offline"
+        };
+        println!(
+            "{:<28} {:<10} {:<10} {:<12} {:>5}  {:<10} {}",
+            s(a, &["id"]),
+            s(a, &["group"]),
+            state,
+            ago(&a["status"]["last_seen"]),
+            a["status"]["active_bans"].to_string(),
+            a["status"]["agent_version"]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .unwrap_or("-"),
+            ago(&a["cert_not_after"]),
+        );
+    }
+    Ok(())
+}
+
+pub async fn agents_show(c: &Client, id: &str, json: bool) -> anyhow::Result<()> {
+    let v = c.get(&format!("/api/v1/agents/{id}")).await?;
+    if json {
+        return json_out(&v);
+    }
+    let a = &v["agent"];
+    let st = &a["status"];
+    println!("id            {}", s(a, &["id"]));
+    println!("hostname      {}", s(a, &["hostname"]));
+    println!("group         {}", s(a, &["group"]));
+    println!(
+        "enrolled      {} ({})",
+        s(a, &["enrolled_at"]),
+        ago(&a["enrolled_at"])
+    );
+    println!(
+        "cert expires  {} ({})",
+        s(a, &["cert_not_after"]),
+        ago(&a["cert_not_after"])
+    );
+    println!(
+        "state         {}{}",
+        if a["connected"].as_bool() == Some(true) {
+            "online"
+        } else {
+            "offline"
+        },
+        if a["revoked"].as_bool() == Some(true) {
+            ", REVOKED"
+        } else {
+            ""
+        }
+    );
+    println!("last seen     {}", ago(&st["last_seen"]));
+    println!("version       {}", s(st, &["agent_version"]));
+    println!("active bans   {}", st["active_bans"]);
+    println!(
+        "firewall      {} (healthy: {})",
+        s(st, &["firewall_backend"]),
+        st["firewall_healthy"]
+    );
+    println!("clock skew    {} ms", st["clock_skew_ms"]);
+    println!("applied seq   {}", st["last_applied_seq"]);
+    Ok(())
+}
+
+pub async fn agents_revoke(c: &Client, id: &str, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .post(&format!("/api/v1/agents/{id}/revoke"), json!({}))
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("revoked {id}; its connections close within a few seconds");
+    Ok(())
+}
+
+pub async fn enroll_token(
+    c: &Client,
+    group: &str,
+    valid_for: Duration,
+    json: bool,
+) -> anyhow::Result<()> {
+    let ttl = humantime::format_duration(valid_for).to_string();
+    let v = c
+        .post(
+            "/api/v1/enroll-tokens",
+            json!({ "group": group, "ttl": ttl }),
+        )
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("{}", s(&v, &["token"]));
+    eprintln!(
+        "one-time token for group '{group}', expires {}; on the agent host:\n  \
+         df2b-agent --enroll-token <token>   (or DF2B_ENROLL_TOKEN)",
+        s(&v, &["expires_at"])
+    );
+    Ok(())
+}
+
+pub async fn bans_list(
+    c: &Client,
+    target: Option<IpNet>,
+    jail: Option<String>,
+    agent: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let mut q = Vec::new();
+    if let Some(t) = target {
+        q.push(("target", t.to_string()));
+    }
+    if let Some(j) = jail {
+        q.push(("jail", j));
+    }
+    let mut v = c.get_query("/api/v1/decisions", &q).await?;
+    if let Some(a) = agent {
+        // client-side: bans reported by this agent
+        let want = format!("agent:{a}");
+        if let Some(list) = v["decisions"].as_array_mut() {
+            list.retain(|d| origin(&d["origin"]) == want);
+        }
+    }
+    if json {
+        return json_out(&v);
+    }
+    print_decisions(v["decisions"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+    Ok(())
+}
+
+pub struct BanArgs {
+    pub target: IpNet,
+    pub duration: Option<Duration>,
+    pub scope: String,
+    pub jail: Option<String>,
+    pub reason: String,
+}
+
+pub async fn ban(c: &Client, a: BanArgs, json: bool) -> anyhow::Result<()> {
+    let body = json!({
+        "target": a.target.to_string(),
+        "duration": a.duration.map(|d| humantime::format_duration(d).to_string()),
+        "scope": a.scope,
+        "jail": a.jail,
+        "reason": a.reason,
+    });
+    let v = c.post("/api/v1/bans", body).await?;
+    if json {
+        return json_out(&v);
+    }
+    match v["decision"].as_object() {
+        Some(_) => print_decisions(std::slice::from_ref(&v["decision"])),
+        None => println!("{}", s(&v, &["message"])),
+    }
+    Ok(())
+}
+
+pub async fn unban(
+    c: &Client,
+    target: IpNet,
+    reason: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let v = c
+        .post(
+            "/api/v1/unban",
+            json!({ "target": target.to_string(), "reason": reason }),
+        )
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    for d in v["unbans"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "unbanned {} ({}), revokes decision {}",
+            s(&d, &["target"]),
+            scope(&d["scope"]),
+            s(&d, &["kind", "revokes"])
+        );
+    }
+    Ok(())
+}
+
+pub async fn audit(c: &Client, limit: usize, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .get_query("/api/v1/audit", &[("limit", limit.to_string())])
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    for e in v["entries"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "{:>5}  {}  {:<20} {:<20} {:<22} {}",
+            e["seq"].to_string(),
+            s(&e, &["time"]).get(..19).unwrap_or("-"),
+            s(&e, &["actor"]),
+            s(&e, &["action"]),
+            e["remote_addr"].as_str().unwrap_or("-"),
+            e["details"]
+        );
+    }
+    Ok(())
+}

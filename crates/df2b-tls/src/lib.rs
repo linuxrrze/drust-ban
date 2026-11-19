@@ -9,7 +9,7 @@ pub mod transport;
 pub use pki::{AgentKey, Ca, CertInfo};
 pub use rustls::pki_types::CertificateDer;
 pub use rustls::ClientConfig;
-pub use token::EnrollToken;
+pub use token::{ApiToken, EnrollToken};
 
 /// The name in the controller's server certificate that agents verify,
 /// independent of the address they connect to.

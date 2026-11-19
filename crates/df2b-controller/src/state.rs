@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::files;
-use crate::store::{AgentRecord, Store};
+use crate::store::{AgentRecord, AuditEntry, Store};
 
 /// A resuming subscriber further behind than this gets a snapshot instead.
 const MAX_BACKLOG: u64 = 10_000;
@@ -314,6 +314,68 @@ impl Controller {
             .collect();
         v.sort_by(|a, b| a.record.id.cmp(&b.record.id));
         v
+    }
+
+    /// Revokes every active ban whose target overlaps `target` (so unbanning
+    /// an address also removes the /64 ban containing it). Each unban goes to
+    /// the same scope as the ban it revokes. Blocking.
+    pub fn unban(
+        &self,
+        target: IpNet,
+        origin: Origin,
+        reason: &str,
+    ) -> anyhow::Result<Vec<Arc<Decision>>> {
+        let matching: Vec<Decision> = self
+            .active_decisions()
+            .into_iter()
+            .filter(|d| d.target.contains(&target) || target.contains(&d.target))
+            .collect();
+        self.append(
+            matching
+                .into_iter()
+                .map(|d| NewDecision {
+                    kind: DecisionKind::Unban { revokes: d.id },
+                    target: d.target,
+                    scope: d.scope,
+                    jail: d.jail,
+                    expires_at: None,
+                    origin: origin.clone(),
+                    reason: reason.to_owned(),
+                })
+                .collect(),
+        )
+    }
+
+    /// Records an administrative action. Blocking.
+    pub fn audit(
+        &self,
+        actor: &str,
+        remote_addr: Option<String>,
+        action: &str,
+        details: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let e = self.store.audit(AuditEntry {
+            seq: 0,
+            time: Utc::now(),
+            actor: actor.to_owned(),
+            remote_addr,
+            action: action.to_owned(),
+            details,
+        })?;
+        tracing::info!(seq = e.seq, actor, action, details = %e.details, "audit");
+        Ok(())
+    }
+
+    pub fn audit_log(&self, limit: usize, before: u64) -> anyhow::Result<Vec<AuditEntry>> {
+        self.store.audit_log(limit, before)
+    }
+
+    pub fn agent(&self, id: &str) -> Option<AgentView> {
+        self.agents().into_iter().find(|a| a.record.id == id)
+    }
+
+    pub fn last_seq(&self) -> u64 {
+        self.lock().last_seq
     }
 
     pub fn active_decisions(&self) -> Vec<Decision> {

@@ -16,6 +16,19 @@ use serde::{Deserialize, Serialize};
 
 const AGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("agents");
 const DECISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("decisions");
+const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
+
+/// One administrative action (REST API or enrollment).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub seq: u64,
+    pub time: DateTime<Utc>,
+    /// API token name, or `agent:<id>` for enrollments.
+    pub actor: String,
+    pub remote_addr: Option<String>,
+    pub action: String,
+    pub details: serde_json::Value,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
@@ -42,6 +55,7 @@ impl Store {
         let tx = db.begin_write()?;
         tx.open_table(AGENTS)?;
         tx.open_table(DECISIONS)?;
+        tx.open_table(AUDIT)?;
         tx.commit()?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -83,6 +97,30 @@ impl Store {
         let t = tx.open_table(DECISIONS)?;
         let mut out = Vec::new();
         for item in t.range(from.saturating_add(1)..=to)? {
+            let (_, v) = item?;
+            out.push(serde_json::from_slice(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Appends an audit entry; assigns its sequence number.
+    pub fn audit(&self, mut e: AuditEntry) -> anyhow::Result<AuditEntry> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(AUDIT)?;
+            e.seq = t.last()?.map_or(1, |(k, _)| k.value() + 1);
+            t.insert(e.seq, serde_json::to_vec(&e)?.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(e)
+    }
+
+    /// Newest first, at most `limit`, with `seq < before`.
+    pub fn audit_log(&self, limit: usize, before: u64) -> anyhow::Result<Vec<AuditEntry>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(AUDIT)?;
+        let mut out = Vec::new();
+        for item in t.range(..before)?.rev().take(limit) {
             let (_, v) = item?;
             out.push(serde_json::from_slice(v.value())?);
         }

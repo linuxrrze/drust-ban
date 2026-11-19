@@ -243,6 +243,13 @@ pub fn cert_from_pem(pem: &str) -> anyhow::Result<CertificateDer<'static>> {
     CertificateDer::from_pem_slice(pem.as_bytes()).context("parsing certificate PEM")
 }
 
+/// All certificates in a PEM file (a chain, leaf first).
+pub fn certs_from_pem(pem: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parsing certificate PEM")
+}
+
 pub fn key_from_pem(pem: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
     PrivateKeyDer::from_pem_slice(pem.as_bytes()).context("parsing private key PEM")
 }

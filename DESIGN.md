@@ -241,8 +241,9 @@ Rules:
 - Client certificates are optional at the TLS layer (Enroll comes first);
   every other RPC requires one and maps it to an enrolled agent whose record
   lists the certificate serial.
-- **Tokens**: `df2b-controller enroll-token --group web [--ttl 1h]` (until the
-  authenticated REST API for `df2bctl` exists). Only the SHA-256 of the
+- **Tokens**: `df2bctl agents enroll-token --group web` (REST, admin) or,
+  on the controller host, `df2b-controller enroll-token --group web [--ttl 1h]`.
+  Only the SHA-256 of the
   secret is stored (`enroll-tokens/<hash>.json`); redeeming renames the file,
   so a token works once even under concurrent use. The CSR is checked before
   the token is consumed. The agent takes the token from `--enroll-token` or
@@ -271,8 +272,34 @@ Rules:
   a remote ban that disappears is only removed if no local ban or other
   decision still covers the prefix; an unban decision also lifts local bans
   (offense history is kept for escalation).
+- **Revocation** also via `df2bctl agents revoke <id>` (REST, admin).
 - Not yet: reports queued only in memory while disconnected (max 10 000),
   observations without a ban (correlation), per-source stats in heartbeats.
+
+#### Implementation (REST API)
+
+- HTTPS only, TLS 1.3, HTTP/1.1 and HTTP/2 (`--https-listen`, default
+  `[::]:7444`); there is no plaintext listener. The certificate is either
+  issued by the internal CA (name `df2b-controller` plus `--name`s) or an
+  operator-provided chain (`--https-cert`/`--https-key`, e.g. from a public
+  CA; reloading needs a restart for now).
+- **API tokens** `df2bapi1.<secret>` as bearer tokens, created on the
+  controller host with `df2b-controller api-token create --name <n> --role
+  viewer|operator|admin [--ttl 90d]`, listed and revoked (effective
+  immediately) with `api-token list|revoke`. Only the SHA-256 of the secret is
+  stored (`api-tokens/<hash>.json`), so lookup needs no secret comparison.
+  Creation prints a ready `df2bctl.toml` including the CA fingerprint.
+- **Roles**: `viewer` reads; `operator` also bans/unbans; `admin` also
+  revokes agents, creates enrollment tokens and reads the audit log.
+- **Audit log** (redb table `audit`): every change made through the API, plus
+  agent enrollments, with actor (token name or `agent:<id>`), client address
+  and details.
+- `df2bctl` trusts the controller by pinned CA fingerprint (checked against
+  the name `df2b-controller`, so any address works), by a CA file, or by
+  Mozilla's roots. Settings: flags, `DF2B_*` environment, or
+  `~/.config/df2b/df2bctl.toml` (warns if readable by others).
+- Not yet: browser sessions (users with argon2, OIDC) for the web UI,
+  OpenAPI, SSE, request rate limiting, certificate hot reload.
 
 ### 4.5 Abuse safeguards
 
@@ -388,16 +415,24 @@ filters where the regex syntax allows it.
 
 ## 8. CLI: `df2bctl`
 
-Talks to the controller over REST (API token), or to the local agent over a
-Unix socket with `--local` (also works in standalone mode). `--output json` on
-every command.
+Talks to the controller over HTTPS (API token, see §4.4), or to the local
+agent over a Unix socket with `--local` (also works in standalone mode).
+`--output json` on every command.
+
+Implemented: `status`, `whoami`, `agents …`, `bans list`, `ban`, `unban`,
+`audit`, `filter test`. An unban revokes every active ban overlapping the
+target (e.g. the /64 containing an IPv6 address) in the scope it was made;
+`--allow-for`, `ip`, `allowlist`, `jails`, `config` and `--local` are not
+implemented yet.
 
 ```
 df2bctl status
 df2bctl agents list | show <id> | revoke <id> | enroll-token --group web
 df2bctl bans list [--jail sshd] [--agent X] [--target 2001:db8::/48]
 df2bctl ban 203.0.113.7 --for 24h --scope global --reason "manual"
-df2bctl unban 203.0.113.7 [--scope …] [--allow-for 1h]
+df2bctl unban 203.0.113.7 [--reason …] [--allow-for 1h]
+df2bctl audit [--limit 50]
+df2bctl whoami
 df2bctl ip 203.0.113.7            # observations per host, decision history
 df2bctl allowlist add|rm|list
 df2bctl jails list
@@ -415,7 +450,8 @@ df2bctl config check | reload
   OpenAPI spec, embedded into the controller binary with `rust-embed`
   (single-binary deployment).
 - Auth: local users (argon2) and optional OIDC. Roles: `viewer`, `operator`
-  (ban/unban), `admin` (agents, policies, users).
+  (ban/unban), `admin` (agents, policies, users). The same roles already apply
+  to API tokens (§4.4).
 
 Pages:
 
@@ -481,11 +517,12 @@ systemd hardening.
 | Tracker / engine             | implemented + tests; one firewall transaction per batch |
 | nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |
 | Agent state (redb)           | source positions + offender records, flushed every 1 s; bans re-applied on start |
-| `df2bctl filter test`        | implemented; other commands are stubs            |
-| Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local`; read-only REST (`/agents`, `/decisions`) on loopback |
+| `df2bctl`                    | `filter test` + controller commands; `--local`, ip, allowlist, jails, config TODO |
+| Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
+| REST API                     | HTTPS (TLS 1.3), API tokens with roles, agents, enrollment tokens, bans, unban, audit log; browser sessions TODO |
 | gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |
 | Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans applied |
-| Encrypted transport (§4.4)   | agent ↔ controller done; REST API still plain HTTP, loopback only (enforced) |
+| Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI → controller (HTTPS) done; HA, external actions, local socket TODO |
 | Web UI                       | placeholder                                      |
 
 ---

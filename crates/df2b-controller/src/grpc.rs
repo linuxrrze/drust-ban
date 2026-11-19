@@ -112,6 +112,13 @@ impl AgentService for Service {
             })
             .map_err(internal)?;
             info!(agent = %id, group = %token_file.group, ?peer, version = %r.agent_version, "agent enrolled");
+            ctl.audit(
+                &format!("agent:{id}"),
+                peer.map(|p| p.to_string()),
+                "agent.enroll",
+                serde_json::json!({ "group": token_file.group, "hostname": r.hostname }),
+            )
+            .map_err(internal)?;
             Ok::<_, Status>(v1::EnrollResponse {
                 agent_id: id,
                 certificate_der: cert.to_vec(),

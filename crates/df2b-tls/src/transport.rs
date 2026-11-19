@@ -104,16 +104,20 @@ impl ServerCertVerifier for PinnedCaVerifier {
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
+        _server_name: &ServerName<'_>,
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        // The internal CA issues SERVER_NAME only to the controller (agent
+        // certificates are clientAuth-only), so check that name instead of
+        // the address the client happened to use.
+        let server_name = ServerName::try_from(SERVER_NAME).expect("valid server name");
         let ca = intermediates
             .iter()
             .find(|c| pki::fingerprint(c) == self.fingerprint)
             .ok_or_else(|| {
                 rustls::Error::General(format!(
-                    "controller CA does not match the enrollment token (expected SHA-256 {})",
+                    "controller CA does not match the pinned fingerprint (expected SHA-256 {})",
                     hex(&self.fingerprint)
                 ))
             })?;
@@ -122,7 +126,7 @@ impl ServerCertVerifier for PinnedCaVerifier {
         WebPkiServerVerifier::builder_with_provider(Arc::new(roots), self.provider.clone())
             .build()
             .map_err(|e| rustls::Error::General(e.to_string()))?
-            .verify_server_cert(end_entity, &[], server_name, ocsp_response, now)
+            .verify_server_cert(end_entity, &[], &server_name, ocsp_response, now)
     }
 
     fn verify_tls12_signature(
@@ -158,6 +162,62 @@ impl ServerCertVerifier for PinnedCaVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// REST API server: TLS 1.3, no client certificates (bearer tokens).
+pub fn https_server_config(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> anyhow::Result<Arc<ServerConfig>> {
+    let mut cfg = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?;
+    cfg.alpn_protocols = vec![ALPN_H2.to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// How an HTTPS client (`df2bctl`) authenticates the controller.
+#[derive(Debug, Clone)]
+pub enum Trust {
+    /// The controller's internal CA, by SHA-256 fingerprint (the name checked
+    /// is always [`SERVER_NAME`]).
+    PinnedCa([u8; 32]),
+    /// CA certificates from a file, normal hostname verification.
+    CaCerts(Vec<CertificateDer<'static>>),
+    /// Mozilla's root store (operator certificate from a public CA).
+    SystemRoots,
+}
+
+/// TLS 1.3 client config for HTTP/1.1 clients.
+pub fn https_client_config(trust: Trust) -> anyhow::Result<Arc<ClientConfig>> {
+    let p = provider();
+    let builder = ClientConfig::builder_with_provider(p.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])?;
+    let mut cfg = match trust {
+        Trust::PinnedCa(fingerprint) => builder
+            .dangerous() // full WebPKI verification against the pinned CA
+            .with_custom_certificate_verifier(Arc::new(PinnedCaVerifier {
+                fingerprint,
+                provider: p,
+            }))
+            .with_no_client_auth(),
+        Trust::CaCerts(certs) => {
+            let mut roots = RootCertStore::empty();
+            for c in certs {
+                roots.add(c)?;
+            }
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+        Trust::SystemRoots => {
+            let roots = RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+    };
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
 }
 
 /// Opens a gRPC channel to the controller at `addr` (`host:port`) over TLS

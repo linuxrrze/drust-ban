@@ -4,13 +4,14 @@
 //! <state_dir>/ca.pem, ca.key        internal CA (key 0600)
 //! <state_dir>/enroll-tokens/<sha256(secret)>.json   pending one-time tokens
 //! <state_dir>/revoked/<agent-id>    revoked agents
+//! <state_dir>/api-tokens/<sha256(secret)>.json      REST API tokens
 //! <state_dir>/controller.redb       agents + decision log (see store.rs)
 //! ```
 //!
-//! Token creation and revocation work by writing files, so they also work
-//! while the controller runs (redb allows a single process) and require
-//! write access to the state directory, i.e. the administrator.
-//! TODO: expose both through the authenticated REST API for `df2bctl`.
+//! Tokens and revocations are files, so the controller's subcommands work
+//! while it runs (redb allows a single process); they require write access
+//! to the state directory, i.e. the administrator. The REST API uses the same
+//! functions. Only hashes of token secrets are stored.
 
 use std::fs;
 use std::io::{self, Write};
@@ -20,13 +21,15 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
-use df2b_tls::{Ca, EnrollToken};
+use clap::ValueEnum;
+use df2b_tls::{ApiToken, Ca, EnrollToken};
 use serde::{Deserialize, Serialize};
 
 const CA_CERT: &str = "ca.pem";
 const CA_KEY: &str = "ca.key";
 const TOKENS: &str = "enroll-tokens";
 const REVOKED: &str = "revoked";
+const API_TOKENS: &str = "api-tokens";
 
 /// Writes `data` atomically (temp file + rename) with `mode`.
 pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
@@ -147,6 +150,113 @@ pub fn prune_tokens(dir: &Path) {
     }
 }
 
+/// REST API roles (DESIGN.md §9), ordered by privilege.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Read everything except the audit log.
+    Viewer,
+    /// Viewer + ban / unban.
+    Operator,
+    /// Everything: agents, enrollment tokens, audit log.
+    Admin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiTokenFile {
+    pub name: String,
+    pub role: Role,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c))
+}
+
+pub fn list_api_tokens(dir: &Path) -> anyhow::Result<Vec<ApiTokenFile>> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(dir.join(API_TOKENS)) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for e in entries.flatten() {
+        if e.path().extension().is_some_and(|x| x == "json") {
+            if let Ok(t) = serde_json::from_slice::<ApiTokenFile>(&fs::read(e.path())?) {
+                out.push(t);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+pub fn create_api_token(
+    dir: &Path,
+    name: &str,
+    role: Role,
+    ttl: Option<Duration>,
+) -> anyhow::Result<ApiToken> {
+    if !valid_name(name) {
+        bail!("invalid token name {name:?} (allowed: letters, digits, - _ . @)");
+    }
+    if list_api_tokens(dir)?.iter().any(|t| t.name == name) {
+        bail!("an API token named {name:?} exists already (revoke it first)");
+    }
+    let token = ApiToken::generate();
+    let now = Utc::now();
+    let file = ApiTokenFile {
+        name: name.to_owned(),
+        role,
+        created_at: now,
+        expires_at: ttl
+            .map(chrono::Duration::from_std)
+            .transpose()?
+            .map(|d| now + d),
+    };
+    let tdir = dir.join(API_TOKENS);
+    fs::create_dir_all(&tdir)?;
+    write_atomic(
+        &tdir.join(format!("{}.json", token.secret_hash())),
+        &serde_json::to_vec_pretty(&file)?,
+        0o644, // only a hash; readable by the controller when created by root
+    )?;
+    Ok(token)
+}
+
+/// Deletes the token named `name`; false if there is none.
+pub fn revoke_api_token(dir: &Path, name: &str) -> anyhow::Result<bool> {
+    let Ok(entries) = fs::read_dir(dir.join(API_TOKENS)) else {
+        return Ok(false);
+    };
+    let mut found = false;
+    for e in entries.flatten() {
+        let matches = fs::read(e.path())
+            .ok()
+            .and_then(|d| serde_json::from_slice::<ApiTokenFile>(&d).ok())
+            .is_some_and(|t| t.name == name);
+        if matches {
+            fs::remove_file(e.path())?;
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+/// The token's record if it exists and has not expired.
+pub fn lookup_api_token(dir: &Path, token: &ApiToken) -> Option<ApiTokenFile> {
+    let path = dir
+        .join(API_TOKENS)
+        .join(format!("{}.json", token.secret_hash()));
+    let t: ApiTokenFile = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    t.expires_at.map_or(true, |e| e > Utc::now()).then_some(t)
+}
+
 fn valid_agent_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -216,6 +326,27 @@ mod tests {
         let t = create_token(&dir, "web", Duration::from_secs(0)).unwrap();
         assert!(redeem_token(&dir, &t).unwrap().is_none(), "expired");
         assert!(create_token(&dir, "../x", Duration::from_secs(1)).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_tokens() {
+        let dir = tmp("api");
+        let t = create_api_token(&dir, "alice", Role::Operator, None).unwrap();
+        assert!(
+            create_api_token(&dir, "alice", Role::Admin, None).is_err(),
+            "duplicate"
+        );
+        assert!(create_api_token(&dir, "a/b", Role::Admin, None).is_err());
+        assert_eq!(lookup_api_token(&dir, &t).unwrap().role, Role::Operator);
+        assert!(lookup_api_token(&dir, &ApiToken::generate()).is_none());
+        let old = create_api_token(&dir, "old", Role::Admin, Some(Duration::ZERO)).unwrap();
+        assert!(lookup_api_token(&dir, &old).is_none(), "expired");
+        assert_eq!(list_api_tokens(&dir).unwrap().len(), 2);
+        assert!(revoke_api_token(&dir, "alice").unwrap());
+        assert!(!revoke_api_token(&dir, "alice").unwrap());
+        assert!(lookup_api_token(&dir, &t).is_none());
+        assert!(Role::Admin > Role::Operator && Role::Operator > Role::Viewer);
         let _ = fs::remove_dir_all(&dir);
     }
 

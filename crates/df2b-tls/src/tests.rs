@@ -106,7 +106,10 @@ async fn enrollment_pins_the_ca() {
     let err = handshake(controller(&ca), pinned_to_other)
         .await
         .unwrap_err();
-    assert!(err.contains("does not match the enrollment token"), "{err}");
+    assert!(
+        err.contains("does not match the pinned fingerprint"),
+        "{err}"
+    );
 
     // an attacker that presents the real CA cert but signs with its own key
     let (mut chain, key) = other.issue_server(&[]).unwrap();

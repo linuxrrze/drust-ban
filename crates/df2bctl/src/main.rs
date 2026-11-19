@@ -1,11 +1,14 @@
 //! dist-f2b command line tool.
 //!
-//! Implemented: `filter test`. Everything else is a stub until the
-//! controller REST API (milestone 2) and the agent control socket exist.
+//! Implemented: `filter test` (offline) and the controller commands
+//! (status, whoami, agents, bans, ban, unban, audit) over the HTTPS REST API.
+//! TODO: `--local` (agent control socket), ip, allowlist, jails, config.
 
 // Stub commands carry arguments that are only read once implemented.
 #![allow(dead_code)]
 
+mod client;
+mod commands;
 mod filter_test;
 
 use std::path::PathBuf;
@@ -18,14 +21,25 @@ use ipnet::IpNet;
 #[derive(Debug, Parser)]
 #[command(version, about = "Manage dist-f2b agents, bans and policies")]
 struct Cli {
-    /// Controller base URL.
-    #[arg(
-        long,
-        global = true,
-        env = "DF2B_CONTROLLER",
-        default_value = "http://127.0.0.1:7080"
-    )]
-    controller: String,
+    /// Controller REST API, e.g. https://ctl.example.org:7444.
+    #[arg(long, global = true, env = "DF2B_CONTROLLER")]
+    controller: Option<String>,
+
+    /// API token (df2bapi1.…).
+    #[arg(long, global = true, env = "DF2B_API_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+
+    /// Pin the controller's internal CA by SHA-256 fingerprint.
+    #[arg(long, global = true, env = "DF2B_CA_FINGERPRINT")]
+    ca_fingerprint: Option<String>,
+
+    /// Trust these CA certificates (PEM) instead of the public roots.
+    #[arg(long, global = true, env = "DF2B_CA_FILE")]
+    ca_file: Option<PathBuf>,
+
+    /// Configuration file (default ~/.config/df2b/df2bctl.toml).
+    #[arg(long, global = true, env = "DF2B_CTL_CONFIG")]
+    config: Option<PathBuf>,
 
     /// Talk to the local agent's control socket instead of the controller.
     #[arg(long, global = true)]
@@ -48,6 +62,13 @@ enum Output {
 enum Command {
     /// Overall status (controller, agents, ban counts).
     Status,
+    /// Show the API token's name and role.
+    Whoami,
+    /// Show the audit log (admin).
+    Audit {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Manage agents.
     #[command(subcommand)]
     Agents(AgentsCmd),
@@ -64,18 +85,18 @@ enum Command {
         /// "global", "group:<name>" or "agent:<id>[,<id>...]".
         #[arg(long, default_value = "global")]
         scope: String,
+        #[arg(long)]
+        jail: Option<String>,
         #[arg(long, default_value = "manual")]
         reason: String,
     },
-    /// Remove a ban.
+    /// Remove every active ban overlapping an address or prefix (e.g. the
+    /// /64 ban containing an IPv6 address), in the scope it was made.
     Unban {
         #[arg(value_parser = parse_target)]
         target: IpNet,
-        #[arg(long, default_value = "global")]
-        scope: String,
-        /// Also allow the target for this long to prevent immediate re-banning.
-        #[arg(long, value_parser = humantime::parse_duration)]
-        allow_for: Option<Duration>,
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Show observations and decision history for an address.
     Ip {
@@ -173,28 +194,77 @@ fn parse_target(s: &str) -> Result<IpNet, String> {
     df2b_core::parse_target(s)
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let json = matches!(cli.output, Output::Json);
+    if let Command::Filter(FilterCmd::Test {
+        filter,
+        log,
+        show_matches,
+        show_missed,
+    }) = &cli.command
+    {
+        return filter_test::run(filter, log, *show_matches, *show_missed, json);
+    }
+    if cli.local {
+        bail!("--local (agent control socket) is not implemented yet");
+    }
+    let client = || {
+        client::Client::new(client::Overrides {
+            controller: cli.controller.clone(),
+            token: cli.token.clone(),
+            ca_fingerprint: cli.ca_fingerprint.clone(),
+            ca_file: cli.ca_file.clone(),
+            config: cli.config.clone(),
+        })
+    };
     match cli.command {
-        Command::Filter(FilterCmd::Test {
-            filter,
-            log,
-            show_matches,
-            show_missed,
-        }) => filter_test::run(
-            &filter,
-            &log,
-            show_matches,
-            show_missed,
-            matches!(cli.output, Output::Json),
-        ),
-        other => {
-            let via = if cli.local {
-                "local agent socket".to_string()
-            } else {
-                cli.controller
-            };
-            bail!("not implemented yet ({via}): {other:?}")
+        Command::Status => commands::status(&client()?, json).await,
+        Command::Whoami => commands::whoami(&client()?, json).await,
+        Command::Audit { limit } => commands::audit(&client()?, limit, json).await,
+        Command::Agents(cmd) => {
+            let c = client()?;
+            match cmd {
+                AgentsCmd::List => commands::agents_list(&c, json).await,
+                AgentsCmd::Show { id } => commands::agents_show(&c, &id, json).await,
+                AgentsCmd::Revoke { id } => commands::agents_revoke(&c, &id, json).await,
+                AgentsCmd::EnrollToken { group, valid_for } => {
+                    commands::enroll_token(&c, &group, valid_for, json).await
+                }
+            }
         }
+        Command::Bans(BansCmd::List {
+            jail,
+            agent,
+            target,
+        }) => commands::bans_list(&client()?, target, jail, agent, json).await,
+        Command::Ban {
+            target,
+            duration,
+            scope,
+            jail,
+            reason,
+        } => {
+            let args = commands::BanArgs {
+                target,
+                duration,
+                scope,
+                jail,
+                reason,
+            };
+            commands::ban(&client()?, args, json).await
+        }
+        Command::Unban { target, reason } => {
+            commands::unban(&client()?, target, reason, json).await
+        }
+        other => bail!("not implemented yet: {other:?}"),
     }
 }

@@ -45,12 +45,30 @@ cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl enroll-token --group w
 # it once with the token; afterwards the certificate in <state_dir>/tls is used.
 cargo run -p df2b-agent -- --config agent.toml --enroll-token df2b1.…
 
-# Overview (read-only, loopback)
-curl http://127.0.0.1:7080/api/v1/agents
-curl http://127.0.0.1:7080/api/v1/decisions
-
 # Revoke an agent
 cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl revoke <agent-id>
+```
+
+### df2bctl (REST API over HTTPS, port 7444)
+
+```sh
+# On the controller host: create an API token (roles: viewer, operator, admin).
+# It prints the token and a ready df2bctl.toml with the CA fingerprint.
+cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl \
+    api-token create --name alice --role admin --url https://127.0.0.1:7444
+#   → put the printed snippet into ~/.config/df2b/df2bctl.toml (chmod 600)
+
+cargo run -p df2bctl -- status
+cargo run -p df2bctl -- agents list
+cargo run -p df2bctl -- agents enroll-token --group web
+cargo run -p df2bctl -- ban 203.0.113.7 --for 24h --reason scanner
+cargo run -p df2bctl -- bans list
+cargo run -p df2bctl -- unban 203.0.113.7
+cargo run -p df2bctl -- audit
+
+# Plain HTTPS works too (internal CA: verify the name df2b-controller)
+curl --cacert /tmp/df2b-ctl/ca.pem --resolve df2b-controller:7444:127.0.0.1 \
+    -H "Authorization: Bearer df2bapi1.…" https://df2b-controller:7444/api/v1/status
 ```
 
 With systemd, put `DF2B_ENROLL_TOKEN=df2b1.…` into `/etc/df2b/agent.env` for

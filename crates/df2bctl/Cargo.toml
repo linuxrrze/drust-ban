@@ -6,7 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+df2b-tls.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 df2b-core.workspace = true
 df2b-matcher.workspace = true

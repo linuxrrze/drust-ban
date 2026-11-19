@@ -83,9 +83,67 @@ impl FromStr for EnrollToken {
     }
 }
 
+/// REST API bearer token: `df2bapi1.<secret>` (base64url). The controller
+/// stores only the SHA-256 of the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiToken {
+    pub secret: [u8; 32],
+}
+
+const API_PREFIX: &str = "df2bapi1";
+
+impl ApiToken {
+    pub fn generate() -> Self {
+        Self {
+            secret: random_bytes(),
+        }
+    }
+
+    pub fn secret_hash(&self) -> String {
+        secret_hash(&self.secret)
+    }
+}
+
+impl fmt::Display for ApiToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{API_PREFIX}.{}", B64.encode(self.secret))
+    }
+}
+
+impl fmt::Debug for ApiToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ApiToken(..)")
+    }
+}
+
+impl FromStr for ApiToken {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        let secret = s
+            .trim()
+            .strip_prefix(API_PREFIX)
+            .and_then(|r| r.strip_prefix('.'))
+            .and_then(|r| B64.decode(r).ok())
+            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+            .context("malformed API token (expected df2bapi1.<secret>)")?;
+        Ok(Self { secret })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_token_roundtrip() {
+        let t = ApiToken::generate();
+        assert_eq!(t.to_string().parse::<ApiToken>().unwrap(), t);
+        assert_eq!(format!("{t:?}"), "ApiToken(..)");
+        for bad in ["", "df2bapi1.", "df2bapi1.abc", "df2b1.x.y"] {
+            assert!(bad.parse::<ApiToken>().is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn roundtrip_and_rejects_garbage() {
