@@ -175,6 +175,8 @@ pub struct Engine {
     /// Keep the latest matching line per observation.
     samples: bool,
     /// `[[redact]]` rules for those lines.
+    local_redactor: df2b_core::Redactor,
+    /// Those, then the controller's.
     redactor: df2b_core::Redactor,
     /// From the agent's configuration.
     allowlist: Allowlist,
@@ -209,14 +211,16 @@ impl Engine {
                 Ok(Jail::new(j, filter))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let local_redactor =
+            df2b_core::Redactor::new(&cfg.redact).map_err(|e| anyhow::anyhow!("redact: {e}"))?;
         Ok(Self {
             jails,
             filter_dir: cfg.agent.filter_dir.clone(),
             central_errors: Vec::new(),
             observations: None,
             samples: false,
-            redactor: df2b_core::Redactor::new(&cfg.redact)
-                .map_err(|e| anyhow::anyhow!("redact: {e}"))?,
+            redactor: local_redactor.clone(),
+            local_redactor,
             allowlist: Allowlist::new(cfg.agent.allowlist.iter().copied()),
             central: Allowlist::default(),
             prefix: PrefixPolicy {
@@ -387,6 +391,11 @@ impl Engine {
             j.max_bantime = p.max_bantime;
             j.overridden = changed;
         }
+    }
+
+    /// The controller's redaction rules (applied after the local ones).
+    pub fn set_central_redaction(&mut self, central: &df2b_core::Redactor) {
+        self.redactor = self.local_redactor.then(central);
     }
 
     /// A log line as sent to the controller: redacted, cleaned, cut.
@@ -994,13 +1003,15 @@ mod tests {
         assert_eq!(e.take_observations()[0].2.sample, None);
 
         // [[redact]] rules apply before a line leaves the host
-        e.redactor = df2b_core::Redactor::new(&[df2b_core::RedactRule {
+        let rule = |pattern: &str, replace: &str| df2b_core::RedactRule {
             name: String::new(),
-            pattern: r"for (\S+) from".into(),
-            replace: "for [user] from".into(),
+            pattern: pattern.into(),
+            replace: replace.into(),
             enabled: true,
-        }])
-        .unwrap();
+        };
+        e.local_redactor =
+            df2b_core::Redactor::new(&[rule(r"for (\S+) from", "for [user] from")]).unwrap();
+        e.set_central_redaction(&df2b_core::Redactor::default());
         e.collect_observations(true);
         e.process(&line("auth", "198.51.100.4"), now); // not banned yet
         let s = e.take_observations()[0].2.sample.clone().unwrap();
@@ -1008,6 +1019,21 @@ mod tests {
         assert!(e
             .sample("Failed password for root from x")
             .contains("[user]"));
+        // the controller's rules apply after the local ones, and replace
+        // the controller's earlier ones
+        let central =
+            df2b_core::Redactor::new(&[rule(r"\[user\]", "[u]"), rule("port \\d+", "port [n]")])
+                .unwrap();
+        e.set_central_redaction(&central);
+        assert_eq!(
+            e.sample("for root from x port 22"),
+            "for [u] from x port [n]"
+        );
+        e.set_central_redaction(&df2b_core::Redactor::default());
+        assert_eq!(
+            e.sample("for root from x port 22"),
+            "for [user] from x port 22"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@
 
   let agents = $state<Agent[]>([]);
   let allowVersion = $state('');
+  let redactVersion = $state('');
   let loaded = $state(false);
   let error = $state('');
   let filter = $state('');
@@ -24,6 +25,7 @@
       const [a, s] = await Promise.all([get<{ agents: Agent[] }>('/agents'), get<Status>('/status')]);
       agents = a.agents;
       allowVersion = s.allowlist_version;
+      redactVersion = s.redaction_version;
       error = '';
       now = Date.now();
     } catch (e) {
@@ -189,6 +191,14 @@
           {#if !current.status.last_seen}–
           {:else if current.status.allowlist_version === allowVersion}<span class="pill good">current</span>
           {:else if !current.status.allowlist_version}<span class="pill plain" title="This agent version does not report it">unknown</span>
+          {:else}<span class="pill warn">outdated</span>{/if}
+        </dd>
+        <dt>Redaction rules</dt>
+        <dd>
+          {#if !current.status.last_seen}–
+          {:else if current.status.redaction_version === 'off'}<span class="pill plain" title="central_redaction = false in agent.toml: only the controller redacts this agent's lines">not accepted</span>
+          {:else if current.status.redaction_version === redactVersion}<span class="pill good">current</span>
+          {:else if !current.status.redaction_version}<span class="pill plain" title="This agent version does not report it">unknown</span>
           {:else}<span class="pill warn">outdated</span>{/if}
         </dd>
         <dt>Certificate</dt><dd>valid until {dateTime(current.cert_not_after)}<br /><span class="faint small">renewed automatically</span></dd>

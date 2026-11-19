@@ -77,6 +77,9 @@ pub struct AgentStatus {
     pub jail_policies_version: String,
     /// Central jail definitions version the agent applies.
     pub central_jails_version: String,
+    /// Central redaction rules version the agent applies ("off": it does
+    /// not accept them, "" = unknown).
+    pub redaction_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +189,8 @@ pub struct Controller {
     rules: Mutex<Arc<Vec<crate::correlation::Rule>>>,
     /// Redaction rules for sample log lines, and the compiled enabled ones.
     redaction: Mutex<(Arc<Vec<RedactRule>>, Arc<Redactor>)>,
+    /// The enabled ones as sent to agents; changes wake up streams.
+    redaction_tx: tokio::sync::watch::Sender<Arc<RedactionSnapshot>>,
     pub correlator: Mutex<crate::correlation::Correlator>,
     /// ASN/country databases (optional; display only)
     pub geo: crate::geo::Geo,
@@ -238,6 +243,28 @@ pub enum AllowAdded {
     Added,
     /// A temporary entry for the same network now lasts longer.
     Extended,
+}
+
+/// The enabled redaction rules as sent to agents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionSnapshot {
+    pub version: String,
+    pub rules: Vec<RedactRule>,
+}
+
+impl RedactionSnapshot {
+    pub fn new(rules: &[RedactRule]) -> Self {
+        let rules: Vec<RedactRule> = rules.iter().filter(|r| r.enabled).cloned().collect();
+        let text: Vec<String> = rules
+            .iter()
+            .map(|r| format!("{}\0{}\0{}", r.name, r.pattern, r.replace))
+            .collect();
+        let hash = df2b_tls::sha256(text.join("\n").as_bytes());
+        Self {
+            version: df2b_tls::hex(&hash[..8]),
+            rules,
+        }
+    }
 }
 
 impl AllowSnapshot {
@@ -353,6 +380,8 @@ impl Controller {
         let redactor = Redactor::new(&redaction_rules).unwrap_or_default();
         // rows written before a rule was added are redacted now
         correlator.redact_samples(&redactor);
+        let redaction_tx =
+            tokio::sync::watch::channel(Arc::new(RedactionSnapshot::new(&redaction_rules))).0;
         let redaction = Mutex::new((Arc::new(redaction_rules), Arc::new(redactor)));
         let rules = Mutex::new(Arc::new(rules));
         // a stored change wins over the default; an explicit flag is
@@ -392,6 +421,7 @@ impl Controller {
             correlator: Mutex::new(correlator),
             geo: Default::default(),
             redaction,
+            redaction_tx,
         })
     }
 
@@ -875,6 +905,15 @@ impl Controller {
             .clone()
     }
 
+    /// The enabled redaction rules for agents, and a receiver for changes.
+    pub fn redaction_watch(&self) -> tokio::sync::watch::Receiver<Arc<RedactionSnapshot>> {
+        self.redaction_tx.subscribe()
+    }
+
+    pub fn redaction_version(&self) -> String {
+        self.redaction_tx.borrow().version.clone()
+    }
+
     /// Changes the redaction rules with `edit` (one writer at a time) and
     /// redacts the sample lines kept so far, in memory and in the database,
     /// so no line that a rule now hides stays anywhere. `edit` returns its
@@ -898,7 +937,16 @@ impl Controller {
         changed += self
             .store
             .map_observation_samples(|l| df2b_core::sample_line(&redactor.apply(l)))?;
+        let snap = RedactionSnapshot::new(&rules);
         *cur = (Arc::new(rules), Arc::new(redactor));
+        // agents only hear of changes to the enabled rules
+        self.redaction_tx.send_if_modified(|v| {
+            let modified = **v != snap;
+            if modified {
+                *v = Arc::new(snap);
+            }
+            modified
+        });
         Ok(Some((out, changed)))
     }
 

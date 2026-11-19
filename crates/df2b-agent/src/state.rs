@@ -32,6 +32,14 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const CENTRAL_ALLOWLIST: &str = "central_allowlist";
 const JAIL_POLICIES: &str = "jail_policies";
 const CENTRAL_JAILS: &str = "central_jails";
+const CENTRAL_REDACTION: &str = "central_redaction";
+
+/// The controller's redaction rules as last applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CentralRedaction {
+    pub version: String,
+    pub rules: Vec<df2b_core::RedactRule>,
+}
 
 /// The controller's jail settings as last applied.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -125,6 +133,7 @@ pub struct Loaded {
     pub central_allowlist: Option<CentralAllowlist>,
     pub jail_policies: Option<JailPolicies>,
     pub central_jails: Option<crate::central::CentralJails>,
+    pub central_redaction: Option<CentralRedaction>,
 }
 
 #[derive(Clone)]
@@ -191,6 +200,12 @@ impl State {
                 Err(e) => tracing::warn!(error = %e, "ignoring unreadable saved jail policies"),
             }
         }
+        if let Some(v) = tx.open_table(META)?.get(CENTRAL_REDACTION)? {
+            match serde_json::from_slice(v.value()) {
+                Ok(r) => loaded.central_redaction = Some(r),
+                Err(e) => tracing::warn!(error = %e, "ignoring unreadable saved redaction rules"),
+            }
+        }
         if let Some(v) = tx.open_table(META)?.get(CENTRAL_ALLOWLIST)? {
             match serde_json::from_slice(v.value()) {
                 Ok(a) => loaded.central_allowlist = Some(a),
@@ -214,6 +229,16 @@ impl State {
         let tx = self.db.begin_write()?;
         tx.open_table(META)?
             .insert(JAIL_POLICIES, serde_json::to_vec(p)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Saves the controller's redaction rules (only when they change).
+    /// Blocking.
+    pub fn save_central_redaction(&self, r: &CentralRedaction) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?
+            .insert(CENTRAL_REDACTION, serde_json::to_vec(r)?.as_slice())?;
         tx.commit()?;
         Ok(())
     }
@@ -357,6 +382,28 @@ mod tests {
         }
         let st = State::open(&dir).unwrap();
         assert_eq!(st.load().unwrap().central_allowlist, Some(a));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn central_redaction_persists() {
+        let dir = tmp("redaction");
+        let r = CentralRedaction {
+            version: "0123".into(),
+            rules: vec![df2b_core::RedactRule {
+                name: "user".into(),
+                pattern: r"user \S+".into(),
+                replace: "user [u]".into(),
+                enabled: true,
+            }],
+        };
+        {
+            let st = State::open(&dir).unwrap();
+            assert!(st.load().unwrap().central_redaction.is_none());
+            st.save_central_redaction(&r).unwrap();
+        }
+        let st = State::open(&dir).unwrap();
+        assert_eq!(st.load().unwrap().central_redaction, Some(r));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

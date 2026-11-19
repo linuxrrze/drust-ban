@@ -729,7 +729,7 @@ df2bctl config check | reload
     `[redacted]`), applied in order. The `regex` crate matches in linear
     time and the compiled size is limited (1 MiB), so a pattern cannot
     stall anything; patterns up to 500 characters, at most 50 rules,
-    none that matches the empty string. Two places:
+    none that matches the empty string. Two sources of rules:
     - **Agent**: `[[redact]] pattern/replace` in agent.toml, applied
       before a line leaves the host (checked at start; unknown keys are
       errors).
@@ -750,6 +750,21 @@ df2bctl config check | reload
       with a warning. (redb is copy-on-write: replaced pages are freed,
       not wiped, so old bytes can stay in the file until the space is
       reused; text that must never be stored belongs in agent.toml.)
+    - **Distribution**: the enabled controller rules also go to every
+      agent (`DecisionEvent.redaction`, after the central jails on
+      subscribe and on every change; version = content hash of name,
+      pattern, replacement in order, so adding a disabled rule sends
+      nothing). Agents apply them after their own `[[redact]]` rules, so
+      what they hide never leaves the host either; they keep the last
+      rules in agent.redb (`central_redaction`) so lines sent after a
+      restart, before the stream delivers the rules, are redacted too, and
+      report the version in heartbeats (`redaction_version`). A rule an
+      agent cannot compile is skipped there with a warning (the controller
+      still applies it). `central_redaction = false` in agent.toml refuses
+      them (reported as `off`). The Policies card shows how many connected
+      agents apply the current rules, the agent page each agent's state.
+      The controller keeps redacting on arrival: for agents that refuse
+      the rules, older agents, and lines sent before a change arrived.
   - The controller rate-limits each agent (20 000 observations per minute;
     `retry_after_ms` tells it to slow down), ignores malformed, too broad
     and allowlisted keys, and places each observation by the agent's
@@ -814,8 +829,7 @@ df2bctl config check | reload
     NETWORK column in `bans list`, files in `status`.
   - Tests build small MaxMind DB files (a minimal writer in
     `geo::testdb`) and read them with the real reader.
-- Not yet: ASN-based rules or allowlist entries; controller redaction
-  rules distributed to agents (today: agent.toml).
+- Not yet: ASN-based rules or allowlist entries.
 
 Pages:
 

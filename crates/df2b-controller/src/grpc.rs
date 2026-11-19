@@ -78,6 +78,21 @@ fn event(e: Event) -> v1::DecisionEvent {
     v1::DecisionEvent { event: Some(e) }
 }
 
+fn redaction_event(snap: &crate::state::RedactionSnapshot) -> v1::DecisionEvent {
+    event(Event::Redaction(v1::RedactionRules {
+        version: snap.version.clone(),
+        rules: snap
+            .rules
+            .iter()
+            .map(|r| v1::RedactionRule {
+                name: r.name.clone(),
+                pattern: r.pattern.clone(),
+                replace: r.replace.clone(),
+            })
+            .collect(),
+    }))
+}
+
 impl Service {
     /// Feeds observations into the correlator and returns the rules that
     /// fired, and how many observations were over the agent's rate.
@@ -253,6 +268,7 @@ impl AgentService for Service {
             s.allowlist_version = h.allowlist_version;
             s.jail_policies_version = h.jail_policies_version;
             s.central_jails_version = h.central_jails_version;
+            s.redaction_version = h.redaction_version.chars().take(64).collect();
             let secs = |ms: i64| u64::try_from(ms / 1000).unwrap_or(0);
             s.jails = h
                 .jails
@@ -436,6 +452,7 @@ impl AgentService for Service {
         let mut allow = ctl.allowlist_watch();
         let mut jails = ctl.jail_watch();
         let mut central = ctl.central_watch();
+        let mut redaction = ctl.redaction_watch();
         tokio::spawn(async move {
             let id = record.id.clone();
             ctl.update_status(&id, |s| s.streams += 1);
@@ -500,9 +517,24 @@ impl AgentService for Service {
                 }
                 v
             };
+            // then the redaction rules for sample lines (the same for all)
+            let first = redaction_event(&redaction.borrow_and_update());
+            if tx.send(Ok(first)).await.is_err() {
+                ctl.update_status(&id, |s| s.streams = s.streams.saturating_sub(1));
+                return;
+            }
             let mut check = tokio::time::interval(REVOCATION_CHECK);
             loop {
                 tokio::select! {
+                    changed = redaction.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let ev = redaction_event(&redaction.borrow_and_update());
+                        if tx.send(Ok(ev)).await.is_err() {
+                            break;
+                        }
+                    }
                     changed = central.changed() => {
                         if changed.is_err() {
                             break;
@@ -705,6 +737,7 @@ mod tests {
             next(&mut stream).await,
             Some(Event::CentralJails(_))
         ));
+        assert!(matches!(next(&mut stream).await, Some(Event::Redaction(_))));
 
         // a change reaches open streams at once, as the complete list
         let entry = |net: &str| crate::store::AllowEntry {
@@ -760,6 +793,80 @@ mod tests {
             ctl.agent(&id).unwrap().status.allowlist_version,
             first.version
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn redaction_rules_are_distributed() {
+        let dir = std::env::temp_dir().join(format!("df2b-ctl-grpc-redact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (addr, ctl) = start(&dir).await;
+        let mut a = enrolled(&addr, &ctl, &dir, "host-r").await;
+        let mut stream = a
+            .subscribe(v1::SubscribeRequest { from_seq: 0 })
+            .await
+            .unwrap()
+            .into_inner();
+        for _ in 0..4 {
+            next(&mut stream).await; // snapshot, allowlist, policies, central jails
+        }
+        let Some(Event::Redaction(empty)) = next(&mut stream).await else {
+            panic!("redaction rules expected")
+        };
+        assert!(empty.rules.is_empty());
+
+        let rule = |name: &str, pattern: &str, enabled: bool| df2b_core::RedactRule {
+            name: name.into(),
+            pattern: pattern.into(),
+            replace: "[x]".into(),
+            enabled,
+        };
+        // a change reaches open streams at once, as the complete list
+        ctl.set_redaction_rule(rule("user", r"user \S+", true))
+            .unwrap();
+        let Some(Event::Redaction(one)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        assert_eq!(one.rules.len(), 1);
+        assert_eq!(
+            (
+                one.rules[0].name.as_str(),
+                one.rules[0].pattern.as_str(),
+                one.rules[0].replace.as_str()
+            ),
+            ("user", r"user \S+", "[x]")
+        );
+        assert_eq!(one.version, ctl.redaction_version());
+        assert_ne!(one.version, empty.version);
+        // disabled rules are not sent, and adding one changes nothing for
+        // agents; enabling it does (in order)
+        ctl.set_redaction_rule(rule("mail", r"\S+@\S+", false))
+            .unwrap();
+        assert_eq!(ctl.redaction_version(), one.version);
+        ctl.set_redaction_rule(rule("mail", r"\S+@\S+", true))
+            .unwrap();
+        let Some(Event::Redaction(two)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        let names: Vec<_> = two.rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["user", "mail"]);
+        ctl.remove_redaction_rule("mail").unwrap();
+        let Some(Event::Redaction(back)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        assert_eq!(back.version, one.version, "the version is a content hash");
+
+        // the agent reports what it applies ("off": it does not accept them)
+        let id = ctl.agents()[0].record.id.clone();
+        for v in [one.version.as_str(), "off"] {
+            a.heartbeat(v1::HeartbeatRequest {
+                redaction_version: v.into(),
+                ..heartbeat()
+            })
+            .await
+            .unwrap();
+            assert_eq!(ctl.agent(&id).unwrap().status.redaction_version, v);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -831,6 +938,12 @@ mod tests {
             panic!("expected the central jails after the jail policies")
         };
         assert!(cj.jails.is_empty());
+        // and the redaction rules (none yet)
+        let Some(Event::Redaction(r)) = stream.message().await.unwrap().unwrap().event else {
+            panic!("expected the redaction rules after the central jails")
+        };
+        assert!(r.rules.is_empty());
+        assert_eq!(r.version, ctl.redaction_version());
 
         // local ban → decision; allowlisted, too broad and non-ban ignored
         let ack = a
@@ -922,6 +1035,7 @@ mod tests {
             next(&mut stream).await,
             Some(Event::CentralJails(_))
         ));
+        assert!(matches!(next(&mut stream).await, Some(Event::Redaction(_))));
 
         ctl.set_group(&id, "db").unwrap();
         // closed within the check interval (5 s)
@@ -966,6 +1080,7 @@ mod tests {
             next(&mut stream).await,
             Some(Event::CentralJails(_))
         ));
+        assert!(matches!(next(&mut stream).await, Some(Event::Redaction(_))));
 
         let ov = |group: Option<&str>, maxretry: u32| JailOverride {
             jail: "sshd".into(),
@@ -1054,6 +1169,7 @@ mod tests {
             panic!("central jails expected")
         };
         assert!(c.jails.is_empty());
+        assert!(matches!(next(&mut stream).await, Some(Event::Redaction(_))));
 
         let def = |group: Option<&str>| JailDef {
             name: "app".into(),

@@ -111,6 +111,12 @@ async fn main() -> anyhow::Result<()> {
     engine.apply_jail_overrides(&jail_policies.jails);
     // the controller's allowlist as last received: applies before the
     // controller is reachable again
+    // the controller's redaction rules as last received: samples sent
+    // before the stream delivers them are redacted too
+    let mut redaction = loaded.central_redaction.clone().unwrap_or_default();
+    if cfg.agent.central_redaction {
+        apply_central_redaction(&mut engine, &redaction);
+    }
     let mut central = loaded.central_allowlist.clone().unwrap_or_default();
     engine.set_central_allowlist(central.live(Utc::now()));
     for r in engine.lift_allowlisted(Utc::now()) {
@@ -167,6 +173,13 @@ async fn main() -> anyhow::Result<()> {
     let stats = Arc::new(LinkStats::default());
     if let Ok(mut v) = stats.allowlist_version.lock() {
         v.clone_from(&central.version);
+    }
+    if let Ok(mut v) = stats.redaction_version.lock() {
+        *v = if cfg.agent.central_redaction {
+            redaction.version.clone()
+        } else {
+            "off".into()
+        };
     }
     if let Ok(mut v) = stats.jail_policies_version.lock() {
         v.clone_from(&jail_policies.version);
@@ -283,6 +296,26 @@ async fn main() -> anyhow::Result<()> {
                     central_jails = c;
                     continue;
                 }
+                if let FromController::Redaction(r) = ev {
+                    if !cfg.agent.central_redaction {
+                        continue;
+                    }
+                    apply_central_redaction(&mut engine, &r);
+                    if r != redaction {
+                        info!(version = %r.version, rules = r.rules.len(), "central redaction rules applied");
+                        let (st, saved) = (state.clone(), r.clone());
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = st.save_central_redaction(&saved) {
+                                error!(error = %format!("{e:#}"), "saving the redaction rules failed");
+                            }
+                        });
+                    }
+                    if let Ok(mut v) = stats.redaction_version.lock() {
+                        v.clone_from(&r.version);
+                    }
+                    redaction = r;
+                    continue;
+                }
                 if let FromController::JailPolicies(p) = ev {
                     engine.apply_jail_overrides(&p.jails);
                     if p.version != jail_policies.version {
@@ -369,6 +402,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("saving state on shutdown")?;
     Ok(())
+}
+
+/// Applies the controller's redaction rules after the local ones; rules
+/// this agent cannot compile are left out (logged): the controller redacts
+/// again on arrival.
+fn apply_central_redaction(engine: &mut Engine, r: &state::CentralRedaction) {
+    let (redactor, errors) = df2b_core::Redactor::lenient(&r.rules);
+    for e in errors {
+        warn!(error = %e, "ignoring a central redaction rule");
+    }
+    engine.set_central_redaction(&redactor);
 }
 
 /// Replaces the controller's allowlist: no new bans there, active local bans

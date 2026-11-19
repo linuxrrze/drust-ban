@@ -143,7 +143,8 @@ impl RemoteBans {
             // handled by the main loop (engine + firewall)
             FromController::Allowlist(_)
             | FromController::JailPolicies(_)
-            | FromController::CentralJails(_) => {}
+            | FromController::CentralJails(_)
+            | FromController::Redaction(_) => {}
         }
         c
     }

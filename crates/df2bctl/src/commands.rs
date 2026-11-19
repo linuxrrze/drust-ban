@@ -988,6 +988,18 @@ pub async fn redaction_list(c: &Client, json: bool) -> anyhow::Result<()> {
             s(r, &["replace"])
         );
     }
+    let n = |k: &str| v["agents"][k].as_u64().unwrap_or(0);
+    if n("connected") > 0 && rules.iter().any(|r| r["enabled"].as_bool() != Some(false)) {
+        let mut line = format!(
+            "applied by {} of {} connected agent(s) before sending",
+            n("current"),
+            n("connected")
+        );
+        if n("off") > 0 {
+            line += &format!("; {} refuse them (central_redaction = false)", n("off"));
+        }
+        println!("{line}");
+    }
     println!();
     println!("presets (df2bctl redaction preset <name>):");
     for p in v["presets"].as_array().into_iter().flatten() {

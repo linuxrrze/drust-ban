@@ -63,6 +63,7 @@ pub struct LinkStats {
     pub jails: std::sync::Mutex<Vec<v1::JailStatus>>,
     pub jail_policies_version: std::sync::Mutex<String>,
     pub central_jails_version: std::sync::Mutex<String>,
+    pub redaction_version: std::sync::Mutex<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,24 @@ pub enum FromController {
     JailPolicies(crate::state::JailPolicies),
     /// Jails defined on the controller (replace earlier ones).
     CentralJails(crate::central::CentralJails),
+    /// Redaction rules for sample lines (replace earlier ones).
+    Redaction(crate::state::CentralRedaction),
+}
+
+pub fn parse_redaction(r: v1::RedactionRules) -> crate::state::CentralRedaction {
+    crate::state::CentralRedaction {
+        version: r.version,
+        rules: r
+            .rules
+            .into_iter()
+            .map(|r| df2b_core::RedactRule {
+                name: r.name,
+                pattern: r.pattern,
+                replace: r.replace,
+                enabled: true,
+            })
+            .collect(),
+    }
 }
 
 /// Converts jail policies; implausible entries are dropped (logged), the
@@ -540,6 +559,7 @@ impl Task {
                         }
                         Some(Event::JailPolicies(p)) => FromController::JailPolicies(parse_jail_policies(p)),
                         Some(Event::CentralJails(c)) => FromController::CentralJails(crate::central::from_proto(c)),
+                        Some(Event::Redaction(r)) => FromController::Redaction(parse_redaction(r)),
                         Some(Event::Allowlist(a)) => match parse_allowlist(a) {
                             Some(ev) => ev,
                             None => { warn!("ignoring malformed allowlist update, keeping the previous one"); continue; }
@@ -568,6 +588,7 @@ impl Task {
                         jails: self.stats.jails.lock().map(|v| v.clone()).unwrap_or_default(),
                         jail_policies_version: self.stats.jail_policies_version.lock().map(|v| v.clone()).unwrap_or_default(),
                         central_jails_version: self.stats.central_jails_version.lock().map(|v| v.clone()).unwrap_or_default(),
+                        redaction_version: self.stats.redaction_version.lock().map(|v| v.clone()).unwrap_or_default(),
                     }).await?.into_inner();
                     // the controller decides the group (it filters the
                     // decisions); keep the local copy for logs up to date

@@ -1339,8 +1339,26 @@ async fn list_redaction(caller: Caller, State(ctl): State<Arc<Controller>>) -> A
             json!({ "name": name, "description": description, "pattern": pattern, "replace": replace })
         })
         .collect();
+    // connected agents: applying the current rules, or not accepting them
+    let current = ctl.redaction_version();
+    let live: Vec<_> = ctl
+        .agents()
+        .into_iter()
+        .filter(|a| a.connected && !a.revoked)
+        .collect();
+    let count = |f: &dyn Fn(&str) -> bool| {
+        live.iter()
+            .filter(|a| f(&a.status.redaction_version))
+            .count()
+    };
     Ok(Json(json!({
         "rules": *ctl.redaction_rules(),
+        "version": current,
+        "agents": {
+            "connected": live.len(),
+            "current": count(&|v| v == current),
+            "off": count(&|v| v == "off"),
+        },
         "presets": presets,
         "default_replace": df2b_core::redact::DEFAULT_REPLACE,
         "max_rules": df2b_core::redact::MAX_RULES,
@@ -2458,6 +2476,7 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         "propagate": ctl.propagate(),
         "allowlist": ctl.allowlist().iter().map(|e| e.net).collect::<Vec<_>>(),
         "allowlist_version": ctl.allowlist_version(),
+        "redaction_version": ctl.redaction_version(),
         "sessions": ctl.sessions.count(),
         "geoip": ctl.geo.databases(),
     })))
@@ -4837,6 +4856,11 @@ mod tests {
         assert_eq!(st, S::OK);
         assert_eq!(v["rules"], json!([]));
         assert_eq!(v["presets"][0]["name"], "ssh-user");
+        assert_eq!(v["version"], json!(env.ctl.redaction_version()));
+        assert_eq!(
+            v["agents"],
+            json!({ "connected": 0, "current": 0, "off": 0 })
+        );
         let rule = json!({ "pattern": r"(for )\S+( from)", "replace": "${1}[user]${2}" });
         assert_eq!(
             send("PUT", &op, "/api/v1/redaction/ssh-user", rule.clone())

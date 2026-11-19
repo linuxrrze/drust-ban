@@ -39,9 +39,14 @@ allowlist = ["127.0.0.0/8", "::1/128"]
 # leaves this host.
 # send_samples = true
 
+# Apply the controller's redaction rules (Policies page) to those lines
+# before sending, after the [[redact]] rules below. false: only those apply
+# here (the controller still redacts on arrival).
+# central_redaction = true
+
 # Rewrite those lines before they leave this host (in order; regular
 # expression, replacement with $1 for groups, default "[redacted]"). The
-# controller can redact further (Policies page).
+# controller's rules (Policies page) apply after these, here as well.
 # [[redact]]
 # pattern = '(?i)((?:\bfor|\binvalid user)\s+)(?:invalid user\s+)?\S+(\s+from\b)'
 # replace = '${1}[user]${2}'

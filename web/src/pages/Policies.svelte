@@ -33,6 +33,7 @@
   let redactRules = $state<RedactRule[]>([]);
   let presets = $state<RedactPreset[]>([]);
   let defaultReplace = $state('[redacted]');
+  let redactAgents = $state<{ connected: number; current: number; off: number } | null>(null);
   let redactOpen = $state(false);
   let editingRedact = $state<RedactRule | null>(null);
   let confirmOpen = $state(false);
@@ -51,9 +52,15 @@
         get<{ definitions: JailDefinition[] }>('/jail-definitions'),
         get<{ filters: CentralFilter[] }>('/filters'),
         get<{ rules: CorrelationRule[]; monitor_hits: CorrelationHit[]; tracked_addresses: number }>('/correlation'),
-        get<{ rules: RedactRule[]; presets: RedactPreset[]; default_replace: string }>('/redaction'),
+        get<{
+          rules: RedactRule[];
+          presets: RedactPreset[];
+          default_replace: string;
+          agents: { connected: number; current: number; off: number };
+        }>('/redaction'),
       ]);
       redactRules = r.rules;
+      redactAgents = r.agents;
       presets = r.presets;
       defaultReplace = r.default_replace;
       rules = c.rules;
@@ -345,9 +352,24 @@
     </div>
     <p class="muted">
       Agents send the latest matching log line with their reports (shown on the address page). These
-      rules rewrite such lines on the controller, in order, e.g. to hide user names, e-mail addresses
-      or tokens.
+      rules rewrite such lines, in order, e.g. to hide user names, e-mail addresses or tokens: the
+      agents apply them before sending (after their own <code>[[redact]]</code> rules), and the
+      controller again when a line arrives.
     </p>
+    {#if redactAgents && redactAgents.connected > 0 && redactRules.some((r) => r.enabled)}
+      <p class="coverage">
+        {#if redactAgents.current === redactAgents.connected}
+          <span class="pill good">all {redactAgents.connected} connected agents apply these rules</span>
+        {:else}
+          <span class="pill warn">{redactAgents.current} of {redactAgents.connected} connected agents apply these rules</span>
+          <span class="faint small">
+            {#if redactAgents.off}{redactAgents.off} {redactAgents.off === 1 ? 'does' : 'do'} not accept them (<code>central_redaction = false</code>);{/if}
+            agents confirm changes within about 10 seconds, and older agent versions do not receive them. The
+            controller redacts those lines on arrival.
+          </span>
+        {/if}
+      </p>
+    {/if}
     {#if redactRules.length === 0}
       <div class="empty">No redaction rules: lines are kept as the agents send them.</div>
     {:else}
@@ -466,6 +488,7 @@
   .section { margin-bottom: 16px; display: grid; gap: 12px; }
   .section h2 { margin: 0; }
   p { margin: 0; }
+  .coverage { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0; }
   .modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px; }
   .mode {
     display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;

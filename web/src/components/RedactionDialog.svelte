@@ -134,9 +134,10 @@
     {/if}
   {/if}
   <p class="faint small">
-    The controller applies the rules to lines as they arrive and rewrites the lines it already keeps (the
-    original text is gone). To keep text from leaving a host at all, use <code>[[redact]]</code> in that
-    agent's <code>agent.toml</code>, or <code>send_samples = false</code>.
+    Agents apply the enabled rules before sending a line; the controller applies them again as lines
+    arrive and rewrites the lines it already keeps (the original text is gone). Agents with
+    <code>central_redaction = false</code> do not accept them: for those, use <code>[[redact]]</code> in
+    their <code>agent.toml</code>, or <code>send_samples = false</code>.
   </p>
   {#if error}<div class="error-box">{error}</div>{/if}
   <div class="actions">

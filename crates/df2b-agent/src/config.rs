@@ -62,6 +62,11 @@ pub struct AgentSection {
     /// leaves the host.
     #[serde(default = "yes")]
     pub send_samples: bool,
+    /// Apply the controller's redaction rules to sample lines too (after
+    /// the `[[redact]]` rules here), so the controller never receives what
+    /// they hide.
+    #[serde(default = "yes")]
+    pub central_redaction: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]

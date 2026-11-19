@@ -85,6 +85,36 @@ impl Redactor {
         Ok(Self { rules: out })
     }
 
+    /// Like [`Redactor::new`], but rules that do not compile (or exceed
+    /// the limits) are left out; returns their errors. For rules received
+    /// from elsewhere, where one bad rule must not drop the others.
+    pub fn lenient(rules: &[RedactRule]) -> (Self, Vec<String>) {
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for (i, r) in rules.iter().enumerate() {
+            if i >= MAX_RULES {
+                errors.push(format!("at most {MAX_RULES} redaction rules"));
+                break;
+            }
+            match Self::new(std::slice::from_ref(r)) {
+                Ok(one) => out.extend(one.rules),
+                Err(e) => errors.push(e),
+            }
+        }
+        (Self { rules: out }, errors)
+    }
+
+    /// These rules, then `other`'s.
+    pub fn then(&self, other: &Redactor) -> Redactor {
+        Self {
+            rules: self.rules.iter().chain(&other.rules).cloned().collect(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
@@ -162,6 +192,20 @@ mod tests {
         assert_eq!(r.apply("user root from x"), "user [admin] from x");
         assert_eq!(r.apply("no match"), "no match");
         assert!(Redactor::default().is_empty());
+        // chained: the first redactor's rules run first
+        let second = Redactor::new(&[rule(r"\[admin\]", "[x]")]).unwrap();
+        assert_eq!(r.then(&second).apply("user root"), "user [x]");
+        assert_eq!(second.then(&r).apply("user root"), "user [admin]");
+    }
+
+    #[test]
+    fn lenient_skips_bad_rules() {
+        let (r, errors) = Redactor::lenient(&[rule("(", ""), rule("b", "B"), rule("a*", "")]);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.apply("abc"), "aBc");
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let (r, errors) = Redactor::lenient(&vec![rule("x", "y"); MAX_RULES + 3]);
+        assert_eq!((r.len(), errors.len()), (MAX_RULES, 1));
     }
 
     #[test]

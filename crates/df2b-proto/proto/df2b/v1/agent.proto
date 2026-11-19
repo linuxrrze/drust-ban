@@ -76,6 +76,9 @@ message HeartbeatRequest {
   string jail_policies_version = 10;
   // Version of the central jail definitions the agent applies.
   string central_jails_version = 11;
+  // Version of the central redaction rules the agent applies ("off" = the
+  // agent does not accept them, "" = none / old agent).
+  string redaction_version = 12;
 }
 
 message JailStatus {
@@ -175,6 +178,9 @@ message DecisionEvent {
     // central filters they use: sent after the jail policies and on every
     // change. Replaces earlier ones.
     CentralJails central_jails = 5;
+    // Redaction rules for sample log lines (all agents): sent after the
+    // central jails and on every change. Replaces earlier ones.
+    RedactionRules redaction = 6;
   }
 }
 
@@ -237,6 +243,21 @@ message JailPolicy {
   optional int64 bantime_ms = 5;
   optional double bantime_factor = 6;
   optional int64 max_bantime_ms = 7;
+}
+
+message RedactionRules {
+  // Content hash; the same rules always have the same version.
+  string version = 1;
+  // The enabled rules, applied in order after the agent's own.
+  repeated RedactionRule rules = 2;
+}
+
+message RedactionRule {
+  string name = 1;
+  // Regular expression (Rust regex syntax).
+  string pattern = 2;
+  // Replacement; $1, ${name} refer to groups, $$ is a literal $.
+  string replace = 3;
 }
 
 message AllowlistUpdate {

@@ -80,6 +80,7 @@ cargo run -p df2bctl -- correlation set distributed --kind threshold --min-failu
 cargo run -p df2bctl -- filter push app-auth app-auth.toml                     # admin
 cargo run -p df2bctl -- jails define app --filter app-auth --file /var/log/app/auth.log --group web
 cargo run -p df2bctl -- sessions list            # web UI sessions (admin)
+cargo run -p df2bctl -- redaction preset ssh-user   # admin: hide user names in sample lines (agents apply it too)
 cargo run -p df2bctl -- sessions end --user olga # or <id>, or --all
 
 # Plain HTTPS works too (internal CA: verify the name df2b-controller)

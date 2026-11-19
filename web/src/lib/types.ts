@@ -46,6 +46,8 @@ export interface AgentStatus {
   last_applied_seq: number;
   streams: number;
   allowlist_version: string;
+  /** "off": the agent does not accept central redaction rules */
+  redaction_version: string;
 }
 
 export interface Agent {
@@ -68,6 +70,7 @@ export interface Status {
   propagate: string;
   allowlist: string[];
   allowlist_version: string;
+  redaction_version: string;
   sessions: number;
   /** configured GeoIP databases */
   geoip: { path: string; database_type: string; build: string | null; error?: string }[];
