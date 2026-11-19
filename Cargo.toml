@@ -29,6 +29,7 @@ humantime = "2"
 humantime-serde = "1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2", "service"] }
+libc = "0.2"
 libloading = "0.8"
 maxminddb = "0.33"
 ipnet = { version = "2", features = ["serde"] }

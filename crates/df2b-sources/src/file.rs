@@ -14,7 +14,11 @@
 //! own tailer (from the start: they are new files). The tailer of a matched
 //! file ends once the file is gone and read to its end.
 //!
-//! TODO: inotify-driven wakeups instead of polling; per-source timestamps.
+//! Tailers wake up on inotify events (see `watch.rs`) for their path's
+//! directory entry and for the file they have open, and otherwise check
+//! every [`IDLE_POLL`]; without inotify they poll every 250 ms.
+//!
+//! TODO: per-source timestamps.
 
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
@@ -23,15 +27,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::os::unix::io::AsRawFd;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::mpsc;
+
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+use crate::watch::{Hub, Watch};
 use crate::{LogLine, Position, SourceBatch, BATCH_MAX, MAX_LINE};
 
 /// Maximum bytes read per poll iteration (bounds memory per tailer).
 const MAX_READ: u64 = 4 * 1024 * 1024;
+/// Check interval while inotify wakes the tailer (a safety net only).
+pub const IDLE_POLL: Duration = Duration::from_secs(2);
 /// How long a rotated-away file is kept open while its replacement is empty.
 const ROTATION_GRACE: Duration = Duration::from_secs(30);
 /// Files followed per source at most (glob matches beyond are ignored).
@@ -57,6 +66,7 @@ pub struct FileTailer {
     path: PathBuf,
     start_at_end: bool,
     poll: Duration,
+    idle_poll: Duration,
     grace: Duration,
     exit_when_gone: bool,
     resume: Option<FileId>,
@@ -93,6 +103,7 @@ impl FileTailer {
             path,
             start_at_end,
             poll: Duration::from_millis(250),
+            idle_poll: IDLE_POLL,
             grace: ROTATION_GRACE,
             exit_when_gone: false,
             resume: None,
@@ -113,8 +124,16 @@ impl FileTailer {
         self
     }
 
+    /// Check interval without inotify; also replaces [`IDLE_POLL`].
     pub fn with_poll_interval(mut self, poll: Duration) -> Self {
         self.poll = poll;
+        self.idle_poll = poll;
+        self
+    }
+
+    /// Check interval while inotify works.
+    pub fn with_idle_poll(mut self, poll: Duration) -> Self {
+        self.idle_poll = poll;
         self
     }
 
@@ -219,6 +238,57 @@ impl FileTailer {
         })
     }
 
+    /// Keeps the inotify watches current: the directory entry of `path`,
+    /// and the open file (by inode, also after a rename).
+    fn rewatch(&self, w: &mut Watches, open: Option<&Open>) {
+        let Some(hub) = Hub::global() else { return };
+        if w.entry.is_none() {
+            let dir = match self.path.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d,
+                _ => Path::new("."),
+            };
+            if let Some(name) = self.path.file_name() {
+                match hub.watch_entry(dir, name, &w.notify) {
+                    Ok(x) => w.entry = Some(x),
+                    Err(e) => {
+                        debug!(path = %self.path.display(), error = %e, "cannot watch directory")
+                    }
+                }
+            }
+        }
+        match open {
+            None => w.file = None,
+            Some(o) if w.file.as_ref().map(|f| f.0) != Some(o.id) => {
+                w.file = match hub.watch_fd(o.file.as_raw_fd(), &w.notify) {
+                    Ok(x) => Some((o.id, x)),
+                    Err(e) => {
+                        debug!(path = %self.path.display(), error = %e, "cannot watch file");
+                        None
+                    }
+                };
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Waits for an inotify event or the poll interval; while a rotated
+    /// file waits for its grace period, not longer than that.
+    async fn idle(&self, w: &mut Watches, open: Option<&Open>, rotated_since: Option<Instant>) {
+        self.rewatch(w, open);
+        let mut d = if w.entry.is_some() {
+            self.idle_poll
+        } else {
+            self.poll
+        };
+        if let Some(since) = rotated_since {
+            d = d.min(self.grace.saturating_sub(since.elapsed()).max(self.poll));
+        }
+        tokio::select! {
+            _ = w.notify.notified() => {}
+            _ = tokio::time::sleep(d) => {}
+        }
+    }
+
     /// Runs until the receiver is dropped (or, with [`Self::exit_when_gone`],
     /// the file is gone).
     pub async fn run(self, tx: mpsc::Sender<SourceBatch>) -> anyhow::Result<()> {
@@ -232,6 +302,11 @@ impl FileTailer {
         let mut rotated_since: Option<Instant> = None;
         // Read the open file to its end once more, then switch.
         let mut finishing = false;
+        let mut watches = Watches {
+            notify: Arc::new(Notify::new()),
+            entry: None,
+            file: None,
+        };
 
         loop {
             if tx.is_closed() {
@@ -244,7 +319,7 @@ impl FileTailer {
                         open = Some(o);
                     }
                     None if self.exit_when_gone => return Ok(()),
-                    None => tokio::time::sleep(self.poll).await,
+                    None => self.idle(&mut watches, None, None).await,
                 }
                 continue;
             };
@@ -331,9 +406,18 @@ impl FileTailer {
                     }
                 }
             }
-            tokio::time::sleep(self.poll).await;
+            let cur = open.as_ref();
+            self.idle(&mut watches, cur, rotated_since).await;
         }
     }
+}
+
+struct Watches {
+    notify: Arc<Notify>,
+    /// The directory entry of the path.
+    entry: Option<Watch>,
+    /// The open file.
+    file: Option<(FileId, Watch)>,
 }
 
 /// A file in the directory of `path` that is the file `id` (a rotated-away
@@ -364,7 +448,8 @@ pub struct FileSource {
     paths: Vec<PathBuf>,
     start_at_end: bool,
     positions: HashMap<PathBuf, (u64, u64, u64)>,
-    poll: Duration,
+    /// Overrides the tailers' poll intervals.
+    poll: Option<Duration>,
     grace: Duration,
     rescan: Duration,
 }
@@ -376,7 +461,7 @@ impl FileSource {
             paths,
             start_at_end,
             positions: HashMap::new(),
-            poll: Duration::from_millis(250),
+            poll: None,
             grace: ROTATION_GRACE,
             rescan: Duration::from_secs(10),
         }
@@ -390,7 +475,7 @@ impl FileSource {
     }
 
     pub fn with_poll_interval(mut self, poll: Duration) -> Self {
-        self.poll = poll;
+        self.poll = Some(poll);
         self
     }
 
@@ -407,8 +492,10 @@ impl FileSource {
 
     fn tailer(&self, path: &Path, start_at_end: bool) -> FileTailer {
         let mut t = FileTailer::new(self.source.clone(), path.to_path_buf(), start_at_end)
-            .with_poll_interval(self.poll)
             .with_rotation_grace(self.grace);
+        if let Some(poll) = self.poll {
+            t = t.with_poll_interval(poll);
+        }
         if let Some(&(dev, ino, offset)) = self.positions.get(path) {
             info!(source = %self.source, path = %path.display(), offset, "resuming file");
             t = t.with_position(dev, ino, offset);
@@ -814,5 +901,51 @@ mod tests {
         assert!(!is_glob(Path::new("/var/log/auth.log")));
         assert!(check_path(Path::new("/var/log/[a.log")).is_err());
         assert!(check_path(Path::new("/var/log/*/access.log")).is_ok());
+    }
+
+    async fn quick(rx: &mut mpsc::Receiver<SourceBatch>) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("no inotify wake-up")
+            .unwrap()
+            .lines
+            .into_iter()
+            .map(|l| l.line)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn inotify_wakes_without_polling() {
+        let dir = std::env::temp_dir().join(format!("df2b-tail-inotify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.log");
+        let (tx, mut rx) = mpsc::channel(16);
+        // polling far too slow for the deadlines below: events must do it
+        let h = tokio::spawn(
+            FileTailer::new(Arc::from("t"), path.clone(), false)
+                .with_poll_interval(Duration::from_secs(60))
+                .with_rotation_grace(Duration::from_secs(60))
+                .run(tx),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // the file appears
+        std::fs::write(&path, "one\n").unwrap();
+        assert_eq!(quick(&mut rx).await, ["one"]);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"two\n").unwrap();
+        assert_eq!(quick(&mut rx).await, ["two"]);
+        // rotation: the writer still writes to the old file, then the
+        // new one gets data
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        f.write_all(b"three\n").unwrap();
+        assert_eq!(quick(&mut rx).await, ["three"]);
+        std::fs::write(&path, "four\n").unwrap();
+        assert_eq!(quick(&mut rx).await, ["four"]);
+        h.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

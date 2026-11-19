@@ -75,8 +75,13 @@ Why not peer-to-peer gossip:
 
 ### 2.2 Files
 
-- Poll every 250 ms (inotify wakeups later); track `(dev, inode, offset)` per
-  file. The tailer keeps the file it reads open.
+- Woken by inotify: one instance per process (the default limit is 128 per
+  user), read by one thread; each tailer watches its path's directory entry
+  (filtered by name: creation, rename, writes) and the inode it has open
+  (also after a rename, via `/proc/self/fd`). Events are only a hint: the
+  tailer still checks every 2 s, and every 250 ms if inotify is not
+  available. Track `(dev, inode, offset)` per file. The tailer keeps the
+  file it reads open.
 - Rotation handling:
   - **rename + create**: finish reading the old inode (through the open file),
     then switch to the new one, flushing an incomplete last line. While the new
@@ -916,7 +921,7 @@ systemd hardening.
 |------------------------------|--------------------------------------------------|
 | `IpKey`, decisions, ban time | implemented + tests                              |
 | Matcher (prefilter/RegexSet) | implemented + tests                              |
-| File tailer                  | polling, resumes from saved offset (also across rotation), drains rotated files, glob paths; inotify TODO |
+| File tailer                  | inotify wake-ups (2 s fallback poll), resumes from saved offset (also across rotation), drains rotated files, glob paths |
 | journald                     | implemented (dlopen, dedicated thread, batches, resumes from saved cursor) |
 | Tracker / engine             | implemented + tests; one firewall transaction per batch |
 | nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |

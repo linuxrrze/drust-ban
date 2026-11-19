@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub mod file;
 #[cfg(feature = "journald")]
 pub mod journald;
+pub mod watch;
 
 pub use file::{FileSource, FileTailer};
 #[cfg(feature = "journald")]
