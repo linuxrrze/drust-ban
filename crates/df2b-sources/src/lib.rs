@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub mod file;
 #[cfg(feature = "journald")]
 pub mod journald;
+pub mod timestamp;
 pub mod watch;
 
 pub use file::{Ended, FileSource, FileTailer};

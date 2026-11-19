@@ -72,6 +72,9 @@ paths = ["/var/log/auth.log"]
 # Globs (*, ? and [...]) are expanded again every 10 s, e.g.
 # "/var/log/nginx/*.access.log"; keep rotated names (*.log.1) out of the match.
 start_at_end = true
+# Event time from each line's timestamp (syslog, ISO 8601, access log), so
+# old content outside findtime is not counted; false: time of reading.
+# timestamps = true
 
 [[jail]]
 name = "sshd"

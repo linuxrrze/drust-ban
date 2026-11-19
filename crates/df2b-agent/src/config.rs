@@ -107,6 +107,10 @@ pub enum SourceKind {
         /// Skip existing content on first start (default: read from start).
         #[serde(default)]
         start_at_end: bool,
+        /// Event time from each line's timestamp (ISO 8601, syslog, access
+        /// log); false: the time the line is read.
+        #[serde(default = "yes")]
+        timestamps: bool,
     },
     Journald {
         /// journalctl-style matches, e.g. "_SYSTEMD_UNIT=sshd.service";

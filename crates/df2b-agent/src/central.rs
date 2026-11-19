@@ -72,6 +72,7 @@ impl CentralJail {
                     } => SourceKind::File {
                         paths: paths.clone(),
                         start_at_end: *start_at_end,
+                        timestamps: true,
                     },
                     CentralSource::Journald { matches, start } => SourceKind::Journald {
                         matches: matches.clone(),

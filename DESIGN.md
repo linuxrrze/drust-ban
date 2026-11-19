@@ -75,6 +75,14 @@ Why not peer-to-peer gossip:
 
 ### 2.2 Files
 
+- **Event times**: each line's time comes from a timestamp at its start
+  when it has one (ISO 8601 / RFC 3339, also with a space and without a
+  zone = local time; classic syslog `Nov 19 19:20:01`, local time, the
+  year closest to now; the access-log stamp `[19/Nov/2026:19:20:01 +0000]`
+  in the first 128 bytes), capped at now; otherwise the time it is read.
+  So reading old file content (first start, replaced file) never counts
+  failures outside `findtime`, and lag is reported for file sources too.
+  Per source `timestamps = false` turns it off.
 - Woken by inotify: one instance per process (the default limit is 128 per
   user), read by one thread; each tailer watches its path's directory entry
   (filtered by name: creation, rename, writes) and the inode it has open

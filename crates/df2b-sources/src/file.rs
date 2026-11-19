@@ -18,7 +18,8 @@
 //! directory entry and for the file they have open, and otherwise check
 //! every [`IDLE_POLL`]; without inotify they poll every 250 ms.
 //!
-//! TODO: per-source timestamps.
+//! Lines get their event time from a timestamp at their start when they
+//! have one (see `timestamp.rs`; [`FileTailer::with_timestamps`]).
 
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
@@ -78,6 +79,7 @@ pub struct FileTailer {
     idle_poll: Duration,
     grace: Duration,
     exit_when_gone: bool,
+    timestamps: bool,
     resume: Option<FileId>,
     resume_offset: u64,
 }
@@ -115,6 +117,7 @@ impl FileTailer {
             idle_poll: IDLE_POLL,
             grace: ROTATION_GRACE,
             exit_when_gone: false,
+            timestamps: true,
             resume: None,
             resume_offset: 0,
         }
@@ -149,6 +152,13 @@ impl FileTailer {
     /// How long a rotated-away file stays open while the new one is empty.
     pub fn with_rotation_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
+        self
+    }
+
+    /// Take each line's event time from its timestamp (default); off: the
+    /// time it is read.
+    pub fn with_timestamps(mut self, on: bool) -> Self {
+        self.timestamps = on;
         self
     }
 
@@ -188,10 +198,15 @@ impl FileTailer {
     }
 
     fn line(&self, raw: &[u8]) -> LogLine {
+        let line = String::from_utf8_lossy(&raw[..raw.len().min(MAX_LINE)]).into_owned();
         LogLine {
             source: self.source.clone(),
-            ts: None,
-            line: String::from_utf8_lossy(&raw[..raw.len().min(MAX_LINE)]).into_owned(),
+            ts: if self.timestamps {
+                crate::timestamp::parse(&line, chrono::Utc::now())
+            } else {
+                None
+            },
+            line,
         }
     }
 
@@ -467,6 +482,7 @@ pub struct FileSource {
     grace: Duration,
     rescan: Duration,
     errors: Option<Arc<SourceErrors>>,
+    timestamps: bool,
 }
 
 impl FileSource {
@@ -480,7 +496,14 @@ impl FileSource {
             grace: ROTATION_GRACE,
             rescan: Duration::from_secs(10),
             errors: None,
+            timestamps: true,
         }
+    }
+
+    /// See [`FileTailer::with_timestamps`].
+    pub fn with_timestamps(mut self, on: bool) -> Self {
+        self.timestamps = on;
+        self
     }
 
     /// Where errors of its files are recorded.
@@ -514,7 +537,8 @@ impl FileSource {
 
     fn tailer(&self, path: &Path, start_at_end: bool) -> FileTailer {
         let mut t = FileTailer::new(self.source.clone(), path.to_path_buf(), start_at_end)
-            .with_rotation_grace(self.grace);
+            .with_rotation_grace(self.grace)
+            .with_timestamps(self.timestamps);
         if let Some(poll) = self.poll {
             t = t.with_poll_interval(poll);
         }

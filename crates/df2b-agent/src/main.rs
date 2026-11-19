@@ -896,12 +896,14 @@ fn spawn_source(
         SourceKind::File {
             paths,
             start_at_end,
+            timestamps,
         } => {
             for p in paths {
                 df2b_sources::file::check_path(p)?;
             }
             let mut files = FileSource::new(name.clone(), paths.clone(), *start_at_end)
-                .with_errors(errors.clone());
+                .with_errors(errors.clone())
+                .with_timestamps(*timestamps);
             // saved positions of this source: configured paths and glob matches
             for (key, pos) in positions {
                 if let Position::File {

@@ -167,6 +167,9 @@ mod tests {
                 seen[linear as usize] += 1;
             }
         }
-        assert!(seen[0] > 500 && seen[1] > 500, "both outcomes exercised: {seen:?}");
+        assert!(
+            seen[0] > 500 && seen[1] > 500,
+            "both outcomes exercised: {seen:?}"
+        );
     }
 }
