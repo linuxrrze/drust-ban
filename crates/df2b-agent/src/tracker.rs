@@ -72,9 +72,9 @@ impl Tracker {
         }
         let q = &mut self.hits.get_mut(&key).expect("inserted above").hits;
         q.push_back(ts);
-        while q.front().is_some_and(|t| *t < cutoff) {
-            q.pop_front();
-        }
+        // events of several sources need not arrive in time order: drop
+        // every expired one, not only those at the front
+        q.retain(|t| *t >= cutoff);
         if q.len() >= self.maxretry {
             self.hits.remove(&key);
             true
@@ -192,6 +192,22 @@ mod tests {
         let later = start + TimeDelta::seconds(120);
         assert!(!t.record(k, later, later), "first hit expired");
         assert!(t.record(k, later, later));
+    }
+
+    /// Regression: an expired event behind a newer one (out of order, two
+    /// sources) still counted.
+    #[test]
+    fn out_of_order_events_expire() {
+        let start = Utc::now();
+        let k = key("192.0.2.1");
+        let mut t = Tracker::new(3, Duration::from_secs(60), 10);
+        let at50 = start + TimeDelta::seconds(50);
+        assert!(!t.record(k, at50, at50));
+        assert!(!t.record(k, start, at50), "older, still in the window");
+        // at +100 s the event from `start` has expired although it sits
+        // behind the one from +50 s
+        let later = start + TimeDelta::seconds(100);
+        assert!(!t.record(k, later, later), "only 2 of 3 in the window");
     }
 
     #[test]

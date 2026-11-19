@@ -72,7 +72,12 @@ fn syslog(line: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 }
 
 fn clf(line: &str) -> Option<DateTime<Utc>> {
-    let window = line.get(..line.len().min(128)).unwrap_or(line);
+    // the first 128 bytes, cut at a character boundary (never the whole line)
+    let mut end = line.len().min(128);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let window = &line[..end];
     let start = window.find('[')? + 1;
     // "19/Nov/2026:19:20:01 +0200]"
     let stamp = window.get(start..start + 27)?;
@@ -166,5 +171,14 @@ mod tests {
         let now = utc("2026-11-19T20:00:00Z");
         assert_eq!(parse("2026-11-19T21:00:00Z x", now), Some(now));
         assert!(now - parse("2026-11-19T19:59:00Z x", now).unwrap() == TimeDelta::minutes(1));
+    }
+
+    /// Regression: a multi-byte character across byte 128 made the window
+    /// the whole line.
+    #[test]
+    fn clf_window_is_cut_at_a_char_boundary() {
+        let now = utc("2026-11-19T20:00:00Z");
+        let line = format!("{}é [19/Nov/2026:19:20:01 +0000]", "x".repeat(127));
+        assert_eq!(parse(&line, now), None);
     }
 }

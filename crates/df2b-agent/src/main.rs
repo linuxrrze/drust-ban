@@ -464,7 +464,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                let changes = remote.apply(ev, now, |net| engine.is_banned(net, now));
+                let mut changes = remote.apply(ev, now, |net| engine.is_banned(net, now));
+                changes.ban.retain(|b| {
+                    let refuse = engine.refuses_remote(&b.net);
+                    if refuse {
+                        warn!(target = %b.net, "refusing a controller ban: allowlisted here or too broad");
+                    }
+                    !refuse
+                });
                 for net in &changes.lift {
                     for r in engine.lift(net, now) {
                         info!(jail = %r.jail, target = %r.key, "local ban lifted by controller");
@@ -572,7 +579,9 @@ async fn main() -> anyhow::Result<()> {
                     expected.add(m.target, m.until);
                 }
                 for (target, until, _) in remote.list(now) {
-                    expected.add(target, until);
+                    if !engine.refuses_remote(&target) {
+                        expected.add(target, until);
+                    }
                 }
                 let (b, flag) = (backend.clone(), reconciling.clone());
                 tokio::spawn(async move {

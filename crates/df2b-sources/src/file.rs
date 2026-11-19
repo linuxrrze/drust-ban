@@ -40,6 +40,10 @@ use crate::{LogLine, Position, SourceBatch, SourceErrors, BATCH_MAX, MAX_LINE};
 
 /// Maximum bytes read per poll iteration (bounds memory per tailer).
 const MAX_READ: u64 = 4 * 1024 * 1024;
+/// How much older than the time it was read a line read live may claim
+/// to be (buffered writers, e.g. nginx with `flush=`).
+const LIVE_SLACK: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
 /// Check interval while inotify wakes the tailer (a safety net only).
 pub const IDLE_POLL: Duration = Duration::from_secs(2);
 /// How long a rotated-away file is kept open while its replacement is empty.
@@ -197,15 +201,29 @@ impl FileTailer {
         .is_ok()
     }
 
-    fn line(&self, raw: &[u8]) -> LogLine {
-        let line = String::from_utf8_lossy(&raw[..raw.len().min(MAX_LINE)]).into_owned();
+    /// `live`: read while following the file (not catching up on older
+    /// content): it was written just now, so a timestamp claiming it is
+    /// much older is not believed - part of a line can be attacker text
+    /// (an access log's user field comes before its time stamp) and an old
+    /// stamp would keep its failures from counting.
+    fn line(&self, raw: &[u8], live: bool) -> LogLine {
+        let raw = &raw[..raw.len().min(MAX_LINE)];
+        // CRLF logs: the patterns end with $
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let line = String::from_utf8_lossy(raw).into_owned();
+        let now = chrono::Utc::now();
+        let ts = if self.timestamps {
+            crate::timestamp::parse(&line, now)
+        } else {
+            None
+        };
+        let ts = match ts {
+            Some(t) if live => Some(t.max(now - LIVE_SLACK)),
+            t => t,
+        };
         LogLine {
             source: self.source.clone(),
-            ts: if self.timestamps {
-                crate::timestamp::parse(&line, chrono::Utc::now())
-            } else {
-                None
-            },
+            ts,
             line,
         }
     }
@@ -330,6 +348,10 @@ impl FileTailer {
         let mut rotated_since: Option<Instant> = None;
         // Read the open file to its end once more, then switch.
         let mut finishing = false;
+        // inside an over-long line, skipping to its end
+        let mut skipping = false;
+        // caught up with the open file once (see `line`)
+        let mut live = false;
         let mut watches = Watches {
             notify: Arc::new(Notify::new()),
             entry: None,
@@ -357,6 +379,7 @@ impl FileTailer {
                 info!(path = %self.path.display(), "file truncated, restarting at 0");
                 pending.clear();
                 cur.offset = 0;
+                skipping = false;
             }
             let mut n = 0;
             if len > cur.offset {
@@ -367,13 +390,27 @@ impl FileTailer {
                     .read_to_end(&mut chunk)
                     .await? as u64;
                 // file offset of pending[0]
-                let base = cur.offset - pending.len() as u64;
+                let mut base = cur.offset - pending.len() as u64;
                 cur.offset += n;
                 let unread = len.saturating_sub(cur.offset);
+                if skipping {
+                    // the rest of an over-long line: never a line of its own
+                    match memchr::memchr(b'\n', &chunk) {
+                        Some(i) => {
+                            chunk.drain(..=i);
+                            base += i as u64 + 1;
+                            skipping = false;
+                        }
+                        None => {
+                            base += chunk.len() as u64;
+                            chunk.clear();
+                        }
+                    }
+                }
                 pending.extend_from_slice(&chunk);
                 let mut start = 0;
                 for pos in memchr::memchr_iter(b'\n', &pending) {
-                    batch.push(self.line(&pending[start..pos]));
+                    batch.push(self.line(&pending[start..pos], live));
                     start = pos + 1;
                     if batch.len() >= BATCH_MAX
                         && !self
@@ -392,19 +429,32 @@ impl FileTailer {
                 }
                 pending.drain(..start);
                 if pending.len() > MAX_LINE {
-                    warn!(path = %self.path.display(), "discarding over-long partial line");
+                    // keep its start (like any over-long line), skip the
+                    // rest up to its newline: the tail must not become a
+                    // line of its own (it could be a forged log entry).
+                    // The position stays at the line's start, so after a
+                    // restart it is cut again rather than its tail read.
+                    warn!(path = %self.path.display(), "over-long line, keeping its first {MAX_LINE} bytes");
+                    let line_start = base + start as u64;
+                    batch.push(self.line(&pending, live));
                     pending.clear();
+                    skipping = true;
+                    if !self.send(&tx, &mut batch, cur.id, line_start, unread).await {
+                        return Ok(Ended::Closed);
+                    }
                 }
             }
             if n == MAX_READ {
                 continue; // more to read right away
             }
+            // at the end of what was written: from now on lines are new
+            live = true;
 
             if finishing {
                 // The rotated-away file is read to its end: nobody will
                 // complete its last line any more.
                 if !pending.is_empty() {
-                    batch.push(self.line(&pending));
+                    batch.push(self.line(&pending, live));
                     pending.clear();
                     if !self.send(&tx, &mut batch, cur.id, cur.offset, 0).await {
                         return Ok(Ended::Closed);
@@ -412,6 +462,9 @@ impl FileTailer {
                 }
                 open = None;
                 finishing = false;
+                // the next file starts fresh
+                live = false;
+                skipping = false;
                 rotated_since = None;
                 continue;
             }
@@ -667,6 +720,7 @@ fn expand(patterns: &[String]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
     use std::collections::VecDeque;
     use std::io::Write;
 
@@ -1014,6 +1068,69 @@ mod tests {
         assert_eq!(quick(&mut rx).await, ["three"]);
         std::fs::write(&path, "four\n").unwrap();
         assert_eq!(quick(&mut rx).await, ["four"]);
+        h.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the tail of a discarded over-long partial line used to
+    /// come out as a line of its own (a forged entry after 16 KiB of junk).
+    #[tokio::test]
+    async fn over_long_line_tail_is_not_a_line() {
+        let dir = tmpdir("overlong");
+        let path = dir.join("app.log");
+        std::fs::write(&path, "").unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileTailer::new(Arc::from("t"), path.clone(), false)
+                .with_poll_interval(Duration::from_millis(10))
+                .run(tx),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        append(&path, &"A".repeat(MAX_LINE + 1000));
+        let cut = recv_batch(&mut rx).await;
+        assert_eq!(cut.lines.len(), 1);
+        assert_eq!(cut.lines[0].line.len(), MAX_LINE, "kept, cut");
+        append(&path, "Nov 19 05:52:01 host sshd[1]: Failed password for root from 192.0.2.77 port 22 ssh2\nreal\n");
+        let mut buf = VecDeque::new();
+        assert_eq!(
+            next_line(&mut rx, &mut buf).await,
+            "real",
+            "the forged tail was skipped"
+        );
+        h.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a time stamp in attacker-controlled text (an access
+    /// log's user field) could make a live line look ancient, so its
+    /// failure never counted. Catching up keeps the stamps.
+    #[tokio::test]
+    async fn live_lines_cannot_claim_to_be_old() {
+        let dir = tmpdir("livets");
+        let path = dir.join("access.log");
+        let line = r#"203.0.113.7 - x [01/Jan/2000:00:00:00 +0000] "GET / HTTP/1.1" 401 0"#;
+        std::fs::write(&path, format!("{line}\r\n")).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileTailer::new(Arc::from("t"), path.clone(), false)
+                .with_poll_interval(Duration::from_millis(10))
+                .run(tx),
+        );
+        let old = recv_batch(&mut rx).await.lines.remove(0);
+        assert_eq!(old.line, line, "CR stripped");
+        assert_eq!(
+            old.ts.unwrap().year(),
+            2000,
+            "catching up: the stamp counts"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        append(&path, &format!("{line}\n"));
+        let live = recv_batch(&mut rx).await.lines.remove(0);
+        let age = chrono::Utc::now() - live.ts.unwrap();
+        assert!(
+            age <= LIVE_SLACK + chrono::TimeDelta::seconds(5),
+            "live: {age}"
+        );
         h.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

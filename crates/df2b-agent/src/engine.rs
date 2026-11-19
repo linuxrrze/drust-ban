@@ -435,6 +435,19 @@ impl Engine {
         out
     }
 
+    /// Whether a ban from the controller must not be applied here: it
+    /// overlaps this agent's allowlist (configured or central) or is wider
+    /// than /8 (IPv4) or /16 (IPv6). The agent's own allowlist wins over
+    /// the controller (management networks; a broken or compromised
+    /// controller must not lock the host out).
+    pub fn refuses_remote(&self, net: &IpNet) -> bool {
+        let too_broad = match net {
+            IpNet::V4(n) => n.prefix_len() < 8,
+            IpNet::V6(n) => n.prefix_len() < 16,
+        };
+        too_broad || self.allowlisted(net)
+    }
+
     /// Whether `net` overlaps the configured or the central allowlist.
     pub fn allowlisted(&self, net: &IpNet) -> bool {
         self.allowlist.overlaps(net) || self.central.overlaps(net)
@@ -1247,5 +1260,23 @@ mod tests {
         assert_eq!(r.ended.len(), 2);
         assert_eq!(r.forgotten.len(), 2);
         assert_eq!(e.jail_count(), 0);
+    }
+
+    /// Regression: controller bans bypassed the local allowlist and had no
+    /// width limit (a 0.0.0.0/0 ban would lock the host out).
+    #[test]
+    fn remote_bans_respect_the_local_allowlist() {
+        let e = engine(); // allowlist 10.0.0.0/8
+        let net = |s: &str| s.parse::<IpNet>().unwrap();
+        assert!(e.refuses_remote(&net("0.0.0.0/0")));
+        assert!(e.refuses_remote(&net("100.0.0.0/7")));
+        assert!(e.refuses_remote(&net("2001::/15")));
+        assert!(e.refuses_remote(&net("10.1.2.3/32")), "allowlisted");
+        assert!(
+            e.refuses_remote(&net("8.0.0.0/6")),
+            "contains the allowlist"
+        );
+        assert!(!e.refuses_remote(&net("203.0.113.0/24")));
+        assert!(!e.refuses_remote(&net("2001:db8::/48")));
     }
 }

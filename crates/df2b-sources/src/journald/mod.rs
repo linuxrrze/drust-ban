@@ -208,7 +208,9 @@ impl JournaldSource {
         let ts = j
             .realtime_usec()
             .ok()
-            .and_then(|us| DateTime::from_timestamp_micros(i64::try_from(us).ok()?));
+            .and_then(|us| DateTime::from_timestamp_micros(i64::try_from(us).ok()?))
+            // never in the future (copied journals, clock skew), like files
+            .map(|t| t.min(chrono::Utc::now()));
         let data = match j.data(c"MESSAGE") {
             Ok(Some(d)) => d,
             Ok(None) => return None,
