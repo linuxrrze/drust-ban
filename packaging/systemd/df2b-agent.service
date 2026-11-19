@@ -20,8 +20,17 @@ AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 
 StateDirectory=df2b
+# agent.redb holds offenders and queued reports with sample log lines
+StateDirectoryMode=0700
+UMask=0077
 RuntimeDirectory=df2b
 ConfigurationDirectory=df2b
+
+# firewall = "ipset" (iptables) additionally needs, in a drop-in
+# (systemctl edit df2b-agent):
+#   AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+#   CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+#   ReadWritePaths=-/run/xtables.lock
 
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -31,6 +40,12 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 LockPersonality=yes

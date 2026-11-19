@@ -15,6 +15,9 @@ RestartSec=2s
 DynamicUser=yes
 StateDirectory=df2b-controller
 ConfigurationDirectory=df2b
+UMask=0077
+# no privileges needed (ports above 1024)
+CapabilityBoundingSet=
 
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -24,6 +27,12 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 LockPersonality=yes

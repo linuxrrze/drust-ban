@@ -213,6 +213,12 @@ impl State {
         let path = dir.join("agent.redb");
         let db = Database::create(&path)
             .with_context(|| format!("opening state database {}", path.display()))?;
+        // offenders, manual bans, queued reports with sample log lines:
+        // not for other users (also when run without the systemd unit)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         // create tables so read transactions never hit "table does not exist"
         let tx = db.begin_write()?;
         tx.open_table(POSITIONS)?;
@@ -531,6 +537,17 @@ mod tests {
         ];
         want.sort();
         assert_eq!(stale, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (security review): agent.redb was world-readable.
+    #[test]
+    fn database_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("mode");
+        let st = State::open(&dir).unwrap();
+        let mode = std::fs::metadata(st.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -37,16 +37,25 @@ const USERS: &str = "users";
 pub const MIN_PASSWORD_LEN: usize = 12;
 
 /// Writes `data` atomically (temp file + rename) with `mode`.
+/// The temporary file is new (random name, `O_EXCL`, no symlinks
+/// followed): run by root on a directory the controller's user can write,
+/// a planted symlink must not redirect the write.
 pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let tmp = path.with_extension(format!(
+        "tmp-{}",
+        df2b_tls::hex(&df2b_tls::random_bytes::<8>())
+    ));
     let mut f = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(mode)
         .open(&tmp)?;
-    f.write_all(data)?;
-    f.sync_all()?;
+    let written = f.write_all(data).and_then(|()| f.sync_all());
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     fs::rename(&tmp, path)
 }
 
@@ -697,6 +706,28 @@ mod tests {
         load_or_create_ca(&dir).unwrap();
         assert!(create_token(&dir, "web", Duration::MAX).is_err());
         assert!(create_api_token(&dir, "x", Role::Viewer, Some(Duration::MAX)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_replaces_with_a_fresh_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("df2b-files-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x.json");
+        write_atomic(&p, b"one", 0o600).unwrap();
+        write_atomic(&p, b"two", 0o600).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no temp files left"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

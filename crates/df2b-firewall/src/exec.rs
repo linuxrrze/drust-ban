@@ -15,6 +15,7 @@
 //! Exit 0 is success; anything else is a failure (stderr is logged).
 
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -72,8 +73,17 @@ impl Exec {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // its own process group: what it starts is killed with it
+            .process_group(0)
             .spawn()
             .with_context(|| format!("starting {}", self.command[0]))?;
+        let pgid = i32::try_from(child.id()).unwrap_or(0);
+        let kill_group = || {
+            if pgid > 0 {
+                // SAFETY: plain syscall; a negative pid is the group
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+        };
         // feed stdin and drain stdout/stderr on threads: no pipe deadlock
         let mut stdin = child.stdin.take().expect("piped");
         let input = input.to_owned();
@@ -98,7 +108,7 @@ impl Exec {
                 break s;
             }
             if start.elapsed() > self.timeout {
-                let _ = child.kill();
+                kill_group();
                 let _ = child.wait();
                 bail!(
                     "{} {op}: timed out after {:?}",
@@ -108,6 +118,16 @@ impl Exec {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        // something it started in the background may still hold the
+        // pipes: wait a little, then kill the group so the readers end
+        let done = || out_t.is_finished() && err_t.is_finished() && feeder.is_finished();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !done() {
+            kill_group();
+        }
         let _ = feeder.join();
         Ok(Run {
             code: status.code(),
@@ -280,5 +300,17 @@ esac"#,
         for d in [d1, d2, d3] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// Regression (security review): a background process holding the
+    /// program's output kept the agent waiting forever.
+    #[test]
+    fn background_children_do_not_hang_it() {
+        let (dir, p) = script("bg", "sleep 30 &\nexit 0");
+        let b = Exec::new(vec![p.display().to_string()]).unwrap();
+        let t = Instant::now();
+        b.check().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
