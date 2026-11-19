@@ -53,7 +53,9 @@ impl Tracker {
     /// Events older than `findtime` relative to `now` are ignored (catch-up
     /// of old log content never triggers bans).
     pub fn record(&mut self, key: IpKey, ts: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-        let cutoff = now - self.findtime;
+        let cutoff = now
+            .checked_sub_signed(self.findtime)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
         if ts < cutoff {
             return false;
         }
@@ -131,7 +133,9 @@ impl Tracker {
 
     /// Drops expired timestamps and empty keys.
     pub fn prune(&mut self, now: DateTime<Utc>) {
-        let cutoff = now - self.findtime;
+        let cutoff = now
+            .checked_sub_signed(self.findtime)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
         self.hits.retain(|_, e| {
             e.hits.retain(|t| *t >= cutoff);
             !e.hits.is_empty()

@@ -8,7 +8,17 @@
 use std::net::IpAddr;
 
 use aho_corasick::AhoCorasick;
-use regex::{Regex, RegexSet};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
+
+/// Bounds on a filter (filters may come from the controller, and the
+/// controller compiles filters sent through its API): pattern counts and
+/// lengths, and the compiled size of each regex and set - a short pattern
+/// like `\w{1000}` can otherwise take megabytes and seconds.
+pub const MAX_PATTERNS: usize = 100;
+pub const MAX_LITERALS: usize = 1000;
+pub const MAX_PATTERN_LEN: usize = 4096;
+const REGEX_SIZE: usize = 2 << 20;
+const SET_SIZE: usize = 16 << 20;
 use serde::Deserialize;
 
 /// Placeholder in filter patterns that is replaced by the host capture group.
@@ -48,6 +58,8 @@ pub enum FilterError {
     Regex(#[from] regex::Error),
     #[error(transparent)]
     Literals(#[from] aho_corasick::BuildError),
+    #[error("filter too large: {0}")]
+    TooLarge(String),
 }
 
 /// Result of a successful match.
@@ -73,6 +85,27 @@ impl Filter {
         if def.failregex.is_empty() {
             return Err(FilterError::Empty);
         }
+        if def.failregex.len() > MAX_PATTERNS || def.ignoreregex.len() > MAX_PATTERNS {
+            return Err(FilterError::TooLarge(format!(
+                "at most {MAX_PATTERNS} failregex and {MAX_PATTERNS} ignoreregex patterns"
+            )));
+        }
+        if def.literals.len() > MAX_LITERALS {
+            return Err(FilterError::TooLarge(format!(
+                "at most {MAX_LITERALS} literals"
+            )));
+        }
+        if def
+            .failregex
+            .iter()
+            .chain(&def.ignoreregex)
+            .chain(&def.literals)
+            .any(|p| p.len() > MAX_PATTERN_LEN)
+        {
+            return Err(FilterError::TooLarge(format!(
+                "patterns and literals have at most {MAX_PATTERN_LEN} bytes"
+            )));
+        }
         let mut patterns = Vec::with_capacity(def.failregex.len());
         for (index, p) in def.failregex.iter().enumerate() {
             if p.matches(HOST_TAG).count() != 1 {
@@ -85,9 +118,11 @@ impl Filter {
         }
         let regexes = patterns
             .iter()
-            .map(|p| Regex::new(p))
+            .map(|p| RegexBuilder::new(p).size_limit(REGEX_SIZE).build())
             .collect::<Result<Vec<_>, _>>()?;
-        let set = RegexSet::new(&patterns)?;
+        let set = RegexSetBuilder::new(&patterns)
+            .size_limit(SET_SIZE)
+            .build()?;
         let prefilter = if def.literals.is_empty() {
             None
         } else {
@@ -96,7 +131,11 @@ impl Filter {
         let ignore = if def.ignoreregex.is_empty() {
             None
         } else {
-            Some(RegexSet::new(&def.ignoreregex)?)
+            Some(
+                RegexSetBuilder::new(&def.ignoreregex)
+                    .size_limit(SET_SIZE)
+                    .build()?,
+            )
         };
         Ok(Self {
             name: name.into(),
@@ -217,5 +256,46 @@ mod tests {
         let f = Filter::compile("x", &def).unwrap();
         assert!(f.match_line("fail from 192.0.2.1").is_some());
         assert!(f.match_line("test-run fail from 192.0.2.1").is_none());
+    }
+
+    /// Regression (security review): a short pattern can compile to many
+    /// megabytes (memory and seconds of CPU per filter); counts and
+    /// lengths were unbounded.
+    #[test]
+    fn filters_are_bounded() {
+        let def = |fail: Vec<String>, ignore: Vec<String>| FilterDef {
+            literals: vec![],
+            failregex: fail,
+            ignoreregex: ignore,
+        };
+        let big = def(vec![r"x\w{2000}<HOST>".into()], vec![]);
+        assert!(
+            matches!(Filter::compile("f", &big), Err(FilterError::Regex(_))),
+            "size limit"
+        );
+        let many = def((0..101).map(|i| format!("a{i} <HOST>")).collect(), vec![]);
+        assert!(matches!(
+            Filter::compile("f", &many),
+            Err(FilterError::TooLarge(_))
+        ));
+        let ignores = def(
+            vec!["<HOST>".into()],
+            (0..101).map(|i| format!("i{i}")).collect(),
+        );
+        assert!(matches!(
+            Filter::compile("f", &ignores),
+            Err(FilterError::TooLarge(_))
+        ));
+        let long = def(vec![format!("{} <HOST>", "a".repeat(5000))], vec![]);
+        assert!(matches!(
+            Filter::compile("f", &long),
+            Err(FilterError::TooLarge(_))
+        ));
+        // ordinary filters still compile
+        let ok = def(
+            vec![r"Failed password for .* from <HOST> port \d+ ssh2$".into()],
+            vec![],
+        );
+        assert!(Filter::compile("f", &ok).is_ok());
     }
 }

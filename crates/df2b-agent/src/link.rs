@@ -140,13 +140,16 @@ pub fn parse_redaction(r: v1::RedactionRules) -> crate::state::CentralRedaction 
 /// Converts jail policies; implausible entries are dropped (logged), the
 /// rest applies.
 pub fn parse_jail_policies(p: v1::JailPolicies) -> crate::state::JailPolicies {
-    let dur = |ms: Option<i64>| -> Result<Option<Duration>, ()> {
+    let dur = |ms: Option<i64>, max: Duration| -> Result<Option<Duration>, ()> {
         match ms {
             None => Ok(None),
-            Some(ms) if ms > 0 => Ok(Some(Duration::from_millis(ms as u64))),
+            Some(ms) if ms > 0 && Duration::from_millis(ms as u64) <= max => {
+                Ok(Some(Duration::from_millis(ms as u64)))
+            }
             Some(_) => Err(()),
         }
     };
+    use crate::engine::{MAX_BANTIME, MAX_FINDTIME};
     let mut jails = Vec::new();
     for j in p.jails {
         let parsed = (|| {
@@ -160,10 +163,10 @@ pub fn parse_jail_policies(p: v1::JailPolicies) -> crate::state::JailPolicies {
                 jail: j.jail.clone(),
                 enabled: j.enabled,
                 maxretry: j.maxretry,
-                findtime: dur(j.findtime_ms)?,
-                bantime: dur(j.bantime_ms)?,
+                findtime: dur(j.findtime_ms, MAX_FINDTIME)?,
+                bantime: dur(j.bantime_ms, MAX_BANTIME)?,
                 factor: j.bantime_factor,
-                max_bantime: dur(j.max_bantime_ms)?,
+                max_bantime: dur(j.max_bantime_ms, MAX_BANTIME)?,
             })
         })();
         match parsed {
@@ -952,5 +955,32 @@ mod tests {
         *s.controller_ips.lock().unwrap() = vec!["198.51.100.10".parse().unwrap()];
         assert!(s.covers_controller(&"198.51.100.0/24".parse().unwrap()));
         assert!(!s.covers_controller(&"198.51.101.0/24".parse().unwrap()));
+    }
+
+    /// Regression (security review): a huge findtime from the controller
+    /// made the tracker's date arithmetic overflow - a panic, and with the
+    /// policy saved, a crash loop.
+    #[test]
+    fn implausible_policies_are_dropped() {
+        let p = |findtime_ms: Option<i64>| v1::JailPolicies {
+            version: "v".into(),
+            jails: vec![v1::JailPolicy {
+                jail: "sshd".into(),
+                findtime_ms,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(parse_jail_policies(p(Some(i64::MAX))).jails.len(), 0);
+        assert_eq!(parse_jail_policies(p(Some(8 * 86_400_000))).jails.len(), 0);
+        assert_eq!(parse_jail_policies(p(Some(600_000))).jails.len(), 1);
+        // and the tracker itself cannot overflow
+        let mut t = crate::tracker::Tracker::new(3, std::time::Duration::MAX, 10);
+        let now = Utc::now();
+        t.record(
+            df2b_core::IpKey::from_addr("192.0.2.1".parse().unwrap(), Default::default()),
+            now,
+            now,
+        );
+        t.prune(now);
     }
 }

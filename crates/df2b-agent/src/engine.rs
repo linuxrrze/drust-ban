@@ -122,6 +122,12 @@ pub struct Observed {
 /// Keys per report interval (memory bound).
 const MAX_OBSERVED: usize = 50_000;
 
+/// Longest window and ban the agent accepts from the controller (the
+/// controller enforces the same; a huge value would overflow the date
+/// arithmetic and crash the agent).
+pub const MAX_FINDTIME: Duration = Duration::from_secs(7 * 86400);
+pub const MAX_BANTIME: Duration = Duration::from_secs(10 * 365 * 86400);
+
 /// What a configuration reload ended.
 #[derive(Debug, Default, PartialEq)]
 pub struct Reloaded {

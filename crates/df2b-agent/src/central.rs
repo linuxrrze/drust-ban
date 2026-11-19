@@ -166,11 +166,19 @@ pub fn dot_like(c: &str) -> bool {
 
 /// Converts the controller's message; implausible jails are dropped.
 pub fn from_proto(c: v1::CentralJails) -> CentralJails {
-    let dur = |ms: i64| (ms > 0).then(|| Duration::from_millis(ms as u64));
+    use crate::engine::{MAX_BANTIME, MAX_FINDTIME};
+    let dur = |ms: i64, max: Duration| {
+        (ms > 0)
+            .then(|| Duration::from_millis(ms as u64))
+            .filter(|d| *d <= max)
+    };
     let mut jails = Vec::new();
     for j in c.jails {
-        let (Some(findtime), Some(bantime)) = (dur(j.findtime_ms), dur(j.bantime_ms)) else {
-            tracing::warn!(jail = %j.name, "ignoring central jail without findtime/bantime");
+        let (Some(findtime), Some(bantime)) = (
+            dur(j.findtime_ms, MAX_FINDTIME),
+            dur(j.bantime_ms, MAX_BANTIME),
+        ) else {
+            tracing::warn!(jail = %j.name, "ignoring central jail without plausible findtime/bantime");
             continue;
         };
         if j.maxretry == 0 || !j.bantime_factor.is_finite() || j.bantime_factor < 1.0 {
@@ -200,7 +208,7 @@ pub fn from_proto(c: v1::CentralJails) -> CentralJails {
             findtime,
             bantime,
             factor: j.bantime_factor,
-            max_bantime: dur(j.max_bantime_ms),
+            max_bantime: dur(j.max_bantime_ms, MAX_BANTIME),
         });
     }
     CentralJails {

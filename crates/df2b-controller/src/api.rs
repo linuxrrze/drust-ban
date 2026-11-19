@@ -1845,23 +1845,38 @@ struct FilterTest {
 }
 
 /// Runs a filter (not stored) against sample log lines.
+/// Filter tests running at once.
+static FILTER_TEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 async fn test_filter(caller: Caller, Json(req): Json<FilterTest>) -> ApiResult {
     caller.require(Role::Viewer)?;
     if req.lines.len() > 5000 || req.lines.iter().map(String::len).sum::<usize>() > 2 << 20 {
         return Err(ApiError::bad_request("at most 5000 lines / 2 MiB"));
     }
-    crate::central::validate_filter("test", &req.toml).map_err(ApiError::bad_request)?;
-    let def = df2b_matcher::FilterDef::from_toml(&req.toml).map_err(ApiError::bad_request_from)?;
-    let filter = df2b_matcher::Filter::compile("test", &def).map_err(ApiError::bad_request_from)?;
-    let mut matches = Vec::new();
-    for (i, line) in req.lines.iter().enumerate() {
-        if let Some(m) = filter.match_line(line) {
-            matches.push(json!({ "line": i + 1, "ip": m.ip, "pattern": m.pattern }));
+    // compiling and matching are CPU work: off the async workers (they
+    // also serve the agents), two at a time
+    let _slot = FILTER_TEST_SLOTS
+        .acquire()
+        .await
+        .map_err(ApiError::internal)?;
+    tokio::task::spawn_blocking(move || {
+        crate::central::validate_filter("test", &req.toml).map_err(ApiError::bad_request)?;
+        let def =
+            df2b_matcher::FilterDef::from_toml(&req.toml).map_err(ApiError::bad_request_from)?;
+        let filter =
+            df2b_matcher::Filter::compile("test", &def).map_err(ApiError::bad_request_from)?;
+        let mut matches = Vec::new();
+        for (i, line) in req.lines.iter().enumerate() {
+            if let Some(m) = filter.match_line(line) {
+                matches.push(json!({ "line": i + 1, "ip": m.ip, "pattern": m.pattern }));
+            }
         }
-    }
-    Ok(Json(
-        json!({ "lines": req.lines.len(), "matched": matches.len(), "matches": matches }),
-    ))
+        Ok(Json(
+            json!({ "lines": req.lines.len(), "matched": matches.len(), "matches": matches }),
+        ))
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
 async fn list_jail_defs(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
