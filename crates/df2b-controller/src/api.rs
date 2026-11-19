@@ -2958,6 +2958,11 @@ async fn ban(
             "{net} is too broad (minimum /8 for IPv4, /16 for IPv6)"
         )));
     }
+    if df2b_core::reserved(&net) {
+        return Err(ApiError::bad_request(format!(
+            "{net} overlaps a reserved range (loopback, link-local, multicast)"
+        )));
+    }
     if ctl.allowlisted(&net) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,

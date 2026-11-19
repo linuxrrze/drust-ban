@@ -1159,6 +1159,16 @@ impl Controller {
     }
 
     /// controller time - agent time, from the last heartbeat.
+    /// Active bans made from this origin's reports.
+    pub fn active_by(&self, origin: &Origin) -> usize {
+        let now = Utc::now();
+        self.lock()
+            .active
+            .values()
+            .filter(|d| d.origin == *origin && d.is_active(now))
+            .count()
+    }
+
     pub fn clock_skew_ms(&self, agent: &str) -> i64 {
         self.lock().status.get(agent).map_or(0, |s| s.clock_skew_ms)
     }

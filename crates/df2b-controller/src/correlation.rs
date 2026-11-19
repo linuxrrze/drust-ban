@@ -30,6 +30,12 @@ pub const MIN_KEEP: Duration = Duration::from_secs(3600);
 pub const MAX_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// Memory bound: addresses tracked at once.
 const MAX_KEYS: usize = 200_000;
+/// Addresses one agent may bring in (the rest stays for the others: one
+/// agent must not blind correlation).
+const MAX_KEYS_PER_AGENT: usize = MAX_KEYS / 8;
+/// Entries per agent and address; more reports from that agent are merged
+/// into its newest one (bounds memory and the scan per observation).
+const MAX_PER_AGENT_KEY: usize = 64;
 /// Observations accepted per agent and minute (§4.5 abuse safeguard).
 pub const MAX_PER_AGENT_MINUTE: u32 = 20_000;
 /// Monitor-mode hits kept for the UI.
@@ -217,6 +223,9 @@ pub struct Trigger {
 #[derive(Default)]
 pub struct Correlator {
     seen: HashMap<(String, IpNet), VecDeque<Seen>>,
+    /// which agent brought each address in, and how many each brought
+    owners: HashMap<(String, IpNet), String>,
+    owned: HashMap<String, usize>,
     /// the latest sample lines per (jail, key), oldest first
     samples: HashMap<(String, IpNet), VecDeque<Sample>>,
     /// lines in `samples`
@@ -272,15 +281,21 @@ impl Correlator {
 
     fn insert(&mut self, jail: &str, key: IpNet, mut s: Seen) -> bool {
         let k = (jail.to_owned(), key);
-        if !self.seen.contains_key(&k) && self.seen.len() >= MAX_KEYS {
-            self.dropped += 1;
-            if self.dropped.is_power_of_two() {
-                tracing::warn!(
-                    dropped = self.dropped,
-                    "correlation: too many addresses, dropping"
-                );
+        if !self.seen.contains_key(&k) {
+            let mine = self.owned.get(&s.agent).copied().unwrap_or(0);
+            if self.seen.len() >= MAX_KEYS || mine >= MAX_KEYS_PER_AGENT {
+                self.dropped += 1;
+                if self.dropped.is_power_of_two() {
+                    tracing::warn!(
+                        dropped = self.dropped,
+                        agent = %s.agent,
+                        "correlation: too many addresses, dropping"
+                    );
+                }
+                return false;
             }
-            return false;
+            self.owners.insert(k.clone(), s.agent.clone());
+            *self.owned.entry(s.agent.clone()).or_default() += 1;
         }
         if let Some(line) = s.sample.take() {
             self.add_sample(
@@ -293,6 +308,16 @@ impl Correlator {
             );
         }
         let q = self.seen.entry(k).or_default();
+        if q.iter().filter(|e| e.agent == s.agent).count() >= MAX_PER_AGENT_KEY {
+            // merge into this agent's newest entry
+            if let Some(i) = q.iter().rposition(|e| e.agent == s.agent) {
+                let mut e = q.remove(i).expect("found");
+                e.failures = e.failures.saturating_add(s.failures);
+                e.banned |= s.banned;
+                e.at = e.at.max(s.at);
+                s = e;
+            }
+        }
         // agents report in order, but several agents interleave: keep the
         // queue sorted so pruning from the front stays correct
         let pos = q.iter().rposition(|e| e.at <= s.at).map_or(0, |i| i + 1);
@@ -474,6 +499,12 @@ impl Correlator {
             }
             !q.is_empty()
         });
+        let seen = &self.seen;
+        self.owners.retain(|k, _| seen.contains_key(k));
+        self.owned.clear();
+        for agent in self.owners.values() {
+            *self.owned.entry(agent.clone()).or_default() += 1;
+        }
         let mut count = 0;
         self.samples.retain(|_, q| {
             q.retain(|s| s.at >= since);
@@ -670,6 +701,56 @@ pub(crate) mod tests {
         c.prune(now + TimeDelta::hours(1), Duration::from_secs(60));
         assert!(c.samples(&key).is_empty());
         assert_eq!(c.sample_count, 0);
+    }
+
+    /// Regression (security review): one agent could grow an address's
+    /// queue without bound (scanned on every observation) and fill the
+    /// whole address table.
+    #[test]
+    fn per_agent_bounds() {
+        let now = Utc::now();
+        let key: IpNet = "203.0.113.7/32".parse().unwrap();
+        let mut c = Correlator::default();
+        for i in 0..1000 {
+            c.record(
+                "sshd",
+                key,
+                seen("a1", "web", now - TimeDelta::seconds(1000 - i), 1, false),
+            );
+        }
+        c.record("sshd", key, seen("a2", "web", now, 1, false));
+        let q = c.recent(&key);
+        assert_eq!(
+            q.iter().filter(|s| s.2.agent == "a1").count(),
+            MAX_PER_AGENT_KEY
+        );
+        let total: u32 = q
+            .iter()
+            .filter(|s| s.2.agent == "a1")
+            .map(|s| s.2.failures)
+            .sum();
+        assert_eq!(total, 1000, "merged, not lost");
+        assert_eq!(q.iter().filter(|s| s.2.agent == "a2").count(), 1);
+
+        let mut c = Correlator::default();
+        let mut stored = 0;
+        for i in 0..(MAX_KEYS_PER_AGENT as u32 + 10) {
+            let k = IpNet::from(std::net::IpAddr::V4((0x0a00_0000 + i).into()));
+            stored += c.record("sshd", k, seen("a1", "web", now, 1, false)) as usize;
+        }
+        assert_eq!(stored, MAX_KEYS_PER_AGENT);
+        let other = IpNet::from(std::net::IpAddr::V4(0xc000_0201u32.into()));
+        assert!(
+            c.record("sshd", other, seen("a2", "web", now, 1, false)),
+            "others still get in"
+        );
+        // pruned keys free the agent's share
+        c.prune(now + TimeDelta::days(2), Duration::from_secs(3600));
+        assert!(c.record(
+            "sshd",
+            key,
+            seen("a1", "web", now + TimeDelta::days(2), 1, false)
+        ));
     }
 
     #[test]

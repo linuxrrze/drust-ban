@@ -10,6 +10,6 @@ pub mod sample;
 pub use allowlist::Allowlist;
 pub use bantime::escalated_bantime;
 pub use decision::{AgentId, Decision, DecisionKind, Origin, Scope};
-pub use ip::{parse_target, IpKey, PrefixPolicy};
+pub use ip::{parse_target, reserved, IpKey, PrefixPolicy};
 pub use redact::{RedactRule, Redactor};
 pub use sample::sample_line;

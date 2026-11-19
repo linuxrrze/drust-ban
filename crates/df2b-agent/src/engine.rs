@@ -201,9 +201,11 @@ pub struct Engine {
 
 /// Local (configuration) or central (controller) allowlist.
 fn allowed(local: &Allowlist, central: &Allowlist, ip: &std::net::IpAddr, net: &IpNet) -> bool {
-    [local, central]
-        .iter()
-        .any(|a| a.contains_addr(ip) || a.overlaps(net))
+    // loopback, link-local, multicast...: banning them only hurts the host
+    df2b_core::reserved(net)
+        || [local, central]
+            .iter()
+            .any(|a| a.contains_addr(ip) || a.overlaps(net))
 }
 
 impl Engine {
@@ -445,7 +447,7 @@ impl Engine {
             IpNet::V4(n) => n.prefix_len() < 8,
             IpNet::V6(n) => n.prefix_len() < 16,
         };
-        too_broad || self.allowlisted(net)
+        too_broad || df2b_core::reserved(net) || self.allowlisted(net)
     }
 
     /// Whether `net` overlaps the configured or the central allowlist.

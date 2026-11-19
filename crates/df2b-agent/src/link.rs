@@ -40,6 +40,8 @@ use uuid::Uuid;
 use crate::outbox::Outbox;
 
 const HEARTBEAT: Duration = Duration::from_secs(10);
+/// Largest message from the controller (a snapshot of ~450 000 bans).
+const MAX_MESSAGE: usize = 64 << 20;
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const REPORT_BATCH: usize = 1000;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -70,6 +72,19 @@ pub struct LinkStats {
     pub firewall: Arc<crate::health::FirewallHealth>,
     /// A session with the controller is up.
     pub connected: std::sync::atomic::AtomicBool,
+    /// The controller's addresses: never banned here (that would cut the
+    /// agent off from the unban).
+    pub controller_ips: std::sync::Mutex<Vec<std::net::IpAddr>>,
+}
+
+impl LinkStats {
+    /// Whether `net` contains one of the controller's addresses.
+    pub fn covers_controller(&self, net: &IpNet) -> bool {
+        self.controller_ips
+            .lock()
+            .map(|v| v.iter().any(|ip| net.contains(ip)))
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,8 +585,15 @@ impl Task {
     }
 
     async fn session(&mut self, id: &mut Identity, connected: &mut bool) -> anyhow::Result<End> {
+        if let Ok(addrs) = tokio::net::lookup_host(self.cfg.addr.as_str()).await {
+            let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+            if let Ok(mut v) = self.stats.controller_ips.lock() {
+                *v = ips;
+            }
+        }
         let channel = transport::connect(self.cfg.addr.clone(), id.client_config()?).await?;
-        let mut client = AgentServiceClient::new(channel);
+        // a snapshot of many bans exceeds tonic's 4 MiB default
+        let mut client = AgentServiceClient::new(channel).max_decoding_message_size(MAX_MESSAGE);
         let mut stream = client
             .subscribe(v1::SubscribeRequest {
                 from_seq: self.last_seq,
@@ -922,5 +944,13 @@ mod tests {
             rate_limited(10, &ack(u32::MAX, Some(99))),
             Some((10, MAX_HOLD))
         );
+    }
+
+    #[test]
+    fn controller_address_is_never_banned() {
+        let s = LinkStats::default();
+        *s.controller_ips.lock().unwrap() = vec!["198.51.100.10".parse().unwrap()];
+        assert!(s.covers_controller(&"198.51.100.0/24".parse().unwrap()));
+        assert!(!s.covers_controller(&"198.51.101.0/24".parse().unwrap()));
     }
 }

@@ -474,7 +474,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let mut changes = remote.apply(ev, now, |net| engine.is_banned(net, now));
                 changes.ban.retain(|b| {
-                    let refuse = engine.refuses_remote(&b.net);
+                    let refuse = engine.refuses_remote(&b.net) || stats.covers_controller(&b.net);
                     if refuse {
                         warn!(target = %b.net, "refusing a controller ban: allowlisted here or too broad");
                     }
@@ -587,7 +587,7 @@ async fn main() -> anyhow::Result<()> {
                     expected.add(m.target, m.until);
                 }
                 for (target, until, _) in remote.list(now) {
-                    if !engine.refuses_remote(&target) {
+                    if !engine.refuses_remote(&target) && !stats.covers_controller(&target) {
                         expected.add(target, until);
                     }
                 }

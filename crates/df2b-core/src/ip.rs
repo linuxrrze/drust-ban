@@ -85,6 +85,28 @@ pub fn parse_target(s: &str) -> Result<IpNet, String> {
         .map_err(|_| format!("not an IP address or prefix: {s}"))
 }
 
+/// Networks no ban may touch: loopback, unspecified ("this network"),
+/// link-local, multicast and the IPv4 broadcast address (banning them
+/// breaks the host itself, never an attacker).
+pub fn reserved(net: &IpNet) -> bool {
+    const RESERVED: [&str; 10] = [
+        "0.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "224.0.0.0/4",
+        "255.255.255.255/32",
+        "::/128",
+        "::1/128",
+        "fe80::/10",
+        "ff00::/8",
+        "::ffff:127.0.0.0/104",
+    ];
+    RESERVED.iter().any(|r| {
+        let r: IpNet = r.parse().expect("valid");
+        r.contains(net) || net.contains(&r)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +151,25 @@ mod tests {
             "2001:db8::/48"
         );
         assert!(parse_target("example.org").is_err());
+    }
+
+    #[test]
+    fn reserved_ranges() {
+        for n in [
+            "127.0.0.1/32",
+            "64.0.0.0/2",
+            "0.0.0.0/0",
+            "::1/128",
+            "fe80::1/128",
+            "ff02::1/128",
+            "224.0.0.0/24",
+            "::/0",
+            "::ffff:127.0.0.1/128",
+        ] {
+            assert!(reserved(&n.parse().unwrap()), "{n}");
+        }
+        for n in ["192.0.2.1/32", "203.0.113.0/24", "2001:db8::/48"] {
+            assert!(!reserved(&n.parse().unwrap()), "{n}");
+        }
     }
 }

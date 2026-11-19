@@ -67,6 +67,20 @@ fn invalid_token() -> Status {
 
 /// Agents report /32 and /64 keys by default; anything much broader from a
 /// single agent is suspicious (DESIGN.md §4.5).
+/// Active bans one agent's reports may hold (a compromised agent must not
+/// ban the whole address space).
+const MAX_ACTIVE_PER_AGENT: usize = if cfg!(test) { 50 } else { 20_000 };
+/// Longest ban an agent report creates (its own escalation may go longer
+/// locally; the network-wide decision does not).
+const MAX_AGENT_BAN: chrono::TimeDelta = chrono::TimeDelta::days(90);
+/// Largest clock difference to an agent that is believed.
+const MAX_SKEW_MS: i64 = 86_400_000;
+
+/// A jail name from an agent: valid, or the observation is ignored.
+fn agent_jail(j: &str) -> Option<String> {
+    crate::policy::valid_jail(j).then(|| j.to_owned())
+}
+
 fn too_broad(net: &IpNet) -> bool {
     match net {
         IpNet::V4(n) => n.prefix_len() < 24,
@@ -119,16 +133,21 @@ impl Service {
             let Ok(net) = o.key.parse::<IpNet>().map(|n| n.trunc()) else {
                 continue;
             };
-            if too_broad(&net) || self.ctl.allowlisted(&net) {
+            if too_broad(&net) || df2b_core::reserved(&net) || self.ctl.allowlisted(&net) {
                 continue;
             }
-            let at = from_unix_ms(o.last_seen_unix_ms).map_or(now, |t| (t + skew).min(now));
+            let Some(jail) = agent_jail(&o.jail) else {
+                continue;
+            };
+            let at = from_unix_ms(o.last_seen_unix_ms)
+                .and_then(|t| t.checked_add_signed(skew))
+                .map_or(now, |t| t.min(now));
             if at < oldest {
                 continue;
             }
             parsed.push((
                 i,
-                o.jail.clone(),
+                jail,
                 net,
                 at,
                 if banned { 0 } else { o.count },
@@ -268,10 +287,14 @@ impl AgentService for Service {
         let h = req.into_inner();
         let now_ms = Utc::now().timestamp_millis();
         self.ctl.update_status(&record.id, |s| {
-            s.agent_version = h.agent_version;
+            // strings from the agent: bounded
+            let cut = |v: String, n: usize| v.chars().take(n).collect::<String>();
+            s.agent_version = cut(h.agent_version, 64);
             s.active_bans = h.active_bans;
-            s.clock_skew_ms = now_ms - h.agent_time_unix_ms;
-            s.firewall_backend = h.firewall_backend;
+            s.clock_skew_ms = now_ms
+                .saturating_sub(h.agent_time_unix_ms)
+                .clamp(-MAX_SKEW_MS, MAX_SKEW_MS);
+            s.firewall_backend = cut(h.firewall_backend, 32);
             s.firewall_healthy = h.firewall_healthy;
             s.firewall_error = h.firewall_error.chars().take(512).collect();
             s.sources = h
@@ -287,9 +310,9 @@ impl AgentService for Service {
                 })
                 .collect();
             s.last_applied_seq = h.last_applied_seq;
-            s.allowlist_version = h.allowlist_version;
-            s.jail_policies_version = h.jail_policies_version;
-            s.central_jails_version = h.central_jails_version;
+            s.allowlist_version = cut(h.allowlist_version, 64);
+            s.jail_policies_version = cut(h.jail_policies_version, 64);
+            s.central_jails_version = cut(h.central_jails_version, 64);
             s.redaction_version = h.redaction_version.chars().take(64).collect();
             let secs = |ms: i64| u64::try_from(ms / 1000).unwrap_or(0);
             s.jails = h
@@ -412,8 +435,16 @@ impl AgentService for Service {
                 });
             }
         }
+        let mut quota = MAX_ACTIVE_PER_AGENT.saturating_sub(
+            self.ctl
+                .active_by(&Origin::Agent(AgentId(record.id.clone()))),
+        );
         for o in batch.iter().filter(|o| o.locally_banned) {
             let Some(scope) = scope.clone() else { break };
+            if quota == 0 {
+                warn!(agent = %record.id, max = MAX_ACTIVE_PER_AGENT, "agent has too many active bans, ignoring more");
+                break;
+            }
             let Ok(net) = o.key.parse::<IpNet>().map(|n| n.trunc()) else {
                 warn!(agent = %record.id, key = %o.key, "ignoring malformed key");
                 continue;
@@ -422,20 +453,38 @@ impl AgentService for Service {
                 warn!(agent = %record.id, %net, "ignoring overly broad ban");
                 continue;
             }
+            if df2b_core::reserved(&net) {
+                warn!(agent = %record.id, %net, "ignoring ban of a reserved range");
+                continue;
+            }
             if self.ctl.allowlisted(&net) {
                 warn!(agent = %record.id, %net, "ignoring ban overlapping the allowlist");
                 continue;
             }
-            let expires_at = from_unix_ms(o.local_ban_expires_unix_ms);
-            if expires_at.is_some_and(|e| e <= now) {
+            // agents always send an expiry: none (0) is not "permanent"
+            let Some(expires_at) = from_unix_ms(o.local_ban_expires_unix_ms) else {
+                warn!(agent = %record.id, %net, "ignoring ban without expiry");
+                continue;
+            };
+            if expires_at <= now {
                 continue;
             }
+            let expires_at = expires_at.min(now + MAX_AGENT_BAN);
+            let Some(jail) = (if o.jail.is_empty() {
+                Some(None)
+            } else {
+                agent_jail(&o.jail).map(Some)
+            }) else {
+                warn!(agent = %record.id, "ignoring ban with an invalid jail name");
+                continue;
+            };
+            quota -= 1;
             new.push(NewDecision {
                 kind: DecisionKind::Ban,
                 target: net,
                 scope,
-                jail: (!o.jail.is_empty()).then(|| o.jail.clone()),
-                expires_at,
+                jail,
+                expires_at: Some(expires_at),
                 origin: Origin::Agent(AgentId(record.id.clone())),
                 reason: format!("local ban on {}: {} failures", record.id, o.count),
             });
@@ -1521,6 +1570,83 @@ mod tests {
         assert!(ack.retry_after_ms > 0 && ack.retry_after_ms <= 60_000);
         // the deferred ban report made no decision (it comes again)
         assert!(ctl.active_decisions().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (security review): agent reports could create permanent
+    /// bans (expiry 0), bans of reserved ranges, unbounded jail names (a
+    /// multi-MB name made every agent's snapshot undecodable) and any
+    /// number of active bans; an absurd clock made the skew overflow.
+    #[tokio::test]
+    async fn agent_input_is_validated() {
+        let dir = std::env::temp_dir().join(format!("df2b-ctl-grpc-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (addr, ctl) = start(&dir).await;
+        let mut a = enrolled(&addr, &ctl, &dir, "host-1").await;
+        let ban = |key: &str, jail: &str, expires_ms: i64| v1::Observation {
+            key: key.into(),
+            jail: jail.into(),
+            count: 5,
+            last_seen_unix_ms: Utc::now().timestamp_millis(),
+            locally_banned: true,
+            local_ban_expires_unix_ms: expires_ms,
+            ..Default::default()
+        };
+        let hour = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis();
+        let year = (Utc::now() + chrono::Duration::days(365)).timestamp_millis();
+        a.report(v1::ObservationBatch {
+            observations: vec![
+                ban("192.0.2.1/32", "sshd", 0),                  // no expiry
+                ban("127.0.0.0/24", "sshd", hour),               // reserved
+                ban("192.0.2.2/32", &"j".repeat(100_000), hour), // jail
+                ban("192.0.2.3/32", "bad name", hour),           // jail
+                ban("192.0.2.4/32", "sshd", year),               // capped
+            ],
+        })
+        .await
+        .unwrap();
+        let d = ctl.active_decisions();
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].target.to_string(), "192.0.2.4/32");
+        let left = d[0].expires_at.unwrap() - Utc::now();
+        assert!(left <= chrono::Duration::days(90), "capped at 90 days");
+
+        // quota of active bans per agent
+        let many: Vec<_> = (0..200u32)
+            .map(|i| {
+                ban(
+                    &format!("198.51.{}.{}/32", 100 + i / 250, i % 250),
+                    "sshd",
+                    hour,
+                )
+            })
+            .collect();
+        a.report(v1::ObservationBatch { observations: many })
+            .await
+            .unwrap();
+        assert_eq!(ctl.active_decisions().len(), MAX_ACTIVE_PER_AGENT);
+
+        // an absurd clock: no overflow, skew clamped
+        a.heartbeat(v1::HeartbeatRequest {
+            agent_time_unix_ms: -(1i64 << 62),
+            agent_version: "x".repeat(10_000),
+            ..heartbeat()
+        })
+        .await
+        .unwrap();
+        assert_eq!(ctl.clock_skew_ms(&ctl.agents()[0].record.id), MAX_SKEW_MS);
+        a.report(v1::ObservationBatch {
+            observations: vec![v1::Observation {
+                key: "192.0.2.50/32".into(),
+                jail: "sshd".into(),
+                count: 1,
+                last_seen_unix_ms: i64::MAX,
+                ..Default::default()
+            }],
+        })
+        .await
+        .unwrap();
+        assert_eq!(ctl.agents()[0].status.agent_version.len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
