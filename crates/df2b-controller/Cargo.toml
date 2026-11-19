@@ -15,9 +15,12 @@ df2b-core.workspace = true
 df2b-proto.workspace = true
 df2b-tls.workspace = true
 humantime.workspace = true
+humantime-serde.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 ipnet.workspace = true
+openidconnect.workspace = true
+reqwest.workspace = true
 redb.workspace = true
 ring.workspace = true
 rpassword.workspace = true
@@ -29,6 +32,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
+toml.workspace = true
 tonic.workspace = true
 tower.workspace = true
 tracing.workspace = true
@@ -36,4 +40,3 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-reqwest.workspace = true

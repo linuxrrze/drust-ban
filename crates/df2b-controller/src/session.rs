@@ -6,9 +6,10 @@
 //! restart logs everybody out. Each session has a CSRF token that requests
 //! other than GET/HEAD must echo in `X-CSRF-Token`.
 //!
-//! Sessions end after `IDLE` without requests, after `MAX_AGE`, on logout,
-//! and as soon as the user is deleted or their password changes (the user
-//! file is read on every request).
+//! Sessions end after `IDLE` without requests, after their maximum age
+//! (`MAX_AGE`, OIDC: `session_lifetime`), on logout, and for local users as
+//! soon as the user is deleted or their password changes (the user file is
+//! read on every request). OIDC sessions keep the role from the login.
 //!
 //! Failed logins are limited per client (IPv6: per /64) and per user name.
 
@@ -21,6 +22,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 
+use crate::files::Role;
+
 pub const COOKIE: &str = "__Host-df2b_session";
 pub const CSRF_HEADER: &str = "x-csrf-token";
 pub const IDLE: Duration = Duration::from_secs(4 * 3600);
@@ -31,14 +34,29 @@ const MAX_FAILURES_PER_CLIENT: u32 = 10;
 const MAX_FAILURES_PER_USER: u32 = 30;
 const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
+/// How the user logged in.
+#[derive(Debug, Clone)]
+pub enum Kind {
+    /// Local user; the user's `password_changed_at` at login.
+    Password { password_changed_at: DateTime<Utc> },
+    /// OpenID Connect; role as mapped at login.
+    Oidc { role: Role },
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub user: String,
     pub csrf: String,
-    /// The user's `password_changed_at` at login.
-    pub password_changed_at: DateTime<Utc>,
+    pub kind: Kind,
+    max_age: Duration,
     created: Instant,
     last_used: Instant,
+}
+
+impl Session {
+    fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.created) > self.max_age || now.duration_since(self.last_used) > IDLE
+    }
 }
 
 #[derive(Default)]
@@ -137,13 +155,14 @@ impl Sessions {
     }
 
     /// Creates a session; returns the cookie secret and the session.
-    pub fn create(&self, user: &str, password_changed_at: DateTime<Utc>) -> (String, Session) {
+    pub fn create(&self, user: &str, kind: Kind, max_age: Duration) -> (String, Session) {
         let secret = random_token();
         let now = Instant::now();
         let s = Session {
             user: user.to_owned(),
             csrf: random_token(),
-            password_changed_at,
+            kind,
+            max_age: max_age.min(MAX_AGE),
             created: now,
             last_used: now,
         };
@@ -157,7 +176,7 @@ impl Sessions {
         let mut map = Self::lock(&self.sessions);
         let k = key(secret);
         let s = map.get_mut(&k)?;
-        if now.duration_since(s.created) > MAX_AGE || now.duration_since(s.last_used) > IDLE {
+        if s.expired(now) {
             map.remove(&k);
             return None;
         }
@@ -172,9 +191,7 @@ impl Sessions {
     /// Drops expired sessions and old failure counters.
     pub fn prune(&self) {
         let now = Instant::now();
-        Self::lock(&self.sessions).retain(|_, s| {
-            now.duration_since(s.created) <= MAX_AGE && now.duration_since(s.last_used) <= IDLE
-        });
+        Self::lock(&self.sessions).retain(|_, s| !s.expired(now));
         Self::lock(&self.by_client).retain(|_, f| f.current(now) > 0);
         Self::lock(&self.by_user).retain(|_, f| f.current(now) > 0);
     }
@@ -211,14 +228,22 @@ pub fn from_cookie_header(header: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    fn pw() -> Kind {
+        Kind::Password {
+            password_changed_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn sessions() {
         let s = Sessions::default();
-        let t = Utc::now();
-        let (secret, sess) = s.create("alice", t);
+        let (secret, sess) = s.create("alice", pw(), MAX_AGE);
         assert_eq!(s.get(&secret).unwrap().csrf, sess.csrf);
         assert!(s.get("nope").is_none());
-        let (other, _) = s.create("bob", t);
+        let (other, _) = s.create("bob", pw(), MAX_AGE);
+        let (short, _) = s.create("carol", pw(), Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(s.get(&short).is_none(), "per-session maximum age");
         s.remove(&secret);
         assert!(s.get(&secret).is_none());
         assert!(s.get(&other).is_some());
@@ -227,7 +252,7 @@ mod tests {
 
     #[test]
     fn cookies() {
-        let (secret, _) = Sessions::default().create("a", Utc::now());
+        let (secret, _) = Sessions::default().create("a", pw(), MAX_AGE);
         let h = format!("theme=dark; {COOKIE}={secret}; x=y");
         assert_eq!(from_cookie_header(&h), Some(secret.as_str()));
         assert_eq!(from_cookie_header("theme=dark"), None);

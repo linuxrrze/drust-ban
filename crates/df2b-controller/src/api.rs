@@ -3,14 +3,15 @@
 //! Authentication, either
 //! - `Authorization: Bearer df2bapi1.<secret>` (CLI, scripts). Tokens are
 //!   created with `df2b-controller api-token create --name <n> --role <r>`;
-//! - or a session cookie from `POST /api/v1/session` (web UI, users created
-//!   with `df2b-controller user add`); see session.rs for CSRF protection.
+//! - or a session cookie (web UI) from `POST /api/v1/session` (local users,
+//!   `df2b-controller user add`) or an OpenID Connect login (oidc.rs); see
+//!   session.rs for CSRF protection.
 //!
 //! Roles are `viewer` < `operator` (ban/unban) < `admin` (agents, enrollment
 //! tokens, audit log). Every change is written to the audit log with the
 //! token or user name and client address.
 //!
-//! TODO: OIDC, OpenAPI (utoipa).
+//! TODO: OpenAPI (utoipa).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -91,7 +92,11 @@ type ApiResult<T = Json<Value>> = Result<T, ApiError>;
 #[derive(Debug, Clone)]
 pub enum Auth {
     Token(ApiToken),
-    Session { secret: String, csrf: String },
+    Session {
+        secret: String,
+        csrf: String,
+        oidc: bool,
+    },
 }
 
 /// The authenticated caller of a request.
@@ -108,21 +113,29 @@ fn unauthorized(m: &str) -> ApiError {
     ApiError::new(StatusCode::UNAUTHORIZED, m)
 }
 
-/// The user behind a session, if the session is still valid. Blocking.
+/// The user and role behind a session, if the session is still valid.
+/// Blocking.
 fn session_user(
     ctl: &Controller,
     secret: &str,
-) -> anyhow::Result<Option<(files::UserFile, session::Session)>> {
+) -> anyhow::Result<Option<(String, Role, session::Session)>> {
     let Some(s) = ctl.sessions.get(secret) else {
         return Ok(None);
     };
-    match files::load_user(&ctl.settings.state_dir, &s.user)? {
-        Some(u) if u.password_changed_at == s.password_changed_at => Ok(Some((u, s))),
-        _ => {
-            // user deleted or password changed
-            ctl.sessions.remove(secret);
-            Ok(None)
-        }
+    match &s.kind {
+        session::Kind::Password {
+            password_changed_at,
+        } => match files::load_user(&ctl.settings.state_dir, &s.user)? {
+            Some(u) if u.password_changed_at == *password_changed_at => {
+                Ok(Some((u.name, u.role, s)))
+            }
+            _ => {
+                // user deleted or password changed
+                ctl.sessions.remove(secret);
+                Ok(None)
+            }
+        },
+        session::Kind::Oidc { role, .. } => Ok(Some((s.user.clone(), *role, s))),
     }
 }
 
@@ -219,7 +232,7 @@ impl FromRequestParts<Arc<Controller>> for Caller {
             .await
             .map_err(ApiError::internal)?
             .map_err(ApiError::internal)?;
-        let Some((user, sess)) = found else {
+        let Some((name, role, sess)) = found else {
             return Err(unauthorized("session expired, please log in again"));
         };
         // cookies are sent by the browser automatically; the CSRF token
@@ -237,12 +250,13 @@ impl FromRequestParts<Arc<Controller>> for Caller {
             }
         }
         Ok(Caller {
-            name: user.name,
-            role: user.role,
+            name,
+            role,
             addr,
             auth: Auth::Session {
                 secret,
                 csrf: sess.csrf,
+                oidc: matches!(sess.kind, session::Kind::Oidc { .. }),
             },
         })
     }
@@ -265,6 +279,9 @@ pub fn router(ctl: Arc<Controller>) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/session", post(login).delete(logout))
+        .route("/api/v1/auth-methods", get(auth_methods))
+        .route("/api/v1/oidc/login", get(oidc_login))
+        .route("/api/v1/oidc/callback", get(oidc_callback))
         .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/status", get(status))
         .route("/api/v1/stats", get(stats))
@@ -295,11 +312,27 @@ async fn health() -> Json<Value> {
 }
 
 async fn whoami(caller: Caller) -> Json<Value> {
-    let (auth, csrf) = match &caller.auth {
-        Auth::Token(_) => ("token", None),
-        Auth::Session { csrf, .. } => ("session", Some(csrf)),
+    let (auth, method, csrf) = match &caller.auth {
+        Auth::Token(_) => ("token", "token", None),
+        Auth::Session { csrf, oidc, .. } => (
+            "session",
+            if *oidc { "oidc" } else { "password" },
+            Some(csrf),
+        ),
     };
-    Json(json!({ "name": caller.name, "role": caller.role, "auth": auth, "csrf_token": csrf }))
+    Json(json!({
+        "name": caller.name, "role": caller.role, "auth": auth,
+        "method": method, "csrf_token": csrf,
+    }))
+}
+
+/// Unauthenticated: which login methods the UI offers.
+async fn auth_methods(State(ctl): State<Arc<Controller>>) -> Json<Value> {
+    let oidc = ctl.settings.oidc.as_ref();
+    Json(json!({
+        "password": oidc.map_or(true, |o| !o.config.disable_password_login),
+        "oidc": oidc.map(|o| json!({ "name": o.config.display_name })),
+    }))
 }
 
 // ----------------------------------------------------------------- sessions
@@ -320,6 +353,17 @@ async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
     let ip = Some(addr.ip());
+    if ctl
+        .settings
+        .oidc
+        .as_ref()
+        .is_some_and(|o| o.config.disable_password_login)
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "password login is disabled, use single sign-on",
+        ));
+    }
     if req.username.len() > 64 || req.password.len() > 1024 {
         return Err(unauthorized("invalid user name or password"));
     }
@@ -353,26 +397,173 @@ async fn login(
         warn!(%addr, user = %req.username, "failed login");
         return Err(unauthorized("invalid user name or password"));
     };
-    let (secret, sess) = ctl.sessions.create(&user.name, user.password_changed_at);
+    let (secret, sess) = ctl.sessions.create(
+        &user.name,
+        session::Kind::Password {
+            password_changed_at: user.password_changed_at,
+        },
+        session::MAX_AGE,
+    );
     let c = ctl.clone();
     let name = user.name.clone();
-    blocking(move || c.audit(&name, Some(addr.to_string()), "session.login", json!({}))).await?;
+    blocking(move || {
+        c.audit(
+            &name,
+            Some(addr.to_string()),
+            "session.login",
+            json!({ "method": "password" }),
+        )
+    })
+    .await?;
     Ok((
         [(header::SET_COOKIE, session::set_cookie(&secret))],
-        Json(json!({ "name": user.name, "role": user.role, "auth": "session", "csrf_token": sess.csrf })),
+        Json(json!({
+            "name": user.name, "role": user.role, "auth": "session",
+            "method": "password", "csrf_token": sess.csrf,
+        })),
     )
         .into_response())
 }
 
+/// Ends the session. For OIDC sessions the response names the provider's
+/// logout page (if it has one), otherwise "Sign in" would log straight in.
 async fn logout(caller: Caller, State(ctl): State<Arc<Controller>>) -> Response {
-    if let Auth::Session { secret, .. } = &caller.auth {
+    let mut logout_url = None;
+    if let Auth::Session { secret, oidc, .. } = &caller.auth {
         ctl.sessions.remove(secret);
+        if let (true, Some(o)) = (*oidc, &ctl.settings.oidc) {
+            logout_url = o.logout_url().await;
+        }
     }
     (
         [(header::SET_COOKIE, session::clear_cookie())],
-        Json(json!({ "logged_out": true })),
+        Json(json!({ "logged_out": true, "logout_url": logout_url })),
     )
         .into_response()
+}
+
+// --------------------------------------------------------------------- OIDC
+
+fn redirect(to: &str, cookies: &[String]) -> Response {
+    let mut r = (StatusCode::SEE_OTHER, [(header::LOCATION, to.to_owned())]).into_response();
+    for c in cookies {
+        if let Ok(v) = c.parse() {
+            r.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    r
+}
+
+/// Back to the login page with a message code.
+fn login_error(code: &str) -> Response {
+    redirect(
+        &format!("/#/login-error/{code}"),
+        &[crate::oidc::clear_binding_cookie()],
+    )
+}
+
+/// Starts an OIDC login (a link on the login page).
+async fn oidc_login(State(ctl): State<Arc<Controller>>) -> Response {
+    let Some(o) = &ctl.settings.oidc else {
+        return ApiError::not_found("single sign-on is not configured").into_response();
+    };
+    match o.begin().await {
+        Ok((url, binding)) => redirect(&url, &[crate::oidc::binding_cookie(&binding)]),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "OIDC login could not start");
+            login_error("unavailable")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+async fn oidc_callback(
+    State(ctl): State<Arc<Controller>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    let Some(o) = ctl.settings.oidc.clone() else {
+        return ApiError::not_found("single sign-on is not configured").into_response();
+    };
+    let binding = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|h| h.split(';'))
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(k, _)| *k == crate::oidc::BINDING_COOKIE)
+        .map(|(_, v)| v.to_owned());
+    let result = match (&q.error, &q.code, &q.state) {
+        (Some(e), _, _) => {
+            if let Some(s) = &q.state {
+                o.forget(s);
+            }
+            warn!(%addr, error = %e, description = ?q.error_description, "OIDC provider returned an error");
+            Err(if e == "access_denied" {
+                crate::oidc::LoginError::Cancelled
+            } else {
+                crate::oidc::LoginError::Failed(anyhow::anyhow!("provider error {e}"))
+            })
+        }
+        (None, Some(code), Some(state)) => o.finish(state, code, binding.as_deref()).await,
+        _ => Err(crate::oidc::LoginError::Expired),
+    };
+    let ident = match result {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(%addr, error = %e, "OIDC login failed");
+            return login_error(e.code());
+        }
+    };
+    let dir = ctl.settings.state_dir.clone();
+    let name = ident.name.clone();
+    match tokio::task::spawn_blocking(move || crate::oidc::check_name(&dir, &name)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(%addr, error = %e, "OIDC login refused");
+            return login_error(e.code());
+        }
+        Err(e) => {
+            warn!(error = %e, "OIDC name check");
+            return login_error("failed");
+        }
+    }
+    let (secret, _) = ctl.sessions.create(
+        &ident.name,
+        session::Kind::Oidc { role: ident.role },
+        o.config.session_lifetime,
+    );
+    let c = ctl.clone();
+    let i = ident.clone();
+    let audited = tokio::task::spawn_blocking(move || {
+        c.audit(
+            &i.name,
+            Some(addr.to_string()),
+            "session.login",
+            json!({ "method": "oidc", "issuer": i.issuer, "subject": i.subject, "role": i.role }),
+        )
+    })
+    .await;
+    if !matches!(audited, Ok(Ok(()))) {
+        ctl.sessions.remove(&secret);
+        warn!("OIDC login: audit log write failed");
+        return login_error("failed");
+    }
+    redirect(
+        "/",
+        &[
+            session::set_cookie(&secret),
+            crate::oidc::clear_binding_cookie(),
+        ],
+    )
 }
 
 // ------------------------------------------------------------ live updates
@@ -868,6 +1059,7 @@ mod tests {
                 cert_lifetime: Duration::from_secs(3600),
                 propagate: Propagate::Global,
                 allowlist: Allowlist::new(["10.0.0.0/8".parse().unwrap()]),
+                oidc: None,
             };
             let ctl = Arc::new(Controller::open(settings, ca, Store::open(&dir).unwrap()).unwrap());
             let (chain, key) = ctl.ca.issue_server(&[]).unwrap();

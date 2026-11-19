@@ -6,7 +6,13 @@ export interface Me {
   name: string;
   role: Role;
   auth: 'session' | 'token';
+  method: 'password' | 'oidc' | 'token';
   csrf_token: string | null;
+}
+
+export interface AuthMethods {
+  password: boolean;
+  oidc: { name: string } | null;
 }
 
 export type Scope =

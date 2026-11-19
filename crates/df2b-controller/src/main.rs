@@ -4,15 +4,16 @@
 //! (heartbeats, ban reports, decision log with resumable subscriptions),
 //! `propagate_local` policy, authenticated REST API over HTTPS (API tokens
 //! with roles, manual ban/unban, agents, audit log), web UI with local users
-//! and live updates (SSE).
+//! or OpenID Connect and live updates (SSE).
 //!
-//! TODO: OIDC, observation rollups and correlation policies, sqlx storage,
-//! log compaction.
+//! TODO: observation rollups and correlation policies, sqlx storage, log
+//! compaction.
 
 mod api;
 mod files;
 mod grpc;
 mod https;
+mod oidc;
 mod session;
 mod state;
 mod store;
@@ -93,6 +94,11 @@ struct ServeArgs {
     /// Networks that are never banned centrally (repeatable).
     #[arg(long = "allow")]
     allowlist: Vec<IpNet>,
+
+    /// Web UI login with an OpenID Connect provider (TOML file; see
+    /// DESIGN.md §9).
+    #[arg(long, env = "DF2B_OIDC_CONFIG")]
+    oidc_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -323,6 +329,15 @@ fn read_pem_chain(path: &std::path::Path) -> anyhow::Result<Vec<CertificateDer<'
 async fn serve(args: Args) -> anyhow::Result<()> {
     let a = args.serve;
     let dir = args.state_dir;
+    let oidc = match &a.oidc_config {
+        Some(p) => {
+            let o = oidc::Oidc::new(oidc::OidcConfig::load(p)?)
+                .with_context(|| format!("OIDC configuration {}", p.display()))?;
+            info!(issuer = %o.config.issuer, "web UI login via OpenID Connect");
+            Some(Arc::new(o))
+        }
+        None => None,
+    };
     let ca = files::load_or_create_ca(&dir)?;
     let store = store::Store::open(&dir)?;
     let ctl = Arc::new(Controller::open(
@@ -331,6 +346,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
             cert_lifetime: a.agent_cert_lifetime,
             propagate: a.propagate,
             allowlist: Allowlist::new(a.allowlist),
+            oidc: oidc.clone(),
         },
         ca,
         store,
@@ -381,6 +397,10 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         api::router(ctl.clone()),
         shutdown(),
     );
+
+    if let Some(o) = oidc {
+        tokio::spawn(async move { o.warm_up().await });
+    }
 
     let housekeeping = {
         let ctl = ctl.clone();

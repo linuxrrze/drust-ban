@@ -55,9 +55,14 @@ export async function login(username: string, password: string): Promise<void> {
 }
 
 export async function logout(): Promise<void> {
+  let next: string | null = null;
   try {
-    await api('DELETE', '/session');
+    const r = await api<{ logout_url: string | null }>('DELETE', '/session');
+    next = r.logout_url;
   } finally {
     session.me = null;
   }
+  // single sign-on: end the provider session too, or "Sign in" would log
+  // straight back in
+  if (next) location.href = next;
 }

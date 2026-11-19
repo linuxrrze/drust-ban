@@ -193,7 +193,7 @@ accepted from an unauthenticated peer.
 | Link                                  | Protection                                                      |
 |---------------------------------------|-----------------------------------------------------------------|
 | agent ↔ controller (gRPC)             | TLS 1.3, **mutual** auth: agent client cert + controller server cert, both from the internal CA |
-| `df2bctl` / browser → controller      | TLS 1.3 (HTTPS); users authenticate with a session (OIDC later), CLI with API tokens; optional client certs |
+| `df2bctl` / browser → controller      | TLS 1.3 (HTTPS); users authenticate with a session (local password or OIDC), CLI with API tokens; optional client certs |
 | controller ↔ controller (HA)          | TLS 1.3 with mutual auth; PostgreSQL connections with `sslmode=verify-full` |
 | controller → external actions         | TLS with system trust store (cloud APIs, webhooks); BGP sessions with TCP-AO/MD5 where the peer supports it |
 | `df2bctl --local` → agent             | Unix socket only (no network), access by file permissions / `SO_PEERCRED` |
@@ -298,8 +298,7 @@ Rules:
   the name `df2b-controller`, so any address works), by a CA file, or by
   Mozilla's roots. Settings: flags, `DF2B_*` environment, or
   `~/.config/df2b/df2bctl.toml` (warns if readable by others).
-- Not yet: OIDC, OpenAPI, rate limiting beyond logins, certificate hot
-  reload.
+- Not yet: OpenAPI, rate limiting beyond logins, certificate hot reload.
 
 ### 4.5 Abuse safeguards
 
@@ -498,9 +497,33 @@ df2bctl config check | reload
   address lookup (active bans, decision timeline, ban/unban), audit log
   (admin, paged). Operator/admin actions are hidden for lower roles; the API
   enforces them regardless.
+- **OIDC** (`--oidc-config`, see `config/oidc.example.toml`; crate
+  `openidconnect` 4 on the controller's rustls/reqwest stack, no redirects
+  followed): authorization code flow with PKCE (S256), `state` and `nonce`.
+  `GET /api/v1/oidc/login` stores the pending login in memory (10 min, each
+  state usable once) and binds it to the browser with `__Host-df2b_oidc`
+  (SameSite=Lax, since the callback is a cross-site navigation); the callback
+  refuses a state without the matching binding cookie, so a login link
+  cannot be planted in someone else's browser. The ID token is verified
+  (provider JWKS, issuer, audience, expiry, nonce, `at_hash`); on failure
+  the metadata and keys are fetched once more (key rotation), otherwise they
+  are cached for an hour. User name from `username_claim` (default
+  `preferred_username`; `email` only if verified), groups from
+  `groups_claim` (dotted paths such as `realm_access.roles`), both completed
+  from userinfo when missing (same `sub` required). The highest role whose
+  group list matches wins, else `default_role`, else access is refused. The
+  name must be valid and must not belong to a local user or API token. The
+  result is an ordinary session (role fixed for `session_lifetime`, default
+  8 h; idle limit 4 h), audited with method, issuer, subject and role.
+  Logout returns the provider's `end_session_endpoint` (RP-initiated logout)
+  for the UI to open. `disable_password_login` leaves only SSO in the UI.
+  Failures send the browser to `/#/login-error/<code>` (expired, cancelled,
+  denied, conflict, unavailable, failed); details go to the log only.
 - Dependencies pinned to exact versions at least two weeks old; `npm` runs
   with `ignore-scripts`. The built UI is ~90 KB of JavaScript (31 KB gzip).
-- Not yet: OIDC, user management and own password change in the UI,
+- Not yet: back-channel logout and ending OIDC sessions from the
+  controller (removal at the provider takes effect at the next login), user
+  management and own password change in the UI,
   observation timelines and sample log lines (needs observation reporting),
   ASN/GeoIP, "allow for X" after unban, policies/jails and allowlist editing,
   changing an agent's group.
@@ -571,11 +594,11 @@ systemd hardening.
 | Agent state (redb)           | source positions + offender records, flushed every 1 s; bans re-applied on start |
 | `df2bctl`                    | `filter test` + controller commands; `--local`, ip, allowlist, jails, config TODO |
 | Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
-| REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
+| REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions (password, OIDC) with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
 | gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |
 | Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans applied |
 | Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI/browser → controller (HTTPS) done; HA, external actions, local socket TODO |
-| Web UI                       | Svelte, embedded: login, overview, bans, agents, address lookup, audit log; live updates; OIDC TODO |
+| Web UI                       | Svelte, embedded: login, overview, bans, agents, address lookup, audit log; live updates; login with local users or OIDC |
 
 ---
 

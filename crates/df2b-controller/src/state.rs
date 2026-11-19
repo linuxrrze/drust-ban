@@ -47,6 +47,8 @@ pub struct Settings {
     pub cert_lifetime: Duration,
     pub propagate: Propagate,
     pub allowlist: Allowlist,
+    /// Web UI login with an OpenID Connect provider.
+    pub oidc: Option<Arc<crate::oidc::Oidc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -466,6 +468,7 @@ mod tests {
             cert_lifetime: Duration::from_secs(3600),
             propagate: Propagate::Global,
             allowlist: Allowlist::default(),
+            oidc: None,
         };
         let c = Controller::open(
             settings,
@@ -555,6 +558,7 @@ mod tests {
                 cert_lifetime: Duration::from_secs(1),
                 propagate: Propagate::Global,
                 allowlist: Allowlist::default(),
+                oidc: None,
             },
             Ca::generate("t").unwrap(),
             Store::open(&dir).unwrap(),

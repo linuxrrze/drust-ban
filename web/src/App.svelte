@@ -18,6 +18,11 @@
     else stopLive();
   });
 
+  // signed in (again): leave the login error page
+  $effect(() => {
+    if (session.me && route.parts[0] === 'login-error') location.hash = '#/';
+  });
+
   const page = $derived(route.parts[0] ?? '');
   const nav = $derived([
     { id: '', label: 'Overview', show: true },

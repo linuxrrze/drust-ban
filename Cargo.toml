@@ -31,6 +31,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "h
 libloading = "0.8"
 ipnet = { version = "2", features = ["serde"] }
 memchr = "2"
+openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "timing-resistant-secret-traits"] }
 prost = "0.13"
 redb = "2"
 protoc-bin-vendored = "3"

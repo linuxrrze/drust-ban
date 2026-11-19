@@ -175,7 +175,7 @@ pub struct ApiTokenFile {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name

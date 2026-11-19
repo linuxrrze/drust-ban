@@ -1,0 +1,47 @@
+# Web UI login with an OpenID Connect provider:
+#   df2b-controller --oidc-config /etc/df2b/oidc.toml   (or DF2B_OIDC_CONFIG)
+#
+# Register a confidential client ("web application") at the provider with
+#   redirect URI:      https://<controller>:7444/api/v1/oidc/callback
+#   post-logout URI:   https://<controller>:7444/            (optional)
+#   grant type:        authorization code (PKCE S256 is always used)
+# and make the provider put the user's groups into the ID token or userinfo.
+
+issuer = "https://sso.example.org/realms/main"
+client_id = "df2b"
+client_secret_file = "/etc/df2b/oidc-client-secret"   # or client_secret = "…"
+redirect_url = "https://df2b.example.org:7444/api/v1/oidc/callback"
+post_logout_redirect_url = "https://df2b.example.org:7444/"
+
+# Text on the login button: "Sign in with …"
+display_name = "Example SSO"
+
+# Requested in addition to "openid".
+# scopes = ["email", "profile"]
+
+# Claim used as the user name (audit log, ban origin). "email" is only
+# accepted when email_verified is true. Names must not be used by local
+# users or API tokens.
+# username_claim = "preferred_username"
+
+# Claim with the user's groups; a dotted path reaches into objects, e.g.
+# "realm_access.roles" (Keycloak realm roles).
+# groups_claim = "groups"
+
+# Provider with a private CA (default: public roots).
+# ca_file = "/etc/df2b/sso-ca.pem"
+
+# How long a login lasts (also ends after 4 h without activity). Group
+# changes at the provider take effect at the next login.
+# session_lifetime = "8h"
+
+# Allow only single sign-on in the web UI (API tokens keep working).
+# disable_password_login = false
+
+# Highest matching role wins. Users in none of the groups are refused
+# unless default_role is set.
+[roles]
+admin = ["df2b-admins"]
+operator = ["noc"]
+viewer = ["staff"]
+# default_role = "viewer"   (top-level key, put it above [roles])
