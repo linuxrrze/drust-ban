@@ -87,6 +87,7 @@ export interface Stats {
 export interface History {
   target: string;
   allowlisted: boolean;
+  allow_entries: { net: string; expires_at: string | null }[];
   active: Decision[];
   history: Decision[];
 }
@@ -139,5 +140,6 @@ export interface AllowEntry {
   comment: string;
   created_by: string | null;
   created_at: string | null;
+  expires_at: string | null;
   active_bans: number;
 }

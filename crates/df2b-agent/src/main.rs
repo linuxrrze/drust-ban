@@ -100,20 +100,17 @@ async fn main() -> anyhow::Result<()> {
     let mut pending = Pending::default();
     // the controller's allowlist as last received: applies before the
     // controller is reachable again
-    let mut central_version = String::new();
-    if let Some(a) = &loaded.central_allowlist {
-        engine.set_central_allowlist(a.networks.iter().copied());
-        central_version = a.version.clone();
-        for r in engine.lift_allowlisted(Utc::now()) {
-            restored.retain(|(key, _)| *key != r.key);
-            pending.set_offender(r);
-        }
+    let mut central = loaded.central_allowlist.clone().unwrap_or_default();
+    engine.set_central_allowlist(central.live(Utc::now()));
+    for r in engine.lift_allowlisted(Utc::now()) {
+        restored.retain(|(key, _)| *key != r.key);
+        pending.set_offender(r);
     }
     info!(
         path = %state.path().display(),
         positions = loaded.positions.len(),
         active_bans = restored.len(),
-        central_allowlist = loaded.central_allowlist.as_ref().map_or(0, |a| a.networks.len()),
+        central_allowlist = central.live(Utc::now()).len(),
         "state loaded"
     );
 
@@ -154,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
 
     let stats = Arc::new(LinkStats::default());
     if let Ok(mut v) = stats.allowlist_version.lock() {
-        v.clone_from(&central_version);
+        v.clone_from(&central.version);
     }
     let mut link: Option<Link> = match &cfg.agent.controller {
         Some(url) => Some(link::spawn(
@@ -233,13 +230,12 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 };
                 let now = Utc::now();
-                if let FromController::Allowlist { version, networks } = ev {
+                if let FromController::Allowlist(list) = ev {
                     apply_central_allowlist(
-                        &mut engine, &remote, &backend, &state, &mut pending,
-                        &mut central_version, version, networks,
+                        &mut engine, &remote, &backend, &state, &mut pending, &mut central, list,
                     );
                     if let Ok(mut v) = stats.allowlist_version.lock() {
-                        v.clone_from(&central_version);
+                        v.clone_from(&central.version);
                     }
                     continue;
                 }
@@ -262,6 +258,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             _ = prune.tick() => {
+                // temporary allowlist entries end here as well (also offline)
+                engine.set_central_allowlist(central.live(Utc::now()));
                 remote.prune(Utc::now());
                 for (jail, key) in engine.prune(Utc::now()) {
                     pending.forget_offender(&jail, &key);
@@ -281,20 +279,17 @@ async fn main() -> anyhow::Result<()> {
 /// Replaces the controller's allowlist: no new bans there, active local bans
 /// overlapping it are lifted (the firewall entry stays if a controller ban
 /// still covers that prefix), and the list is saved for restarts.
-#[allow(clippy::too_many_arguments)]
 fn apply_central_allowlist(
     engine: &mut Engine,
     remote: &RemoteBans,
     backend: &Arc<dyn FirewallBackend>,
     state: &State,
     pending: &mut Pending,
-    current: &mut String,
-    version: String,
-    networks: Vec<ipnet::IpNet>,
+    current: &mut state::CentralAllowlist,
+    list: state::CentralAllowlist,
 ) {
-    let changed = version != *current;
-    engine.set_central_allowlist(networks.iter().copied());
     let now = Utc::now();
+    engine.set_central_allowlist(list.live(now));
     let mut unban = Vec::new();
     for r in engine.lift_allowlisted(now) {
         info!(jail = %r.jail, target = %r.key, "local ban lifted: allowlisted by the controller");
@@ -311,20 +306,22 @@ fn apply_central_allowlist(
             ..Default::default()
         },
     );
-    if changed {
-        info!(%version, entries = networks.len(), "central allowlist applied");
+    if list.version != current.version {
+        info!(
+            version = %list.version,
+            entries = list.networks.len(),
+            temporary = list.expires_at.iter().filter(|e| e.is_some()).count(),
+            "central allowlist applied"
+        );
         let st = state.clone();
-        let saved = state::CentralAllowlist {
-            version: version.clone(),
-            networks,
-        };
+        let saved = list.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = st.save_central_allowlist(&saved) {
                 error!(error = %format!("{e:#}"), "saving the central allowlist failed");
             }
         });
-        *current = version;
     }
+    *current = list;
 }
 
 async fn next_event(link: &mut Option<Link>) -> Option<FromController> {

@@ -36,6 +36,28 @@ const CENTRAL_ALLOWLIST: &str = "central_allowlist";
 pub struct CentralAllowlist {
     pub version: String,
     pub networks: Vec<ipnet::IpNet>,
+    /// Expiry per network (same order); empty: all permanent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expires_at: Vec<Option<chrono::DateTime<chrono::Utc>>>,
+}
+
+impl CentralAllowlist {
+    /// Networks still in force (temporary entries expire here too, also
+    /// while the controller is unreachable).
+    pub fn live(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<ipnet::IpNet> {
+        self.networks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                self.expires_at
+                    .get(*i)
+                    .copied()
+                    .flatten()
+                    .map_or(true, |e| e > now)
+            })
+            .map(|(_, n)| *n)
+            .collect()
+    }
 }
 
 /// Key of a source position: one per journald source, one per file path.
@@ -277,8 +299,16 @@ mod tests {
         let dir = tmp("central");
         let a = CentralAllowlist {
             version: "abcd".into(),
-            networks: vec!["192.0.2.0/24".parse().unwrap()],
+            networks: vec![
+                "192.0.2.0/24".parse().unwrap(),
+                "198.51.100.7/32".parse().unwrap(),
+            ],
+            expires_at: vec![
+                None,
+                Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+            ],
         };
+        assert_eq!(a.live(chrono::Utc::now()).len(), 1, "expired entry dropped");
         {
             let st = State::open(&dir).unwrap();
             assert!(st.load().unwrap().central_allowlist.is_none());

@@ -135,11 +135,13 @@ impl RemoteBans {
                         }
                     }
                 }
-                // TODO: allow entries (temporary allowlist)
+                // "allow for X" is a temporary entry of the central
+                // allowlist (FromController::Allowlist); Allow decisions
+                // are not produced by the controller
                 RemoteKind::Ban | RemoteKind::Allow => {}
             },
             // handled by the main loop (engine + firewall)
-            FromController::Allowlist { .. } => {}
+            FromController::Allowlist(_) => {}
         }
         c
     }

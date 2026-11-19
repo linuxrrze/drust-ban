@@ -621,9 +621,29 @@ df2bctl config check | reload
   the state lock when the snapshot is built. The agent learns its group
   from the heartbeat response and updates `identity.json`. Revoked agents
   cannot be moved; audited as `agent.group` (only real changes).
+- **"Allow for X" after unban**: `POST /api/v1/unban {..., allow_for}`
+  (unban dialog "Then don't ban it again for", `df2bctl unban --allow-for`)
+  first adds a *temporary allowlist entry* for the target, then unbans, so
+  agents stop banning before the unbans reach them. This uses the central
+  allowlist (with its distribution to agents) rather than `Allow`
+  decisions in the log, which the agents never needed. Operators may set
+  up to 7 days, admins 30; targets at most /24 (IPv4) or /48 (IPv6) —
+  broader exemptions belong on the allowlist proper. Without `allow_for`
+  an unban with nothing to unban stays a 404; with it, the entry is still
+  created. Temporary entries can also be created on the allowlist (`ttl`,
+  "Keep for …", `allowlist add --for`). Merging: a permanent entry replaces
+  a temporary one for the same network, a longer temporary entry replaces a
+  shorter one (`already_allowlisted` otherwise), a temporary entry inside a
+  permanent one is not stored. Expired entries stop applying at once, are
+  removed by the controller's housekeeping (every minute; agents then get
+  the shorter list) and dropped by agents on their own (every minute, also
+  while disconnected): `AllowlistUpdate.expires_unix_ms` carries one
+  expiry per network. The version hash includes expiries, so extensions
+  reach agents too. Offense history is kept, so a returning attacker is
+  escalated as before.
 - Not yet:
   observation timelines and sample log lines (needs observation reporting),
-  ASN/GeoIP, "allow for X" after unban, policies/jails editing.
+  ASN/GeoIP, policies/jails editing.
 
 Pages:
 
@@ -640,7 +660,9 @@ Pages:
 
 **Unban semantics**: an unban is an `Unban` decision revoking a ban's id. It
 propagates through the decision log; agents remove the set element and reset
-their tracker counters for that key.
+their tracker counters for that key (offense history stays). "Allow for X"
+adds a temporary entry to the central allowlist first (see the allowlist
+implementation notes in §9).
 
 ---
 

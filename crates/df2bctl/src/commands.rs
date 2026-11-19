@@ -306,12 +306,14 @@ pub async fn unban(
     c: &Client,
     target: IpNet,
     reason: Option<String>,
+    allow_for: Option<Duration>,
     json: bool,
 ) -> anyhow::Result<()> {
+    let allow_for = allow_for.map(|d| humantime::format_duration(d).to_string());
     let v = c
         .post(
             "/api/v1/unban",
-            json!({ "target": target.to_string(), "reason": reason }),
+            json!({ "target": target.to_string(), "reason": reason, "allow_for": allow_for }),
         )
         .await?;
     if json {
@@ -324,6 +326,14 @@ pub async fn unban(
             scope(&d["scope"]),
             s(&d, &["kind", "revokes"])
         );
+    }
+    if let Some(t) = v["allowed_until"].as_str() {
+        println!(
+            "{target} will not be banned again until {t} ({})",
+            until(&v["allowed_until"])
+        );
+    } else if v["already_allowlisted"] == true {
+        println!("{target} is already allowlisted at least that long");
     }
     Ok(())
 }
@@ -423,8 +433,8 @@ pub async fn allowlist_list(c: &Client, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:<14} {:<10} {:>5}  COMMENT",
-        "NETWORK", "ADDED BY", "ADDED", "BANS"
+        "{:<24} {:<14} {:<10} {:<12} {:>5}  COMMENT",
+        "NETWORK", "ADDED BY", "ADDED", "EXPIRES", "BANS"
     );
     for e in &list {
         let by = if e["source"] == "command line" {
@@ -432,11 +442,17 @@ pub async fn allowlist_list(c: &Client, json: bool) -> anyhow::Result<()> {
         } else {
             s(e, &["created_by"])
         };
+        let expires = if e["expires_at"].is_string() {
+            ago(&e["expires_at"])
+        } else {
+            "never".into()
+        };
         println!(
-            "{:<24} {:<14} {:<10} {:>5}  {}",
+            "{:<24} {:<14} {:<10} {:<12} {:>5}  {}",
             s(e, &["net"]),
             by,
             ago(&e["created_at"]),
+            expires,
             e["active_bans"].to_string(),
             e["comment"].as_str().unwrap_or(""),
         );
@@ -449,12 +465,17 @@ pub async fn allowlist_add(
     net: IpNet,
     comment: Option<String>,
     unban: bool,
+    ttl: Option<Duration>,
     json: bool,
 ) -> anyhow::Result<()> {
+    let ttl = ttl.map_or_else(
+        || "never".to_owned(),
+        |d| humantime::format_duration(d).to_string(),
+    );
     let v = c
         .post(
             "/api/v1/allowlist",
-            json!({ "net": net.to_string(), "comment": comment.unwrap_or_default(), "unban": unban }),
+            json!({ "net": net.to_string(), "comment": comment.unwrap_or_default(), "unban": unban, "ttl": ttl }),
         )
         .await?;
     if json {

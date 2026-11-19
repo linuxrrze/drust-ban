@@ -151,18 +151,34 @@ pub struct Controller {
 pub struct AllowSnapshot {
     /// Content hash (16 hex digits): stable across restarts.
     pub version: String,
-    pub networks: Vec<IpNet>,
+    /// Network and, for temporary entries, its expiry.
+    pub entries: Vec<(IpNet, Option<DateTime<Utc>>)>,
+}
+
+/// What `add_allow` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AllowAdded {
+    Added,
+    /// A temporary entry for the same network now lasts longer.
+    Extended,
 }
 
 impl AllowSnapshot {
-    pub fn new(mut networks: Vec<IpNet>) -> Self {
-        networks.sort();
-        networks.dedup();
-        let text: Vec<String> = networks.iter().map(|n| n.to_string()).collect();
+    pub fn new(mut entries: Vec<(IpNet, Option<DateTime<Utc>>)>) -> Self {
+        entries.sort();
+        entries.dedup_by_key(|e| e.0);
+        let text: Vec<String> = entries
+            .iter()
+            .map(|(n, e)| match e {
+                Some(t) => format!("{n} {}", t.timestamp_millis()),
+                None => n.to_string(),
+            })
+            .collect();
         let hash = df2b_tls::sha256(text.join("\n").as_bytes());
         Self {
             version: df2b_tls::hex(&hash[..8]),
-            networks,
+            entries,
         }
     }
 }
@@ -176,6 +192,8 @@ pub struct AllowView {
     pub comment: String,
     pub created_by: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
+    /// temporary entries
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -227,8 +245,13 @@ impl Controller {
             settings
                 .allowlist
                 .iter()
-                .copied()
-                .chain(allow_entries.iter().map(|e| e.net))
+                .map(|n| (*n, None))
+                .chain(
+                    allow_entries
+                        .iter()
+                        .filter(|e| e.is_live(now))
+                        .map(|e| (e.net, e.expires_at)),
+                )
                 .collect(),
         )))
         .0;
@@ -433,6 +456,9 @@ impl Controller {
         inner.hourly.retain(|h, _| *h >= oldest);
         drop(inner);
         self.sessions.prune();
+        if let Err(e) = self.prune_allowlist() {
+            tracing::warn!(error = %format!("{e:#}"), "pruning the allowlist failed");
+        }
     }
 
     fn allow_lock(&self) -> MutexGuard<'_, Vec<AllowEntry>> {
@@ -441,16 +467,21 @@ impl Controller {
 
     /// Whether banning `net` would touch an allowlisted address (fixed and
     /// API entries).
+    /// Whether banning `net` would touch an allowlisted address (fixed and
+    /// API entries; temporary ones until they expire).
     pub fn allowlisted(&self, net: &IpNet) -> bool {
+        let now = Utc::now();
         self.settings.allowlist.overlaps(net)
             || self
                 .allow_lock()
                 .iter()
+                .filter(|e| e.is_live(now))
                 .any(|e| e.net.contains(net) || net.contains(&e.net))
     }
 
-    /// All entries: `--allow` first, then API entries by network.
+    /// All live entries: `--allow` first, then API entries by network.
     pub fn allowlist(&self) -> Vec<AllowView> {
+        let now = Utc::now();
         let mut v: Vec<AllowView> = self
             .settings
             .allowlist
@@ -461,17 +492,20 @@ impl Controller {
                 comment: String::new(),
                 created_by: None,
                 created_at: None,
+                expires_at: None,
             })
             .collect();
         let mut added: Vec<AllowView> = self
             .allow_lock()
             .iter()
+            .filter(|e| e.is_live(now))
             .map(|e| AllowView {
                 net: e.net,
                 source: "api",
                 comment: e.comment.clone(),
                 created_by: Some(e.created_by.clone()),
                 created_at: Some(e.created_at),
+                expires_at: e.expires_at,
             })
             .collect();
         added.sort_by_key(|e| e.net);
@@ -479,36 +513,75 @@ impl Controller {
         v
     }
 
-    /// Adds an entry (blocking: one fsync).
-    pub fn add_allow(&self, e: AllowEntry) -> Result<(), AllowError> {
+    /// Adds an entry (blocking: one fsync). Permanent entries replace a
+    /// temporary one for the same network; a temporary entry replaces a
+    /// shorter one. Refused: an entry that exists (at least as long) or
+    /// lies inside a permanent one.
+    pub fn add_allow(&self, e: AllowEntry) -> Result<AllowAdded, AllowError> {
+        let now = Utc::now();
         let mut entries = self.allow_lock();
-        let all = self
-            .settings
-            .allowlist
-            .iter()
-            .copied()
-            .chain(entries.iter().map(|x| x.net));
-        for n in all {
-            if n == e.net {
+        for n in self.settings.allowlist.iter() {
+            if *n == e.net {
                 return Err(AllowError::Exists(e.net));
             }
             if n.contains(&e.net) {
-                return Err(AllowError::Covered(e.net, n));
+                return Err(AllowError::Covered(e.net, *n));
             }
         }
+        let mut outcome = AllowAdded::Added;
+        for x in entries.iter().filter(|x| x.is_live(now)) {
+            if x.net == e.net {
+                match (x.expires_at, e.expires_at) {
+                    (None, _) => return Err(AllowError::Exists(e.net)),
+                    (Some(_), None) => {}
+                    (Some(old), Some(new)) if old >= new => return Err(AllowError::Exists(e.net)),
+                    (Some(_), Some(_)) => outcome = AllowAdded::Extended,
+                }
+            } else if x.expires_at.is_none() && x.net.contains(&e.net) {
+                return Err(AllowError::Covered(e.net, x.net));
+            }
+        }
+        // the store key is the network: this replaces an older entry
         self.store.put_allow(&e)?;
+        entries.retain(|x| x.net != e.net);
         entries.push(e);
         self.publish_allowlist(&entries);
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// Drops expired temporary entries (housekeeping). Blocking.
+    pub fn prune_allowlist(&self) -> anyhow::Result<usize> {
+        let now = Utc::now();
+        let mut entries = self.allow_lock();
+        let expired: Vec<IpNet> = entries
+            .iter()
+            .filter(|e| !e.is_live(now))
+            .map(|e| e.net)
+            .collect();
+        for net in &expired {
+            self.store.delete_allow(net)?;
+            tracing::info!(%net, "temporary allowlist entry expired");
+        }
+        if !expired.is_empty() {
+            entries.retain(|e| e.is_live(now));
+            self.publish_allowlist(&entries);
+        }
+        Ok(expired.len())
     }
 
     fn publish_allowlist(&self, entries: &[AllowEntry]) {
+        let now = Utc::now();
         let snap = AllowSnapshot::new(
             self.settings
                 .allowlist
                 .iter()
-                .copied()
-                .chain(entries.iter().map(|e| e.net))
+                .map(|n| (*n, None))
+                .chain(
+                    entries
+                        .iter()
+                        .filter(|e| e.is_live(now))
+                        .map(|e| (e.net, e.expires_at)),
+                )
                 .collect(),
         );
         self.allow_tx.send_replace(Arc::new(snap));
@@ -830,6 +903,7 @@ mod tests {
             comment: "partner".into(),
             created_by: "ada".into(),
             created_at: Utc::now(),
+            expires_at: None,
         };
         c.add_allow(e.clone()).unwrap();
         assert!(matches!(c.add_allow(e), Err(AllowError::Exists(_))));
@@ -935,6 +1009,78 @@ mod tests {
         assert!(rec(&c).resync && rec(&c).group == "web");
         let (i, _) = c.subscribe(c.last_seq(), &rec(&c)).unwrap();
         assert_eq!(targets(&i), ["192.0.2.1/32", "192.0.2.3/32"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temporary_allowlist_entries() {
+        let (c, dir) = ctl("tempallow");
+        let entry = |net: &str, mins: Option<i64>| AllowEntry {
+            net: net.parse().unwrap(),
+            comment: String::new(),
+            created_by: "olga".into(),
+            created_at: Utc::now(),
+            expires_at: mins.map(|m| Utc::now() + chrono::Duration::minutes(m)),
+        };
+        let ip: IpNet = "192.0.2.7/32".parse().unwrap();
+        let v0 = c.allowlist_version();
+        assert_eq!(
+            c.add_allow(entry("192.0.2.7/32", Some(60))).unwrap(),
+            AllowAdded::Added
+        );
+        assert!(c.allowlisted(&ip));
+        let v1 = c.allowlist_version();
+        assert_ne!(v0, v1);
+        // shorter: refused; longer: extends (new version)
+        assert!(matches!(
+            c.add_allow(entry("192.0.2.7/32", Some(30))),
+            Err(AllowError::Exists(_))
+        ));
+        assert_eq!(
+            c.add_allow(entry("192.0.2.7/32", Some(120))).unwrap(),
+            AllowAdded::Extended
+        );
+        assert_ne!(c.allowlist_version(), v1, "expiry is part of the version");
+        // permanent replaces temporary; temporary inside permanent is covered
+        assert_eq!(
+            c.add_allow(entry("192.0.2.7/32", None)).unwrap(),
+            AllowAdded::Added
+        );
+        assert_eq!(c.allowlist().iter().filter(|e| e.net == ip).count(), 1);
+        assert!(c.allowlist().iter().all(|e| e.expires_at.is_none()));
+        c.add_allow(entry("198.51.100.0/24", None)).unwrap();
+        assert!(matches!(
+            c.add_allow(entry("198.51.100.9/32", Some(60))),
+            Err(AllowError::Covered(..))
+        ));
+        // a temporary /24 does not block a permanent /32 inside it
+        c.add_allow(entry("203.0.113.0/24", Some(60))).unwrap();
+        c.add_allow(entry("203.0.113.5/32", None)).unwrap();
+
+        // expiry: no longer effective at once, removed by housekeeping
+        let short = AllowEntry {
+            expires_at: Some(Utc::now() + chrono::Duration::milliseconds(50)),
+            ..entry("192.0.2.200/32", None)
+        };
+        c.add_allow(short).unwrap();
+        let before = c.allowlist_version();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!c.allowlisted(&"192.0.2.200/32".parse().unwrap()));
+        assert!(c
+            .allowlist()
+            .iter()
+            .all(|e| e.net.to_string() != "192.0.2.200/32"));
+        assert_eq!(c.prune_allowlist().unwrap(), 1);
+        assert_ne!(c.allowlist_version(), before, "agents get the shorter list");
+        assert_eq!(c.prune_allowlist().unwrap(), 0);
+        let snap = c.allowlist_watch().borrow().clone();
+        let temp: Vec<_> = snap
+            .entries
+            .iter()
+            .filter(|(_, e)| e.is_some())
+            .map(|(n, _)| n.to_string())
+            .collect();
+        assert_eq!(temp, ["203.0.113.0/24"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

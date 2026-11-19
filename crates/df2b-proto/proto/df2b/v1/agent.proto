@@ -150,6 +150,9 @@ message AllowlistUpdate {
   string version = 1;
   // Networks never to ban, e.g. "192.0.2.0/24".
   repeated string networks = 2;
+  // Expiry per network (same order; 0 = permanent). Agents drop expired
+  // entries themselves, also while disconnected. Empty: all permanent.
+  repeated int64 expires_unix_ms = 3;
 }
 
 message Snapshot {

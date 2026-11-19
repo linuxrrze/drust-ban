@@ -294,7 +294,12 @@ impl AgentService for Service {
             let send_allow = |snap: &crate::state::AllowSnapshot| {
                 event(Event::Allowlist(v1::AllowlistUpdate {
                     version: snap.version.clone(),
-                    networks: snap.networks.iter().map(|n| n.to_string()).collect(),
+                    networks: snap.entries.iter().map(|(n, _)| n.to_string()).collect(),
+                    expires_unix_ms: snap
+                        .entries
+                        .iter()
+                        .map(|(_, e)| e.map_or(0, |t| t.timestamp_millis()))
+                        .collect(),
                 }))
             };
             let first = send_allow(&allow.borrow_and_update());
@@ -477,6 +482,7 @@ mod tests {
             comment: String::new(),
             created_by: "ada".into(),
             created_at: Utc::now(),
+            expires_at: None,
         };
         ctl.add_allow(entry("192.0.2.0/24")).unwrap();
         let Some(Event::Allowlist(second)) = next(&mut stream).await else {

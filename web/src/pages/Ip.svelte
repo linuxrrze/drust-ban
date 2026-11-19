@@ -73,7 +73,15 @@
         {:else}
           <span class="pill good">not banned</span>
         {/if}
-        {#if data.allowlisted}<a class="pill plain" href={href('allowlist')}>on the controller allowlist</a>{/if}
+        {#if data.allowlisted}
+          {@const temp = data.allow_entries.filter((e) => e.expires_at)}
+          {@const permanent = data.allow_entries.length > temp.length}
+          <a class="pill plain" href={href('allowlist')}>
+            {#if !permanent && temp.length}
+              allowlisted until {dateTime(temp.map((e) => e.expires_at!).sort().at(-1)!)}
+            {:else}on the controller allowlist{/if}
+          </a>
+        {/if}
       </div>
     </div>
     <span class="spacer"></span>

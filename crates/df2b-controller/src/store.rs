@@ -28,6 +28,15 @@ pub struct AllowEntry {
     pub comment: String,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
+    /// Temporary entries ("allow for X", e.g. after an unban).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl AllowEntry {
+    pub fn is_live(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.map_or(true, |e| e > now)
+    }
 }
 
 /// One administrative action (REST API or enrollment).

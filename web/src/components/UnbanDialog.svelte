@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ApiError, post } from '../lib/api';
-  import { target as fmtTarget } from '../lib/format';
+  import { dateTime, target as fmtTarget } from '../lib/format';
+  import { can } from '../lib/session.svelte';
   import { notify } from '../lib/toast.svelte';
   import Dialog from './Dialog.svelte';
 
@@ -11,6 +12,7 @@
   }: { open: boolean; targets: string[]; ondone?: () => void } = $props();
 
   let reason = $state('');
+  let allowFor = $state('');
   let error = $state('');
   let busy = $state(false);
 
@@ -18,6 +20,7 @@
     if (open) {
       error = '';
       reason = '';
+      allowFor = '';
     }
   });
 
@@ -25,10 +28,16 @@
     busy = true;
     error = '';
     let done = 0;
+    let until: string | null = null;
     const failed: string[] = [];
     for (const t of targets) {
       try {
-        await post('/unban', { target: t, reason: reason.trim() || null });
+        const r = await post<{ allowed_until: string | null }>('/unban', {
+          target: t,
+          reason: reason.trim() || null,
+          allow_for: allowFor || null,
+        });
+        until = r.allowed_until ?? until;
         done++;
       } catch (e) {
         // 404: already lifted (e.g. by an earlier unban of a covering prefix)
@@ -39,7 +48,8 @@
     if (failed.length) {
       error = failed.join('\n');
     } else {
-      notify(done === 1 ? `Unbanned ${fmtTarget(targets[0])}` : `Unbanned ${done} entries`);
+      const what = done === 1 ? `Unbanned ${fmtTarget(targets[0])}` : `Unbanned ${done} entries`;
+      notify(until ? `${what}; not banned again until ${dateTime(until)}` : what);
       open = false;
     }
     ondone?.();
@@ -60,6 +70,20 @@
   <label class="field">
     Reason
     <input bind:value={reason} placeholder="manual unban" />
+  </label>
+  <label class="field">
+    Then don't ban it again for
+    <select bind:value={allowFor}>
+      <option value="">— (may be banned again right away)</option>
+      <option value="1h">1 hour</option>
+      <option value="24h">24 hours</option>
+      <option value="7d">7 days</option>
+      {#if can('admin')}<option value="30d">30 days</option>{/if}
+    </select>
+    <span class="hint">
+      For false positives: a temporary allowlist entry, so the next failed login does not ban it
+      again. Single addresses and networks up to /24 (IPv4) or /48 (IPv6).
+    </span>
   </label>
   {#if error}<div class="error-box pre">{error}</div>{/if}
   <div class="actions">

@@ -860,6 +860,33 @@ struct NewAllow {
     /// also lift active bans overlapping the network (default)
     #[serde(default = "default_unban")]
     unban: bool,
+    /// temporary entry, e.g. "24h" (at most 30 days); default: permanent
+    ttl: Option<String>,
+}
+
+/// Longest temporary allowlist entry (admins; operators: `OPERATOR_ALLOW`).
+const MAX_ALLOW: Duration = Duration::from_secs(30 * 86400);
+/// Longest "allow for" an operator may set with an unban.
+const OPERATOR_ALLOW: Duration = Duration::from_secs(7 * 86400);
+
+/// "allow for" targets are single hosts or small networks (like agent
+/// reports); broader exemptions belong on the allowlist proper.
+fn too_broad_for_temporary(net: &IpNet) -> bool {
+    match net {
+        IpNet::V4(n) => n.prefix_len() < 24,
+        IpNet::V6(n) => n.prefix_len() < 48,
+    }
+}
+
+fn expiry(ttl: &str, max: Duration) -> Result<chrono::DateTime<Utc>, ApiError> {
+    let d = parse_duration(ttl, "duration")?;
+    if d < Duration::from_secs(60) || d > max {
+        return Err(ApiError::bad_request(format!(
+            "duration must be between 1 minute and {}",
+            humantime::format_duration(max)
+        )));
+    }
+    Ok(Utc::now() + chrono::Duration::from_std(d).map_err(ApiError::internal)?)
 }
 
 fn allow_error(e: crate::state::AllowError) -> ApiError {
@@ -891,11 +918,16 @@ async fn add_allow(
         .filter(|c| !c.is_control())
         .take(200)
         .collect();
+    let expires_at = match req.ttl.as_deref() {
+        None | Some("never") => None,
+        Some(t) => Some(expiry(t, MAX_ALLOW)?),
+    };
     let entry = crate::store::AllowEntry {
         net,
         comment: comment.trim().to_owned(),
         created_by: caller.name.clone(),
         created_at: Utc::now(),
+        expires_at,
     };
     let c = ctl.clone();
     let unban = req.unban;
@@ -912,7 +944,7 @@ async fn add_allow(
             &caller.name,
             caller.addr(),
             "allowlist.add",
-            json!({ "net": net, "comment": comment.trim(), "unbanned": lifted }),
+            json!({ "net": net, "comment": comment.trim(), "unbanned": lifted, "expires_at": expires_at }),
         )
         .map_err(ApiError::internal)?;
         Ok::<_, ApiError>(lifted)
@@ -921,7 +953,7 @@ async fn add_allow(
     .map_err(ApiError::internal)??;
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "net": net, "unbanned": unbanned })),
+        Json(json!({ "net": net, "unbanned": unbanned, "expires_at": expires_at })),
     ))
 }
 
@@ -1571,6 +1603,11 @@ async fn history(
     Ok(Json(json!({
         "target": net,
         "allowlisted": ctl.allowlisted(&net),
+        "allow_entries": ctl
+            .allowlist()
+            .into_iter()
+            .filter(|e| e.net.contains(&net) || net.contains(&e.net))
+            .collect::<Vec<_>>(),
         "active": active,
         "history": history,
     })))
@@ -1892,6 +1929,9 @@ impl ApiError {
 struct UnbanRequest {
     target: String,
     reason: Option<String>,
+    /// then keep the target from being banned again for this long ("24h"):
+    /// a temporary allowlist entry, at most 7 days for operators
+    allow_for: Option<String>,
 }
 
 async fn unban(
@@ -1902,10 +1942,47 @@ async fn unban(
     caller.require(Role::Operator)?;
     let net = target(&req.target)?;
     let reason = req.reason.unwrap_or_else(|| "manual unban".into());
+    let allow_until = match req.allow_for.as_deref() {
+        None => None,
+        Some(t) => {
+            let max = if caller.role >= Role::Admin {
+                MAX_ALLOW
+            } else {
+                OPERATOR_ALLOW
+            };
+            let until = expiry(t, max)?;
+            if too_broad_for_temporary(&net.trunc()) {
+                return Err(ApiError::bad_request(format!(
+                    "{net} is too broad for \"allow for\" (at most /24 for IPv4, /48 for IPv6); \
+                     use the allowlist"
+                )));
+            }
+            Some(until)
+        }
+    };
     let c = ctl.clone();
-    let revoked = blocking(move || {
+    let (revoked, allowed) = blocking(move || {
+        // allow first: agents stop banning before the unbans reach them
+        let allowed = match allow_until {
+            Some(until) => {
+                let entry = crate::store::AllowEntry {
+                    net: net.trunc(),
+                    comment: format!("after unban: {reason}").chars().take(200).collect(),
+                    created_by: caller.name.clone(),
+                    created_at: Utc::now(),
+                    expires_at: Some(until),
+                };
+                match c.add_allow(entry) {
+                    Ok(_) => Some(until),
+                    // already allowed at least as long, or permanently
+                    Err(crate::state::AllowError::Exists(_) | crate::state::AllowError::Covered(..)) => None,
+                    Err(e) => return Err(anyhow::anyhow!(e.to_string())),
+                }
+            }
+            None => None,
+        };
         let revoked = c.unban(net, caller.origin(), &reason)?;
-        if !revoked.is_empty() {
+        if !revoked.is_empty() || allowed.is_some() {
             let ids: Vec<_> = revoked
                 .iter()
                 .filter_map(|d| match d.kind {
@@ -1917,17 +1994,23 @@ async fn unban(
                 &caller.name,
                 caller.addr(),
                 "unban",
-                json!({ "target": net, "revoked": ids, "reason": reason }),
+                json!({ "target": net, "revoked": ids, "reason": reason, "allowed_until": allowed }),
             )?;
         }
-        Ok(revoked)
+        Ok((revoked, allowed))
     })
     .await?;
-    if revoked.is_empty() {
+    // nothing to unban is only an error when nothing else was asked for
+    if revoked.is_empty() && req.allow_for.is_none() {
         return Err(ApiError::not_found(format!("no active ban overlaps {net}")));
     }
     let list: Vec<_> = revoked.iter().map(|d| &**d).collect();
-    Ok(Json(json!({ "unbans": list })))
+    Ok(Json(json!({
+        "unbans": list,
+        "allowed_until": allowed,
+        // asked for, but an entry at least as long (or permanent) exists
+        "already_allowlisted": req.allow_for.is_some() && allowed.is_none(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -3343,6 +3426,166 @@ mod tests {
             ),
             (Some("web"), Some("db"))
         );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn unban_and_allow_for() {
+        let env = Env::new("allowfor").await;
+        let op = env.token("olga", Role::Operator);
+        let admin = env.token("ada", Role::Admin);
+        let ban = |t: &str| {
+            let (env, op, t) = (&env, op.clone(), t.to_owned());
+            async move {
+                env.call(
+                    "POST",
+                    "/api/v1/bans",
+                    &op,
+                    json!({ "target": t, "duration": "1h" }),
+                )
+                .await
+                .0
+            }
+        };
+        let unban = |tok: &str, body: Value| {
+            let (env, tok) = (&env, tok.to_owned());
+            async move { env.call("POST", "/api/v1/unban", &tok, body).await }
+        };
+
+        assert_eq!(ban("198.51.100.7").await, S::CREATED);
+        let (st, v) = unban(
+            &op,
+            json!({ "target": "198.51.100.7", "allow_for": "24h", "reason": "false positive" }),
+        )
+        .await;
+        assert_eq!(st, S::OK, "{v}");
+        assert_eq!(v["unbans"].as_array().unwrap().len(), 1);
+        let until: chrono::DateTime<Utc> = v["allowed_until"].as_str().unwrap().parse().unwrap();
+        assert!(
+            (until - Utc::now() - chrono::Duration::hours(24))
+                .num_seconds()
+                .abs()
+                < 60
+        );
+        assert_eq!(v["already_allowlisted"], false);
+        // cannot be banned again meanwhile
+        assert_eq!(ban("198.51.100.7").await, S::CONFLICT);
+        // shown on the allowlist as temporary
+        let (_, v) = env.call("GET", "/api/v1/allowlist", &op, json!({})).await;
+        let e = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["net"] == "198.51.100.7/32")
+            .unwrap()
+            .clone();
+        assert!(e["expires_at"].is_string());
+        assert_eq!(
+            (e["created_by"].as_str(), e["comment"].as_str()),
+            (Some("olga"), Some("after unban: false positive"))
+        );
+        // asking again for less: nothing to do, not an error
+        let (st, v) = unban(&op, json!({ "target": "198.51.100.7", "allow_for": "1h" })).await;
+        assert_eq!(
+            (
+                st,
+                v["already_allowlisted"].as_bool(),
+                v["allowed_until"].is_null()
+            ),
+            (S::OK, Some(true), true)
+        );
+        // without allow_for, nothing to unban stays a 404
+        assert_eq!(
+            unban(&op, json!({ "target": "198.51.100.8" })).await.0,
+            S::NOT_FOUND
+        );
+
+        // limits: operators 7 days, admins 30; small targets only
+        for (tok, body, want) in [
+            (
+                &op,
+                json!({ "target": "192.0.2.1", "allow_for": "8d" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                &op,
+                json!({ "target": "192.0.2.1", "allow_for": "10s" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                &op,
+                json!({ "target": "192.0.2.1", "allow_for": "soon" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                &op,
+                json!({ "target": "192.0.0.0/16", "allow_for": "1h" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                &admin,
+                json!({ "target": "192.0.2.1", "allow_for": "31d" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                &admin,
+                json!({ "target": "192.0.2.1", "allow_for": "30d" }),
+                S::OK,
+            ),
+            (
+                &op,
+                json!({ "target": "2001:db8:1::/48", "allow_for": "7d" }),
+                S::OK,
+            ),
+        ] {
+            let (st, v) = unban(tok, body.clone()).await;
+            assert_eq!(st, want, "{body} {v}");
+        }
+        // inside the fixed --allow 10.0.0.0/8: already allowed
+        let (_, v) = unban(&op, json!({ "target": "10.1.2.3", "allow_for": "1h" })).await;
+        assert_eq!(v["already_allowlisted"], true);
+
+        // temporary entries from the allowlist itself (admin)
+        let (st, v) = env
+            .call(
+                "POST",
+                "/api/v1/allowlist",
+                &admin,
+                json!({ "net": "203.0.113.0/24", "ttl": "2h" }),
+            )
+            .await;
+        assert_eq!(st, S::CREATED, "{v}");
+        assert!(v["expires_at"].is_string());
+        let (st, _) = env
+            .call(
+                "POST",
+                "/api/v1/allowlist",
+                &admin,
+                json!({ "net": "203.0.114.0/24", "ttl": "60d" }),
+            )
+            .await;
+        assert_eq!(st, S::BAD_REQUEST);
+        // made permanent: replaces the temporary entry
+        let (st, v) = env
+            .call(
+                "POST",
+                "/api/v1/allowlist",
+                &admin,
+                json!({ "net": "203.0.113.0/24" }),
+            )
+            .await;
+        assert_eq!((st, v["expires_at"].is_null()), (S::CREATED, true));
+
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let first_unban = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| e["action"] == "unban")
+            .unwrap()
+            .clone();
+        assert!(first_unban["details"]["allowed_until"].is_string());
         let _ = std::fs::remove_dir_all(&env.dir);
     }
 

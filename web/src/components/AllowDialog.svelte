@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ApiError, post } from '../lib/api';
   import { notify } from '../lib/toast.svelte';
+  import { dateTime } from '../lib/format';
   import Dialog from './Dialog.svelte';
 
   let {
@@ -12,6 +13,7 @@
   let net = $state('');
   let comment = $state('');
   let unban = $state(true);
+  let ttl = $state('never');
   let error = $state('');
   let busy = $state(false);
 
@@ -20,6 +22,7 @@
       net = initialNet;
       comment = '';
       unban = true;
+      ttl = 'never';
       error = '';
     }
   });
@@ -28,12 +31,14 @@
     busy = true;
     error = '';
     try {
-      const r = await post<{ net: string; unbanned: number }>('/allowlist', {
+      const r = await post<{ net: string; unbanned: number; expires_at: string | null }>('/allowlist', {
         net: net.trim(),
         comment: comment.trim(),
         unban,
+        ttl,
       });
-      notify(`${r.net} allowlisted${r.unbanned ? `; ${r.unbanned} active ban(s) lifted` : ''}`);
+      const until = r.expires_at ? ` until ${dateTime(r.expires_at)}` : '';
+      notify(`${r.net} allowlisted${until}${r.unbanned ? `; ${r.unbanned} active ban(s) lifted` : ''}`);
       open = false;
       ondone?.();
     } catch (e) {
@@ -53,6 +58,16 @@
   <label class="field">
     Comment <span class="hint">who or what this is</span>
     <input bind:value={comment} maxlength="200" placeholder="e.g. monitoring, partner VPN" />
+  </label>
+  <label class="field">
+    Keep
+    <select bind:value={ttl}>
+      <option value="never">permanently</option>
+      <option value="1h">for 1 hour</option>
+      <option value="24h">for 24 hours</option>
+      <option value="7d">for 7 days</option>
+      <option value="30d">for 30 days</option>
+    </select>
   </label>
   <label class="check">
     <input type="checkbox" bind:checked={unban} />

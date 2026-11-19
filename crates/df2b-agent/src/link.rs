@@ -86,10 +86,7 @@ pub enum FromController {
     Snapshot(Vec<RemoteDecision>),
     Decision(RemoteDecision),
     /// The complete central allowlist (replaces the previous one).
-    Allowlist {
-        version: String,
-        networks: Vec<IpNet>,
-    },
+    Allowlist(crate::state::CentralAllowlist),
 }
 
 /// Parses an allowlist update; `None` if any entry is malformed (a partial
@@ -101,10 +98,20 @@ pub fn parse_allowlist(a: v1::AllowlistUpdate) -> Option<FromController> {
         .map(|n| n.parse::<IpNet>().map(|n| n.trunc()))
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
-    Some(FromController::Allowlist {
+    // empty: all permanent; otherwise one expiry per network (0 = never)
+    if !a.expires_unix_ms.is_empty() && a.expires_unix_ms.len() != networks.len() {
+        return None;
+    }
+    let expires_at = a
+        .expires_unix_ms
+        .iter()
+        .map(|&ms| from_unix_ms(ms))
+        .collect();
+    Some(FromController::Allowlist(crate::state::CentralAllowlist {
         version: a.version,
         networks,
-    })
+        expires_at,
+    }))
 }
 
 pub struct Link {
@@ -666,8 +673,14 @@ mod tests {
         let ok = parse_allowlist(v1::AllowlistUpdate {
             version: "v1".into(),
             networks: vec!["192.0.2.7/24".into(), "2001:db8::/48".into()],
+            ..Default::default()
         });
-        let Some(FromController::Allowlist { version, networks }) = ok else {
+        let Some(FromController::Allowlist(crate::state::CentralAllowlist {
+            version,
+            networks,
+            ..
+        })) = ok
+        else {
             panic!()
         };
         assert_eq!(version, "v1");
@@ -676,7 +689,28 @@ mod tests {
         assert!(parse_allowlist(v1::AllowlistUpdate {
             version: "v2".into(),
             networks: vec!["192.0.2.0/24".into(), "nonsense".into()],
+            ..Default::default()
         })
         .is_none());
+        // expiries: one per network
+        let now_ms = Utc::now().timestamp_millis();
+        let Some(FromController::Allowlist(t)) = parse_allowlist(v1::AllowlistUpdate {
+            version: "v3".into(),
+            networks: vec!["192.0.2.0/24".into(), "198.51.100.7/32".into()],
+            expires_unix_ms: vec![0, now_ms + 3_600_000],
+        }) else {
+            panic!()
+        };
+        assert_eq!(t.expires_at[0], None);
+        assert!(t.expires_at[1].is_some());
+        assert!(
+            parse_allowlist(v1::AllowlistUpdate {
+                version: "v4".into(),
+                networks: vec!["192.0.2.0/24".into()],
+                expires_unix_ms: vec![0, 0],
+            })
+            .is_none(),
+            "mismatched lengths"
+        );
     }
 }

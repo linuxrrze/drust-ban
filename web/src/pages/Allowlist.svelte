@@ -90,7 +90,7 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>Network</th><th>Comment</th><th>Added</th><th class="num">Overlapping bans</th>{#if can('admin')}<th></th>{/if}</tr>
+          <tr><th>Network</th><th>Comment</th><th>Added</th><th>Expires</th><th class="num">Overlapping bans</th>{#if can('admin')}<th></th>{/if}</tr>
         </thead>
         <tbody>
           {#each entries as e (e.net)}
@@ -103,6 +103,11 @@
                 {:else}
                   <span title={dateTime(e.created_at)}>{relative(e.created_at, now)} by {e.created_by}</span>
                 {/if}
+              </td>
+              <td>
+                {#if e.expires_at}
+                  <span class="pill warn" title={dateTime(e.expires_at)}>{relative(e.expires_at, now)}</span>
+                {:else}<span class="faint">never</span>{/if}
               </td>
               <td class="num">
                 {#if e.active_bans}

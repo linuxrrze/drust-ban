@@ -102,6 +102,10 @@ enum Command {
         target: IpNet,
         #[arg(long)]
         reason: Option<String>,
+        /// Then keep it from being banned again for this long, e.g. 24h
+        /// (temporary allowlist entry; operators: at most 7d).
+        #[arg(long, value_parser = humantime::parse_duration)]
+        allow_for: Option<Duration>,
     },
     /// Show observations and decision history for an address.
     Ip {
@@ -189,6 +193,9 @@ enum AllowlistCmd {
         /// Keep active bans overlapping the network.
         #[arg(long)]
         keep_bans: bool,
+        /// Temporary entry for this long, e.g. 7d (default: permanent).
+        #[arg(long = "for", value_parser = humantime::parse_duration)]
+        ttl: Option<Duration>,
     },
     /// Remove a network added through the API (admin).
     Rm {
@@ -308,7 +315,8 @@ async fn run() -> anyhow::Result<()> {
                     target,
                     comment,
                     keep_bans,
-                } => commands::allowlist_add(&c, target, comment, !keep_bans, json).await,
+                    ttl,
+                } => commands::allowlist_add(&c, target, comment, !keep_bans, ttl, json).await,
                 AllowlistCmd::Rm { target } => commands::allowlist_rm(&c, target, json).await,
             }
         }
@@ -321,9 +329,11 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Unban { target, reason } => {
-            commands::unban(&client()?, target, reason, json).await
-        }
+        Command::Unban {
+            target,
+            reason,
+            allow_for,
+        } => commands::unban(&client()?, target, reason, allow_for, json).await,
         other => bail!("not implemented yet: {other:?}"),
     }
 }

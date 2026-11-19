@@ -410,9 +410,13 @@ async fn serve(args: Args) -> anyhow::Result<()> {
             let mut t = tokio::time::interval(Duration::from_secs(60));
             loop {
                 t.tick().await;
-                ctl.prune();
-                let dir = dir.clone();
-                let _ = tokio::task::spawn_blocking(move || files::prune_tokens(&dir)).await;
+                // may write (expired allowlist entries): off the runtime
+                let (c, dir) = (ctl.clone(), dir.clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    c.prune();
+                    files::prune_tokens(&dir);
+                })
+                .await;
             }
         }
     };
