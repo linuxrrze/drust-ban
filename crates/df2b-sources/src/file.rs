@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::watch::{Hub, Watch};
-use crate::{LogLine, Position, SourceBatch, BATCH_MAX, MAX_LINE};
+use crate::{LogLine, Position, SourceBatch, SourceErrors, BATCH_MAX, MAX_LINE};
 
 /// Maximum bytes read per poll iteration (bounds memory per tailer).
 const MAX_READ: u64 = 4 * 1024 * 1024;
@@ -150,13 +150,15 @@ impl FileTailer {
         self
     }
 
-    /// Sends `batch` with the position `offset`; false if the receiver is gone.
+    /// Sends `batch` with the position `offset` and the bytes still to
+    /// read; false if the receiver is gone.
     async fn send(
         &self,
         tx: &mpsc::Sender<SourceBatch>,
         batch: &mut Vec<LogLine>,
         id: FileId,
         offset: u64,
+        backlog: u64,
     ) -> bool {
         let lines = std::mem::take(batch);
         let position = Some(Position::File {
@@ -169,6 +171,7 @@ impl FileTailer {
             source: self.source.clone(),
             lines,
             position,
+            backlog: Some(backlog),
         })
         .await
         .is_ok()
@@ -341,6 +344,7 @@ impl FileTailer {
                 // file offset of pending[0]
                 let base = cur.offset - pending.len() as u64;
                 cur.offset += n;
+                let unread = len.saturating_sub(cur.offset);
                 pending.extend_from_slice(&chunk);
                 let mut start = 0;
                 for pos in memchr::memchr_iter(b'\n', &pending) {
@@ -348,7 +352,7 @@ impl FileTailer {
                     start = pos + 1;
                     if batch.len() >= BATCH_MAX
                         && !self
-                            .send(&tx, &mut batch, cur.id, base + start as u64)
+                            .send(&tx, &mut batch, cur.id, base + start as u64, unread)
                             .await
                     {
                         return Ok(()); // receiver gone: shutting down
@@ -356,7 +360,7 @@ impl FileTailer {
                 }
                 if !batch.is_empty()
                     && !self
-                        .send(&tx, &mut batch, cur.id, base + start as u64)
+                        .send(&tx, &mut batch, cur.id, base + start as u64, unread)
                         .await
                 {
                     return Ok(());
@@ -377,7 +381,7 @@ impl FileTailer {
                 if !pending.is_empty() {
                     batch.push(self.line(&pending));
                     pending.clear();
-                    if !self.send(&tx, &mut batch, cur.id, cur.offset).await {
+                    if !self.send(&tx, &mut batch, cur.id, cur.offset, 0).await {
                         return Ok(());
                     }
                 }
@@ -452,6 +456,7 @@ pub struct FileSource {
     poll: Option<Duration>,
     grace: Duration,
     rescan: Duration,
+    errors: Option<Arc<SourceErrors>>,
 }
 
 impl FileSource {
@@ -464,7 +469,14 @@ impl FileSource {
             poll: None,
             grace: ROTATION_GRACE,
             rescan: Duration::from_secs(10),
+            errors: None,
         }
+    }
+
+    /// Where errors of its files are recorded.
+    pub fn with_errors(mut self, errors: Arc<SourceErrors>) -> Self {
+        self.errors = Some(errors);
+        self
     }
 
     /// The saved position of the file at `path` (a configured path or a
@@ -518,9 +530,13 @@ impl FileSource {
         let mut active: HashSet<PathBuf> = HashSet::new();
         let spawn = |tasks: &mut JoinSet<PathBuf>, t: FileTailer| {
             let (path, source, tx) = (t.path.clone(), self.source.clone(), tx.clone());
+            let errors = self.errors.clone();
             tasks.spawn(async move {
                 if let Err(e) = t.run(tx).await {
                     error!(%source, path = %path.display(), error = %e, "file source failed");
+                    if let Some(errors) = errors {
+                        errors.set(&source, format!("{}: {e:#}", path.display()));
+                    }
                 }
                 path
             });

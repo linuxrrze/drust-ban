@@ -8,6 +8,17 @@ export function duration(secs: number): string {
   return `${Math.round(s / 86400)}d`;
 }
 
+/** 1536 → "1.5 KiB" */
+export function bytes(n: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${i === 0 ? n : n.toFixed(1)} ${units[i]}`;
+}
+
 /** "5m ago" / "in 3h" */
 export function relative(t: string | null | undefined, now = Date.now()): string {
   if (!t) return '–';

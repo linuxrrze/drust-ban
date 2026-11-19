@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use self::sys::Journal;
-use crate::{LogLine, Position, SourceBatch, BATCH_MAX, MAX_LINE};
+use crate::{LogLine, Position, SourceBatch, SourceErrors, BATCH_MAX, MAX_LINE};
 
 /// How long `sd_journal_wait` blocks before checking for shutdown.
 const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -50,6 +50,7 @@ pub struct JournaldSource {
     directory: Option<PathBuf>,
     start: Start,
     cursor: Option<String>,
+    errors: Option<Arc<SourceErrors>>,
 }
 
 impl JournaldSource {
@@ -60,7 +61,14 @@ impl JournaldSource {
             directory: None,
             start: Start::Tail,
             cursor: None,
+            errors: None,
         }
+    }
+
+    /// Where an error that stops the source is recorded.
+    pub fn with_errors(mut self, errors: Arc<SourceErrors>) -> Self {
+        self.errors = Some(errors);
+        self
     }
 
     /// Read journal files from `dir` instead of the system journal.
@@ -104,6 +112,9 @@ impl JournaldSource {
                 info!(source = %self.source, "following journal");
                 if let Err(e) = self.follow(&mut journal, &tx) {
                     error!(source = %self.source, error = %format!("{e:#}"), "journal source stopped");
+                    if let Some(errors) = &self.errors {
+                        errors.set(&self.source, format!("journal source stopped: {e:#}"));
+                    }
                 }
             })
             .context("spawning journald thread")?;
@@ -235,6 +246,7 @@ impl JournaldSource {
             source: self.source.clone(),
             lines,
             position,
+            backlog: None,
         })
         .is_ok()
     }

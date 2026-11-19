@@ -297,7 +297,16 @@ Rules:
   (offense history is kept for escalation).
 - **Revocation** also via `df2bctl agents revoke <id>` (REST, admin).
 - Reports queued while disconnected (max 10 000) are kept in `agent.redb`
-  across restarts (§6). Not yet: per-source stats in heartbeats.
+  across restarts (§6).
+- **Health in heartbeats**: per source the lines per second since the last
+  heartbeat, the largest lag (age of the newest processed journal entry)
+  and file backlog (bytes written but not read) in that interval, and the
+  error that stopped it (a file of it, or a central source that failed to
+  start). Firewall: the last ban/unban/setup failure (until one succeeds)
+  and a check every minute (nftables: the input chain with its drop rules
+  still exists); `firewall_error` says what failed. The UI shows sources
+  on the agent page (lag ≥ 10 s and backlog ≥ 1 MiB highlighted) and
+  lists agents with a stopped source on the dashboard.
 
 #### Implementation (REST API)
 

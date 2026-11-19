@@ -44,8 +44,14 @@
   });
 
   const problems = $derived(
-    agents.filter((a) => !a.revoked && (!a.connected || !a.status.firewall_healthy || certSoon(a))),
+    agents.filter(
+      (a) => !a.revoked && (!a.connected || !a.status.firewall_healthy || sourceError(a) || certSoon(a)),
+    ),
   );
+
+  function sourceError(a: Agent): boolean {
+    return a.status.sources?.some((s) => s.error) ?? false;
+  }
 
   function certSoon(a: Agent): boolean {
     return Date.parse(a.cert_not_after) - now < 3 * 86400e3;
@@ -137,7 +143,7 @@
     <div class="card">
       <h2>Agents needing attention</h2>
       {#if problems.length === 0}
-        <div class="faint small">All agents are connected, their firewalls are healthy and no certificate expires within 3 days.</div>
+        <div class="faint small">All agents are connected, their firewalls and log sources are healthy and no certificate expires within 3 days.</div>
       {:else}
         <div class="table-wrap">
           <table>
@@ -147,7 +153,8 @@
                   <td><a href={href('agents', a.id)}>{a.id}</a></td>
                   <td>
                     {#if !a.connected}<span class="pill bad">offline · seen {relative(a.status.last_seen, now)}</span>
-                    {:else if !a.status.firewall_healthy}<span class="pill bad">firewall error</span>
+                    {:else if !a.status.firewall_healthy}<span class="pill bad" title={a.status.firewall_error}>firewall error</span>
+                    {:else if sourceError(a)}<span class="pill warn" title={a.status.sources.filter((s) => s.error).map((s) => `${s.name}: ${s.error}`).join('\n')}>log source stopped</span>
                     {:else}<span class="pill warn">certificate expires {relative(a.cert_not_after, now)}</span>{/if}
                   </td>
                 </tr>

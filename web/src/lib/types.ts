@@ -43,11 +43,25 @@ export interface AgentStatus {
   clock_skew_ms: number;
   firewall_backend: string;
   firewall_healthy: boolean;
+  /** why the firewall is not healthy */
+  firewall_error: string;
+  sources: SourceStatus[];
   last_applied_seq: number;
   streams: number;
   allowlist_version: string;
   /** "off": the agent does not accept central redaction rules */
   redaction_version: string;
+}
+
+export interface SourceStatus {
+  name: string;
+  lines_per_second: number;
+  /** how old the newest processed entry was (journald) */
+  lag_ms: number;
+  /** bytes written but not read yet (files) */
+  backlog_bytes: number;
+  /** why it stopped reading ("" = fine) */
+  error: string;
 }
 
 export interface Agent {

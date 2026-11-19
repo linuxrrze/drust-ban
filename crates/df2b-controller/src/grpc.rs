@@ -267,6 +267,19 @@ impl AgentService for Service {
             s.clock_skew_ms = now_ms - h.agent_time_unix_ms;
             s.firewall_backend = h.firewall_backend;
             s.firewall_healthy = h.firewall_healthy;
+            s.firewall_error = h.firewall_error.chars().take(512).collect();
+            s.sources = h
+                .sources
+                .into_iter()
+                .take(256)
+                .map(|x| crate::state::SourceView {
+                    name: x.name.chars().take(64).collect(),
+                    lines_per_second: x.lines_per_second,
+                    lag_ms: x.lag_ms,
+                    backlog_bytes: x.backlog_bytes,
+                    error: x.error.chars().take(512).collect(),
+                })
+                .collect();
             s.last_applied_seq = h.last_applied_seq;
             s.allowlist_version = h.allowlist_version;
             s.jail_policies_version = h.jail_policies_version;
@@ -921,8 +934,34 @@ mod tests {
         // mutual TLS: identity from the certificate
         let cfg1 = agent_cfg(&ctl, resp.certificate_der, &k1);
         let mut a = client(&addr, cfg1.clone()).await;
-        let hb = a.heartbeat(heartbeat()).await.unwrap().into_inner();
+        let hb = a
+            .heartbeat(v1::HeartbeatRequest {
+                firewall_healthy: false,
+                firewall_error: "table gone".into(),
+                sources: vec![v1::SourceStatus {
+                    name: "auth".into(),
+                    lines_per_second: 12,
+                    backlog_bytes: 4096,
+                    error: "x".repeat(2000),
+                    ..Default::default()
+                }],
+                ..heartbeat()
+            })
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(hb.groups, vec!["web".to_string()]);
+        let st = ctl.agents().into_iter().next().unwrap().status;
+        assert_eq!(
+            (st.firewall_healthy, st.firewall_error.as_str()),
+            (false, "table gone")
+        );
+        assert_eq!(st.sources.len(), 1);
+        assert_eq!(
+            (st.sources[0].lines_per_second, st.sources[0].backlog_bytes),
+            (12, 4096)
+        );
+        assert_eq!(st.sources[0].error.len(), 512, "capped");
 
         let mut stream = a
             .subscribe(v1::SubscribeRequest { from_seq: 0 })

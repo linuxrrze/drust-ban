@@ -8,6 +8,7 @@
 mod central;
 mod config;
 mod engine;
+mod health;
 mod link;
 mod outbox;
 mod remote;
@@ -132,10 +133,16 @@ async fn main() -> anyhow::Result<()> {
         "state loaded"
     );
 
-    let backend: Arc<dyn FirewallBackend> = match cfg.agent.firewall {
+    let stats = Arc::new(LinkStats::default());
+    let inner: Arc<dyn FirewallBackend> = match cfg.agent.firewall {
         FirewallKind::Nftables => Arc::new(Nftables::default()),
         FirewallKind::DryRun => Arc::new(DryRun),
     };
+    // every call's outcome goes into the heartbeats
+    let backend: Arc<dyn FirewallBackend> = Arc::new(health::Monitored {
+        inner,
+        health: stats.firewall.clone(),
+    });
     {
         let b = backend.clone();
         tokio::task::spawn_blocking(move || b.ensure_setup())
@@ -163,15 +170,20 @@ async fn main() -> anyhow::Result<()> {
     // the sources instead of buffering without limit.
     let (tx, mut rx) = mpsc::channel::<SourceBatch>(64);
     for src in &cfg.source {
-        spawn_source(src, &tx, &loaded.positions)?;
+        spawn_source(src, &tx, &loaded.positions, &stats.sources)?;
     }
     // kept: central jails start sources later (and an agent without local
     // sources must keep running)
     let src_tx = tx;
     let mut central_sources = CentralSources::default();
-    central_sources.update(&central_jails, &running_central, &src_tx, &loaded.positions);
+    central_sources.update(
+        &central_jails,
+        &running_central,
+        &src_tx,
+        &loaded.positions,
+        &stats.sources,
+    );
 
-    let stats = Arc::new(LinkStats::default());
     if let Ok(mut v) = stats.allowlist_version.lock() {
         v.clone_from(&central.version);
     }
@@ -224,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 };
                 let now = Utc::now();
+                stats.sources.record(&batch, now);
                 let mut entries = Vec::new();
                 for line in &batch.lines {
                     for action in engine.process(line, now) {
@@ -282,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
                     let running = engine.set_central_jails(&accepted, &c.filters, rejected);
                     // the policies apply to central jails as well
                     engine.apply_jail_overrides(&jail_policies.jails);
-                    central_sources.update(&c, &running, &src_tx, &loaded.positions);
+                    central_sources.update(&c, &running, &src_tx, &loaded.positions, &stats.sources);
                     if c.version != central_jails.version {
                         info!(version = %c.version, defined = c.jails.len(), running = running.len(), "central jails applied");
                         let (st, saved) = (state.clone(), c.clone());
@@ -388,6 +401,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             _ = prune.tick() => {
+                // the outcome lands in the firewall health (heartbeats)
+                let b = backend.clone();
+                tokio::spawn(async move {
+                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || b.check()).await {
+                        error!(error = %format!("{e:#}"), "firewall check failed");
+                    }
+                });
                 // temporary allowlist entries end here as well (also offline)
                 engine.set_central_allowlist(central.live(Utc::now()));
                 remote.prune(Utc::now());
@@ -535,6 +555,7 @@ impl CentralSources {
         running: &[String],
         tx: &mpsc::Sender<SourceBatch>,
         positions: &HashMap<String, Position>,
+        health: &health::SourceHealth,
     ) {
         let mut wanted: HashMap<String, (central::CentralSource, SourceConfig)> = HashMap::new();
         for j in jails.jails.iter().filter(|j| running.contains(&j.name)) {
@@ -550,6 +571,7 @@ impl CentralSources {
                 for t in tasks.iter() {
                     t.abort();
                 }
+                health.stop(name);
                 info!(source = %name, "central source stopped");
             }
             keep
@@ -558,13 +580,14 @@ impl CentralSources {
             if self.0.contains_key(&name) {
                 continue;
             }
-            match spawn_central_source(&cfg, tx, positions) {
+            match spawn_central_source(&cfg, tx, positions, health) {
                 Ok(tasks) => {
                     info!(source = %name, "central source started");
                     self.0.insert(name, (def, tasks));
                 }
                 Err(e) => {
-                    error!(source = %name, error = %format!("{e:#}"), "central source failed")
+                    error!(source = %name, error = %format!("{e:#}"), "central source failed");
+                    health.errors.set(&name, format!("{e:#}"));
                 }
             }
         }
@@ -577,9 +600,10 @@ fn spawn_central_source(
     src: &SourceConfig,
     tx: &mpsc::Sender<SourceBatch>,
     positions: &HashMap<String, Position>,
+    health: &health::SourceHealth,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let (own_tx, mut own_rx) = mpsc::channel::<SourceBatch>(16);
-    let mut tasks = spawn_source(src, &own_tx, positions)?;
+    let mut tasks = spawn_source(src, &own_tx, positions, health)?;
     let tx = tx.clone();
     tasks.push(tokio::spawn(async move {
         while let Some(b) = own_rx.recv().await {
@@ -595,9 +619,12 @@ fn spawn_source(
     src: &SourceConfig,
     tx: &mpsc::Sender<SourceBatch>,
     positions: &HashMap<String, Position>,
+    health: &health::SourceHealth,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut tasks = Vec::new();
     let name: Arc<str> = Arc::from(src.name.as_str());
+    health.start(&src.name);
+    let errors = health.errors.clone();
     match &src.kind {
         SourceKind::File {
             paths,
@@ -606,7 +633,8 @@ fn spawn_source(
             for p in paths {
                 df2b_sources::file::check_path(p)?;
             }
-            let mut files = FileSource::new(name.clone(), paths.clone(), *start_at_end);
+            let mut files = FileSource::new(name.clone(), paths.clone(), *start_at_end)
+                .with_errors(errors.clone());
             // saved positions of this source: configured paths and glob matches
             for (key, pos) in positions {
                 if let Position::File {
@@ -625,6 +653,7 @@ fn spawn_source(
             tasks.push(tokio::spawn(async move {
                 if let Err(e) = files.run(tx).await {
                     error!(source = %n, error = %e, "file source failed");
+                    errors.set(&n, format!("{e:#}"));
                 }
             }));
         }
@@ -653,12 +682,13 @@ fn spawn_source(
                     .with_directory(directory.clone())
                     .with_start(start)
                     .with_cursor(cursor)
+                    .with_errors(errors)
                     .spawn(tx.clone())
                     .with_context(|| format!("source '{}'", src.name))?;
             }
             #[cfg(not(feature = "journald"))]
             {
-                let _ = (matches, directory, start, positions);
+                let _ = (matches, directory, start, positions, errors);
                 anyhow::bail!(
                     "source '{}': this build has no journald support (enable feature `journald`)",
                     src.name

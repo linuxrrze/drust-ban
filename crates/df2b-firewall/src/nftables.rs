@@ -102,6 +102,23 @@ impl Nftables {
         s
     }
 
+    /// Runs `nft <args>` and returns its standard output.
+    fn query(&self, args: &[&str]) -> anyhow::Result<String> {
+        let out = Command::new(&self.nft)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("spawning {}", self.nft.display()))?;
+        if !out.status.success() {
+            bail!(
+                "nft {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     fn run(&self, script: &str) -> anyhow::Result<()> {
         debug!(script, "nft -f -");
         let mut child = Command::new(&self.nft)
@@ -141,6 +158,18 @@ impl FirewallBackend for Nftables {
             return Ok(());
         }
         self.run(&self.ban_script(entries))
+    }
+
+    /// The input chain (with its table and sets) must still exist.
+    fn check(&self) -> anyhow::Result<()> {
+        let out = self.query(&["list", "chain", "inet", &self.table, "input"])?;
+        if !out.contains("@ban_v4") || !out.contains("@ban_v6") {
+            bail!(
+                "nftables chain inet {} input lost its drop rules",
+                self.table
+            );
+        }
+        Ok(())
     }
 
     fn unban(&self, nets: &[IpNet]) -> anyhow::Result<()> {
@@ -189,5 +218,34 @@ mod tests {
             "delete element inet df2b ban_v4 { 203.0.113.7/32 }\n"
         );
         assert!(nft.setup_script().contains("ip6 saddr @ban_v6 drop"));
+    }
+
+    /// A stand-in `nft` that prints `out` (exit 0) or fails.
+    fn fake_nft(tag: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("df2b-nft-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("nft");
+        std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn check() {
+        let ok = fake_nft(
+            "ok",
+            "echo 'table inet df2b { chain input { ip saddr @ban_v4 drop; ip6 saddr @ban_v6 drop } }'",
+        );
+        assert!(Nftables::new("df2b", &ok).check().is_ok());
+        let flushed = fake_nft("flushed", "echo 'table inet df2b { chain input { } }'");
+        assert!(Nftables::new("df2b", &flushed).check().is_err());
+        let gone = fake_nft("gone", "echo 'No such file or directory' >&2; exit 1");
+        let e = Nftables::new("df2b", &gone)
+            .check()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("No such file"), "{e}");
+        assert!(Nftables::new("df2b", "/nonexistent/nft").check().is_err());
     }
 }

@@ -57,7 +57,10 @@ message SourceStatus {
   uint64 lines_per_second = 2;
   // How far behind the newest log entry the source is, in milliseconds.
   uint64 lag_ms = 3;
+  // Why the source (or one of its files) stopped reading; "" = fine.
   string error = 4;
+  // File sources: bytes written but not read yet.
+  uint64 backlog_bytes = 5;
 }
 
 message HeartbeatRequest {
@@ -79,6 +82,8 @@ message HeartbeatRequest {
   // Version of the central redaction rules the agent applies ("off" = the
   // agent does not accept them, "" = none / old agent).
   string redaction_version = 12;
+  // Why firewall_healthy is false.
+  string firewall_error = 13;
 }
 
 message JailStatus {

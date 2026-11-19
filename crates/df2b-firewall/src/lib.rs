@@ -29,4 +29,10 @@ pub trait FirewallBackend: Send + Sync {
     fn ban(&self, entries: &[BanEntry]) -> anyhow::Result<()>;
 
     fn unban(&self, nets: &[IpNet]) -> anyhow::Result<()>;
+
+    /// Checks that the backend still works and its rules are in place (the
+    /// table may have been flushed by someone else). Called periodically.
+    fn check(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

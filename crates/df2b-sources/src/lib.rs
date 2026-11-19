@@ -4,8 +4,9 @@
 //! channel. Batching amortizes channel synchronization at high volume; a full
 //! channel applies back-pressure to the source.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -52,4 +53,29 @@ pub struct SourceBatch {
     pub lines: Vec<LogLine>,
     /// Position after the last line of this batch.
     pub position: Option<Position>,
+    /// Bytes not read yet after this batch (files: how far behind).
+    pub backlog: Option<u64>,
+}
+
+/// The last error of each source that stopped reading (or one of whose
+/// files did), for status reports; logged as well.
+#[derive(Debug, Default)]
+pub struct SourceErrors(Mutex<HashMap<String, String>>);
+
+impl SourceErrors {
+    pub fn set(&self, source: &str, error: String) {
+        self.lock().insert(source.to_owned(), error);
+    }
+
+    pub fn clear(&self, source: &str) {
+        self.lock().remove(source);
+    }
+
+    pub fn get(&self, source: &str) -> Option<String> {
+        self.lock().get(source).cloned()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }

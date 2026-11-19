@@ -66,6 +66,10 @@ pub struct AgentStatus {
     pub clock_skew_ms: i64,
     pub firewall_backend: String,
     pub firewall_healthy: bool,
+    /// Why the firewall is not healthy ("" = fine or unknown).
+    pub firewall_error: String,
+    /// The agent's log sources.
+    pub sources: Vec<SourceView>,
     pub last_applied_seq: u64,
     /// Open decision streams (> 0 = connected).
     pub streams: u32,
@@ -204,6 +208,19 @@ pub enum CentralError {
     Missing(&'static str),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
+}
+
+/// A log source as an agent reports it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceView {
+    pub name: String,
+    pub lines_per_second: u64,
+    /// How old the newest processed entry was (journald).
+    pub lag_ms: u64,
+    /// Bytes written but not read yet (files).
+    pub backlog_bytes: u64,
+    /// Why it stopped reading ("" = fine).
+    pub error: String,
 }
 
 /// A jail as an agent reports it.

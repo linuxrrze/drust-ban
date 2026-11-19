@@ -65,6 +65,9 @@ pub struct LinkStats {
     pub jail_policies_version: std::sync::Mutex<String>,
     pub central_jails_version: std::sync::Mutex<String>,
     pub redaction_version: std::sync::Mutex<String>,
+    /// Per-source throughput, lag and errors.
+    pub sources: crate::health::SourceHealth,
+    pub firewall: Arc<crate::health::FirewallHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,13 +621,15 @@ impl Task {
                     sent?;
                 }
                 _ = heartbeat.tick() => {
+                    let firewall_error = self.stats.firewall.error();
                     let hb = client.heartbeat(v1::HeartbeatRequest {
                         agent_version: env!("CARGO_PKG_VERSION").into(),
                         agent_time_unix_ms: Utc::now().timestamp_millis(),
-                        sources: Vec::new(), // TODO: per-source rate and lag
+                        sources: self.stats.sources.report(),
                         active_bans: self.stats.active_bans.load(Ordering::Relaxed),
                         firewall_backend: self.cfg.firewall_backend.into(),
-                        firewall_healthy: true, // TODO: backend health check
+                        firewall_healthy: firewall_error.is_none(),
+                        firewall_error: firewall_error.unwrap_or_default(),
                         last_applied_seq: self.last_seq,
                         allowlist_version: self.stats.allowlist_version.lock().map(|v| v.clone()).unwrap_or_default(),
                         jails: self.stats.jails.lock().map(|v| v.clone()).unwrap_or_default(),

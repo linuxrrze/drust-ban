@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ApiError, api, get, post } from '../lib/api';
-  import { dateTime, relative } from '../lib/format';
+  import { bytes, dateTime, duration, relative } from '../lib/format';
   import { go, href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
   import { notify } from '../lib/toast.svelte';
@@ -54,6 +54,7 @@
     if (a.revoked) return { text: 'revoked', cls: 'plain' };
     if (!a.connected) return { text: 'offline', cls: 'bad' };
     if (!a.status.firewall_healthy) return { text: 'firewall error', cls: 'bad' };
+    if (a.status.sources?.some((s) => s.error)) return { text: 'source error', cls: 'warn' };
     if (Date.parse(a.cert_not_after) - now < 3 * 86400e3) return { text: 'cert expiring', cls: 'warn' };
     return { text: 'online', cls: 'good' };
   }
@@ -183,6 +184,24 @@
           {#if current.status.last_seen}
             <span class="pill {current.status.firewall_healthy ? 'good' : 'bad'}">{current.status.firewall_healthy ? 'healthy' : 'error'}</span>
           {/if}
+          {#if current.status.firewall_error}<div class="small err-text">{current.status.firewall_error}</div>{/if}
+        </dd>
+        <dt>Sources</dt>
+        <dd>
+          {#if !current.status.sources?.length}–
+          {:else}
+            <ul class="sources">
+              {#each current.status.sources as s (s.name)}
+                <li>
+                  <span class="mono">{s.name}</span>
+                  <span class="faint small">{s.lines_per_second.toLocaleString()} lines/s</span>
+                  {#if s.lag_ms >= 10_000}<span class="pill warn" title="Newest processed entry was this old">{duration(s.lag_ms / 1000)} behind</span>{/if}
+                  {#if s.backlog_bytes >= 1 << 20}<span class="pill warn" title="Written but not read yet">{bytes(s.backlog_bytes)} unread</span>{/if}
+                  {#if s.error}<div class="small err-text">{s.error}</div>{/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </dd>
         <dt>Clock skew</dt><dd>{skew(current.status.clock_skew_ms)}</dd>
         <dt>Applied decisions</dt><dd>up to #{current.status.last_applied_seq}</dd>
@@ -258,6 +277,9 @@
   .detail .title { margin: 0; color: var(--text); font-size: 15px; word-break: break-all; }
   .detail .pill { justify-self: start; }
   .spacer { flex: 1; }
+  .sources { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+  .sources .pill { margin-left: 4px; }
+  .err-text { color: var(--bad); overflow-wrap: anywhere; }
   dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; }
   dt { color: var(--text-2); }
   dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
