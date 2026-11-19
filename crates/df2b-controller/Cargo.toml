@@ -62,3 +62,26 @@ assets = [
     ["../../README.md", "usr/share/doc/df2b-controller/README.md", "644"],
     ["../../config/oidc.example.toml", "usr/share/doc/df2b-controller/examples/oidc.example.toml", "644"],
 ]
+
+# RPM package (cargo-generate-rpm); build with packaging/rpm/build.sh (the
+# web UI in web/dist must be built first, it is embedded into the binary).
+# Paths are relative to the workspace root.
+[package.metadata.generate-rpm]
+# no license declared for the project yet (RPM requires the tag)
+license = "LicenseRef-Unspecified"
+release = "1"
+assets = [
+    { source = "target/rpm/bin/df2b-controller", dest = "/usr/bin/df2b-controller", mode = "755" },
+    { source = "packaging/systemd/df2b-controller.service", dest = "/usr/lib/systemd/system/df2b-controller.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/df2b-controller/README.md", mode = "644", doc = true },
+    { source = "config/oidc.example.toml", dest = "/usr/share/doc/df2b-controller/examples/oidc.example.toml", mode = "644", doc = true },
+]
+post_install_script = "packaging/rpm/df2b-controller/post"
+pre_uninstall_script = "packaging/rpm/df2b-controller/preun"
+post_uninstall_script = "packaging/rpm/df2b-controller/postun"
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"
+
+[package.metadata.generate-rpm.recommends]
+df2bctl = "*"

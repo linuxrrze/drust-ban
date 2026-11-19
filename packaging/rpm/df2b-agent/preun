@@ -1,0 +1,7 @@
+# shellcheck shell=sh
+# %preun of df2b-agent ($1: 0 = removal, 1 = upgrade)
+
+if [ "$1" -eq 0 ]; then
+    # like %systemd_preun
+    systemctl --no-reload disable --now df2b-agent.service >/dev/null 2>&1 || :
+fi

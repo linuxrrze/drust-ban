@@ -32,3 +32,12 @@ depends = "$auto"
 assets = [
     ["target/release/df2bctl", "usr/bin/", "755"],
 ]
+
+# RPM package (cargo-generate-rpm); build with packaging/rpm/build.sh.
+[package.metadata.generate-rpm]
+# no license declared for the project yet (RPM requires the tag)
+license = "LicenseRef-Unspecified"
+release = "1"
+assets = [
+    { source = "target/rpm/bin/df2bctl", dest = "/usr/bin/df2bctl", mode = "755" },
+]

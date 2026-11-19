@@ -1,0 +1,233 @@
+name: packages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: deb (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Build on the oldest supported target (glibc 2.36): the packages then
+    # install on Debian 12+ and Ubuntu 24.04+.
+    container: debian:bookworm
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git dpkg-dev lintian xz-utils
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build web UI
+        run: npm --prefix web ci && npm --prefix web run build
+
+      - name: Package version
+        id: version
+        shell: bash
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_version=${GITHUB_REF_NAME#v}
+            if [[ "$tag_version" != "$cargo_version" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $cargo_version"
+              exit 1
+            fi
+            deb_version="$cargo_version-1"
+          else
+            # sorts before the release of the same version
+            deb_version="${cargo_version}~ci${GITHUB_RUN_NUMBER}+g${GITHUB_SHA::7}-1"
+          fi
+          echo "deb=$deb_version" >> "$GITHUB_OUTPUT"
+          echo "package version: $deb_version"
+
+      - name: Build packages
+        env:
+          DEB_VERSION: ${{ steps.version.outputs.deb }}
+        run: packaging/deb/build.sh
+
+      - name: Inspect packages
+        shell: bash
+        run: |
+          for deb in target/debian/*.deb; do
+            echo "::group::$deb"
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+            echo "::endgroup::"
+          done
+
+      - name: Lintian
+        continue-on-error: true
+        run: lintian --info --display-info target/debian/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.arch }}
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+
+  rpm:
+    name: rpm (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Build on the oldest supported target (glibc 2.34): the packages then
+    # install on RHEL 9 and its rebuilds (AlmaLinux, Rocky), Fedora, ...
+    container: almalinux:9
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            binutils findutils gcc git-core gzip tar xz
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rpm-${{ matrix.arch }}
+
+      # built from source (a no-op when ~/.cargo/bin comes from the cache):
+      # prebuilt binaries may need a newer glibc than this container has
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked --version 0.21.1
+
+      - name: Build web UI
+        run: npm --prefix web ci && npm --prefix web run build
+
+      - name: Package version
+        id: version
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_version=${GITHUB_REF_NAME#v}
+            if [[ "$tag_version" != "$cargo_version" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $cargo_version"
+              exit 1
+            fi
+            rpm_version="$cargo_version"
+          else
+            # "~" sorts before the release of the same version (no "-" in
+            # an RPM version); the release stays 1
+            rpm_version="${cargo_version}~ci${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::7}"
+          fi
+          echo "rpm=$rpm_version" >> "$GITHUB_OUTPUT"
+          echo "package version: $rpm_version-1"
+
+      - name: Build packages
+        env:
+          RPM_VERSION: ${{ steps.version.outputs.rpm }}
+        run: packaging/rpm/build.sh
+
+      - name: Inspect packages
+        run: |
+          for rpm in target/generate-rpm/*.rpm; do
+            echo "::group::$rpm"
+            rpm -qpi "$rpm"
+            echo "--- files"
+            rpm -qplv "$rpm"
+            echo "--- config files"
+            rpm -qpc "$rpm"
+            echo "--- requires"
+            rpm -qpR "$rpm"
+            echo "--- recommends"
+            rpm -qp --recommends "$rpm"
+            echo "--- scriptlets"
+            rpm -qp --scripts "$rpm"
+            echo "::endgroup::"
+          done
+
+      # installs the packages into the build container (pulls in nftables
+      # and systemd), runs the scriptlets, then removes them again
+      - name: Install test
+        run: |
+          dnf install -y target/generate-rpm/*.rpm
+          rpm -V df2b-agent df2b-controller df2bctl
+          id df2b
+          grep -q '^filter_dir = "filters"' /etc/df2b/agent.toml
+          ls /etc/df2b/filters/*.toml
+          df2b-agent --help > /dev/null
+          df2b-controller --help > /dev/null
+          df2bctl --help > /dev/null
+          dnf remove -y df2b-agent df2b-controller df2bctl
+          test ! -e /usr/bin/df2b-agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms-${{ matrix.arch }}
+          path: target/generate-rpm/*.rpm
+          if-no-files-found: error
+
+  # one release job for both package formats (no two jobs racing to create
+  # the same release)
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [deb, rpm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          merge-multiple: true
+          path: packages
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rpms-*
+          merge-multiple: true
+          path: packages
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packages/*.deb
+            packages/*.rpm

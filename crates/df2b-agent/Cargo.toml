@@ -57,3 +57,31 @@ assets = [
     ["../../README.md", "usr/share/doc/df2b-agent/README.md", "644"],
     ["../../config/agent.example.toml", "usr/share/doc/df2b-agent/examples/agent.example.toml", "644"],
 ]
+
+# RPM package (cargo-generate-rpm); build with packaging/rpm/build.sh, which
+# generates target/rpm/agent.toml and the stripped binaries in target/rpm/bin/.
+# Paths are relative to the workspace root. The df2b user comes from the
+# sysusers.d file (systemd-sysusers in %post).
+[package.metadata.generate-rpm]
+# no license declared for the project yet (RPM requires the tag)
+license = "LicenseRef-Unspecified"
+release = "1"
+assets = [
+    { source = "target/rpm/bin/df2b-agent", dest = "/usr/bin/df2b-agent", mode = "755" },
+    { source = "target/rpm/agent.toml", dest = "/etc/df2b/agent.toml", mode = "644", config = "noreplace" },
+    { source = "filters/*.toml", dest = "/etc/df2b/filters/", mode = "644", config = "noreplace" },
+    { source = "packaging/systemd/df2b-agent.service", dest = "/usr/lib/systemd/system/df2b-agent.service", mode = "644" },
+    { source = "packaging/deb/df2b-agent.sysusers", dest = "/usr/lib/sysusers.d/df2b-agent.conf", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/df2b-agent/README.md", mode = "644", doc = true },
+    { source = "config/agent.example.toml", dest = "/usr/share/doc/df2b-agent/examples/agent.example.toml", mode = "644", doc = true },
+]
+post_install_script = "packaging/rpm/df2b-agent/post"
+pre_uninstall_script = "packaging/rpm/df2b-agent/preun"
+post_uninstall_script = "packaging/rpm/df2b-agent/postun"
+
+[package.metadata.generate-rpm.requires]
+nftables = "*"
+systemd = "*"
+
+[package.metadata.generate-rpm.recommends]
+df2bctl = "*"

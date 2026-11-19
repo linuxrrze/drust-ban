@@ -1,0 +1,11 @@
+# shellcheck shell=sh
+# %postun of df2b-agent ($1: 0 = removal, 1 = upgrade)
+#
+# The state in /var/lib/df2b (offender database, the agent's TLS key and
+# certificate) and the df2b user are kept on removal.
+
+systemctl daemon-reload >/dev/null 2>&1 || :
+if [ "$1" -ge 1 ]; then
+    # like %systemd_postun_with_restart: restart a running agent on upgrade
+    systemctl try-restart df2b-agent.service >/dev/null 2>&1 || :
+fi

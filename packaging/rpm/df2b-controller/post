@@ -1,0 +1,9 @@
+# shellcheck shell=sh
+# %post of df2b-controller ($1: 1 = installation, 2 = upgrade)
+# (DynamicUser=yes: no user to create)
+
+if [ "$1" -eq 1 ]; then
+    # like %systemd_post: enable according to the systemd presets
+    # (Fedora/RHEL default: disabled), never start on installation
+    systemctl --no-reload preset df2b-controller.service >/dev/null 2>&1 || :
+fi

@@ -24,7 +24,7 @@ cargo test -p df2b-sources --features journald -- --ignored live_journal
 
 ## Debian packages
 
-CI (`.github/workflows/deb.yml`) builds `.deb` packages for amd64 and arm64
+CI (`.github/workflows/packages.yml`) builds `.deb` packages for amd64 and arm64
 (Debian 12+, Ubuntu 24.04+): download them from the workflow run's artifacts
 or, for `v*` tags, from the GitHub release. Locally: build the web UI, then
 `cargo install cargo-deb --locked && packaging/deb/build.sh` (→ `target/debian/`).
@@ -61,6 +61,34 @@ sudo systemd-run --pty --quiet -p DynamicUser=yes -p User=df2b-controller \
 
 `apt purge` also removes `/var/lib/df2b` and `/var/lib/df2b-controller`
 (agent keys, controller CA, users and tokens).
+
+## RPM packages
+
+The same workflow builds `.rpm` packages for x86_64 and aarch64 on
+AlmaLinux 9 (glibc 2.34: RHEL 9 and its rebuilds, Fedora): workflow
+artifacts, or the GitHub release for `v*` tags. Locally: build the web UI,
+then `cargo install cargo-generate-rpm --locked && packaging/rpm/build.sh`
+(→ `target/generate-rpm/`; no `rpmbuild` needed).
+
+The packages and files are those of the Debian packages (units in
+`/usr/lib/systemd/system`, the `df2b` user from `/usr/lib/sysusers.d`);
+`/etc/df2b/agent.toml` and the filters are `%config(noreplace)`.
+
+```sh
+sudo dnf install ./df2b-agent-*.rpm ./df2bctl-*.rpm   # pulls in nftables
+```
+
+Following the Fedora/RHEL convention, installation applies the systemd
+presets (by default: disabled) and starts nothing; upgrades restart running
+services. Configure the agent as above, then:
+
+```sh
+sudo systemctl enable --now df2b-agent        # or df2b-controller
+```
+
+`dnf remove` stops and disables the services but keeps the state in
+`/var/lib/df2b` and `/var/lib/private/df2b-controller` (RPM has no purge;
+delete them by hand) and saves modified configuration files as `*.rpmsave`.
 
 ## Try it
 

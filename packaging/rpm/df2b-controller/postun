@@ -1,0 +1,11 @@
+# shellcheck shell=sh
+# %postun of df2b-controller ($1: 0 = removal, 1 = upgrade)
+#
+# The state (CA, database, tokens) in /var/lib/private/df2b-controller is
+# kept on removal.
+
+systemctl daemon-reload >/dev/null 2>&1 || :
+if [ "$1" -ge 1 ]; then
+    # like %systemd_postun_with_restart: restart a running controller on upgrade
+    systemctl try-restart df2b-controller.service >/dev/null 2>&1 || :
+fi
