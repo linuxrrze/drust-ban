@@ -1,6 +1,7 @@
 //! Persistent controller state in redb (`<state_dir>/controller.redb`):
-//! enrolled agents, the append-only decision log, the audit log and the
-//! allowlist entries added through the API.
+//! enrolled agents, the append-only decision log, the audit log, the
+//! allowlist entries added through the API, central policies and the
+//! correlation observations of the last hours.
 //!
 //! Runtime status (last heartbeat, open streams) is kept in memory only: it
 //! changes every few seconds per agent and is worthless after a restart.
@@ -23,6 +24,9 @@ const JAIL_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_p
 const FILTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("filters");
 const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("correlation_rules");
 const JAIL_DEFS: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_defs");
+/// Correlation observations in arrival order (pruned after the longest
+/// rule window).
+const OBSERVATIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("observations");
 /// Runtime settings changed through the API (e.g. "propagate").
 const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
@@ -73,6 +77,12 @@ pub struct AgentRecord {
     pub resync: bool,
 }
 
+#[derive(Serialize)]
+struct ObservationRow<'a> {
+    received: DateTime<Utc>,
+    obs: &'a crate::correlation::Stored,
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
@@ -93,6 +103,7 @@ impl Store {
         tx.open_table(FILTERS)?;
         tx.open_table(JAIL_DEFS)?;
         tx.open_table(RULES)?;
+        tx.open_table(OBSERVATIONS)?;
         tx.commit()?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -331,6 +342,87 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Appends correlation observations, and the correlator's pauses and
+    /// hits if given, in one transaction.
+    pub fn append_observations(
+        &self,
+        received: DateTime<Utc>,
+        obs: &[crate::correlation::Stored],
+        meta: Option<&crate::correlation::Meta>,
+    ) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(OBSERVATIONS)?;
+            let first = t.last()?.map_or(0, |(k, _)| k.value()) + 1;
+            for (seq, o) in (first..).zip(obs) {
+                let row = ObservationRow { received, obs: o };
+                t.insert(seq, serde_json::to_vec(&row)?.as_slice())?;
+            }
+            if let Some(m) = meta {
+                tx.open_table(SETTINGS)?
+                    .insert("correlation", serde_json::to_vec(m)?.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Stored observations received at or after `since`, in order.
+    /// Unreadable rows (an older format) are skipped.
+    pub fn observations(
+        &self,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<crate::correlation::Stored>> {
+        #[derive(Deserialize)]
+        struct Row {
+            received: DateTime<Utc>,
+            obs: crate::correlation::Stored,
+        }
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for item in tx.open_table(OBSERVATIONS)?.iter()? {
+            let (_, v) = item?;
+            match serde_json::from_slice::<Row>(v.value()) {
+                Ok(r) if r.received >= since => out.push(r.obs),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(error = %e, "skipping unreadable observation"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes observations received before `before`; returns how many.
+    pub fn prune_observations(&self, before: DateTime<Utc>) -> anyhow::Result<usize> {
+        #[derive(Deserialize)]
+        struct Received {
+            received: DateTime<Utc>,
+        }
+        let tx = self.db.begin_write()?;
+        let n;
+        {
+            let mut t = tx.open_table(OBSERVATIONS)?;
+            // arrival order: everything up to the first newer row
+            let mut last = None;
+            let mut count = 0;
+            for item in t.iter()? {
+                let (k, v) = item?;
+                let old = serde_json::from_slice::<Received>(v.value())
+                    .map_or(true, |r| r.received < before);
+                if !old {
+                    break;
+                }
+                last = Some(k.value());
+                count += 1;
+            }
+            if let Some(last) = last {
+                t.retain_in(..=last, |_, _| false)?;
+            }
+            n = count;
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Calls `f` for every decision in order (startup replay).

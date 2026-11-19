@@ -314,7 +314,25 @@ impl Controller {
         );
         let jail_tx = tokio::sync::watch::channel(Arc::new(store.jail_overrides()?)).0;
         let central_tx = tokio::sync::watch::channel(Arc::new(store.central_config()?)).0;
-        let rules = Mutex::new(Arc::new(store.rules()?));
+        let rules = store.rules()?;
+        // observations of the last hours (correlation survives restarts)
+        let mut correlator = crate::correlation::Correlator::default();
+        let keep = crate::correlation::keep_for(&rules);
+        let since = now - chrono::Duration::from_std(keep).unwrap_or_default();
+        let restored = correlator.restore(
+            store.observations(since)?,
+            store.setting::<crate::correlation::Meta>("correlation")?,
+            now,
+            keep,
+        );
+        if restored > 0 {
+            tracing::info!(
+                observations = restored,
+                addresses = correlator.tracked(),
+                "correlation observations restored"
+            );
+        }
+        let rules = Mutex::new(Arc::new(rules));
         // a stored change wins over the default; an explicit flag is
         // applied by main.rs with set_propagate
         let propagate = store
@@ -349,7 +367,7 @@ impl Controller {
             jail_write: Mutex::new(()),
             central_tx,
             rules,
-            correlator: Mutex::new(Default::default()),
+            correlator: Mutex::new(correlator),
         })
     }
 
@@ -551,8 +569,36 @@ impl Controller {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .prune(now, keep);
+        let before = now - chrono::Duration::from_std(keep).unwrap_or_default();
+        if let Err(e) = self.store.prune_observations(before) {
+            tracing::warn!(error = %format!("{e:#}"), "pruning stored observations failed");
+        }
         if let Err(e) = self.prune_allowlist() {
             tracing::warn!(error = %format!("{e:#}"), "pruning the allowlist failed");
+        }
+    }
+
+    /// Writes the correlation observations accepted since the last call
+    /// (every few seconds and at shutdown; blocking).
+    pub fn flush_observations(&self) {
+        let (obs, meta) = self
+            .correlator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_unsaved();
+        if obs.is_empty() && meta.is_none() {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .append_observations(Utc::now(), &obs, meta.as_ref())
+        {
+            // memory still has them; only a restart would lose them
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                observations = obs.len(),
+                "storing correlation observations failed"
+            );
         }
     }
 
@@ -1460,6 +1506,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.correlation_offenses(&t), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn observations_survive_a_restart() {
+        use crate::correlation::{tests::rule, RuleKind, Seen};
+        let (c, dir) = ctl("observations");
+        let key: IpNet = "198.51.100.9/32".parse().unwrap();
+        let now = Utc::now();
+        let mut monitor = rule(RuleKind::Threshold, 2, 4);
+        monitor.monitor = true;
+        {
+            let mut k = c.correlator.lock().unwrap();
+            for a in ["a1", "a2"] {
+                k.record(
+                    "sshd",
+                    key,
+                    Seen {
+                        agent: a.into(),
+                        group: "web".into(),
+                        at: now,
+                        failures: 2,
+                        banned: false,
+                    },
+                );
+            }
+            assert_eq!(
+                k.evaluate(&[monitor.clone()], "sshd", key, "web", now)
+                    .len(),
+                1
+            );
+        }
+        c.flush_observations();
+        c.flush_observations(); // nothing new: no write
+        let reopen = |dir: &PathBuf| {
+            let settings = Settings {
+                state_dir: dir.clone(),
+                cert_lifetime: Duration::from_secs(3600),
+                propagate: Propagate::Global,
+                allowlist: Allowlist::default(),
+                oidc: None,
+                https_internal_ca: true,
+            };
+            Controller::open(
+                settings,
+                Ca::generate("t").unwrap(),
+                Store::open(dir).unwrap(),
+            )
+            .unwrap()
+        };
+        drop(c);
+        let c = reopen(&dir);
+        {
+            let mut k = c.correlator.lock().unwrap();
+            assert_eq!(k.recent(&key).len(), 2, "observations restored");
+            assert_eq!(k.hits().len(), 1, "monitor hits restored");
+            assert!(
+                k.evaluate(&[monitor], "sshd", key, "web", now).is_empty(),
+                "no second firing after the restart"
+            );
+        }
+        // pruned from the database once older than the longest window
+        assert_eq!(
+            c.store
+                .prune_observations(now - chrono::Duration::minutes(1))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.store
+                .prune_observations(Utc::now() + chrono::Duration::seconds(1))
+                .unwrap(),
+            2
+        );
+        drop(c);
+        let c = reopen(&dir);
+        assert_eq!(c.correlator.lock().unwrap().tracked(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

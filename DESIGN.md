@@ -369,7 +369,8 @@ cloud firewall APIs, webhooks (chat, SIEM).
   one second of log lines is processed again; bans from that window are
   already kept from double-counting by the offender records that were saved.
 - **Controller** (now): `redb` at `<state_dir>/controller.redb` with enrolled
-  agents and the decision log; runtime status (heartbeats, connections) is in
+  agents, the decision and audit logs, allowlist, policies, central jails,
+  correlation rules and the observations of the last hours; runtime status (heartbeats, connections) is in
   memory only. Planned: `sqlx` with SQLite by default, PostgreSQL for HA/large setups.
   Tables: `agents`, `decisions`, `observations_rollup` (per minute, pruned after
   N days), `offense_history`, `users`, `api_tokens`, `audit_log`.
@@ -719,7 +720,15 @@ df2bctl config check | reload
     to now; older than 24 h dropped), so reports queued while an agent was
     offline do not look like a fresh burst. Observations are kept in
     memory for the longest rule window (at least an hour), for at most
-    200 000 addresses; a restart starts them afresh.
+    200 000 addresses.
+  - **Across restarts**: accepted observations are buffered and written to
+    redb `observations` every 5 s in one transaction (and at shutdown),
+    together with the firing pauses and monitor hits (settings key
+    `correlation`) when they changed. At start they are replayed (those
+    within the longest window), so a restart loses at most the last 5 s,
+    does not fire a rule again for an address it already fired for, and
+    keeps the monitor list. Rows are pruned with the in-memory ones (every
+    minute, older than the longest window).
   - Rules (stored in redb `correlation_rules`): `threshold` — at least N
     failures from at least M different agents within a window (local ban
     reports are votes, not failures); `quorum` — at least M (≥ 2) agents
@@ -740,14 +749,11 @@ df2bctl config check | reload
     days (exact target), also ended ones; bans a person lifted (unban by a
     user, e.g. a false positive or an allowlist entry) are forgiven. The
     count is kept from the decision log (rebuilt at start, updated on every
-    append), so it survives controller restarts although observations do
-    not; the reason says "offense n" and the address page shows the count.
+    append), so it survives controller restarts; the reason says "offense n" and the address page shows the count.
     When several rules fire for the same address in one report, only the
     longest ban is recorded.
 - Not yet:
-  observation timelines and sample log lines (needs observation reporting),
-  ASN/GeoIP, observations kept across controller restarts, sample log
-  lines.
+  sample log lines (agents send counts only), ASN/GeoIP.
 
 Pages:
 

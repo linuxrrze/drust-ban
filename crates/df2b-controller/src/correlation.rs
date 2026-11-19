@@ -12,7 +12,9 @@
 //! then only counts that group's agents and bans in that group). In monitor
 //! mode it only records what it would have banned. Observations are kept
 //! in memory for the longest window (at least an hour, for the address
-//! page); a controller restart starts them afresh.
+//! page). They are also written to the database every few seconds and
+//! replayed at startup, with the firing pauses and monitor hits, so a
+//! controller restart loses at most the last few seconds.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -155,8 +157,28 @@ pub struct Seen {
     pub banned: bool,
 }
 
+/// An observation as stored in the database.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stored {
+    pub jail: String,
+    pub key: IpNet,
+    pub agent: String,
+    pub group: String,
+    pub at: DateTime<Utc>,
+    pub failures: u32,
+    pub banned: bool,
+}
+
+/// Firing pauses and monitor hits, stored as one value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Meta {
+    /// (rule, jail, key, not before)
+    pub fired: Vec<(String, String, IpNet, DateTime<Utc>)>,
+    pub hits: Vec<Trigger>,
+}
+
 /// A rule that fired.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trigger {
     pub rule: String,
     pub jail: String,
@@ -176,6 +198,10 @@ pub struct Correlator {
     rate: HashMap<String, (i64, u32)>,
     hits: VecDeque<Trigger>,
     dropped: u64,
+    /// accepted since the last flush (written to the database)
+    pending: Vec<Stored>,
+    /// fired or hits changed since the last flush
+    meta_dirty: bool,
 }
 
 impl Correlator {
@@ -192,6 +218,23 @@ impl Correlator {
 
     /// Records an observation; false if the memory bound was reached.
     pub fn record(&mut self, jail: &str, key: IpNet, s: Seen) -> bool {
+        let stored = Stored {
+            jail: jail.to_owned(),
+            key,
+            agent: s.agent.clone(),
+            group: s.group.clone(),
+            at: s.at,
+            failures: s.failures,
+            banned: s.banned,
+        };
+        if !self.insert(jail, key, s) {
+            return false;
+        }
+        self.pending.push(stored);
+        true
+    }
+
+    fn insert(&mut self, jail: &str, key: IpNet, s: Seen) -> bool {
         let k = (jail.to_owned(), key);
         if !self.seen.contains_key(&k) && self.seen.len() >= MAX_KEYS {
             self.dropped += 1;
@@ -203,8 +246,61 @@ impl Correlator {
             }
             return false;
         }
-        self.seen.entry(k).or_default().push_back(s);
+        let q = self.seen.entry(k).or_default();
+        // agents report in order, but several agents interleave: keep the
+        // queue sorted so pruning from the front stays correct
+        let pos = q.iter().rposition(|e| e.at <= s.at).map_or(0, |i| i + 1);
+        q.insert(pos, s);
         true
+    }
+
+    /// Replays stored observations and state (startup). Observations
+    /// older than `keep` and expired pauses are skipped.
+    pub fn restore(
+        &mut self,
+        observations: impl IntoIterator<Item = Stored>,
+        meta: Option<Meta>,
+        now: DateTime<Utc>,
+        keep: Duration,
+    ) -> usize {
+        let since = now - TimeDelta::from_std(keep).unwrap_or(TimeDelta::MAX);
+        let mut n = 0;
+        for o in observations.into_iter().filter(|o| o.at >= since) {
+            let seen = Seen {
+                agent: o.agent,
+                group: o.group,
+                at: o.at,
+                failures: o.failures,
+                banned: o.banned,
+            };
+            if self.insert(&o.jail, o.key, seen) {
+                n += 1;
+            }
+        }
+        if let Some(m) = meta {
+            self.fired.extend(
+                m.fired
+                    .into_iter()
+                    .filter(|f| f.3 > now)
+                    .map(|(r, j, k, t)| ((r, j, k), t)),
+            );
+            self.hits = m.hits.into_iter().take(MAX_HITS).collect();
+        }
+        n
+    }
+
+    /// What to write to the database since the last call: new
+    /// observations, and the firing pauses and hits if they changed.
+    pub fn take_unsaved(&mut self) -> (Vec<Stored>, Option<Meta>) {
+        let meta = std::mem::take(&mut self.meta_dirty).then(|| Meta {
+            fired: self
+                .fired
+                .iter()
+                .map(|((r, j, k), t)| (r.clone(), j.clone(), *k, *t))
+                .collect(),
+            hits: self.hits.iter().cloned().collect(),
+        });
+        (std::mem::take(&mut self.pending), meta)
     }
 
     /// Rules that fire for this key now.
@@ -262,6 +358,7 @@ impl Correlator {
                 fired_key,
                 now + TimeDelta::from_std(pause).unwrap_or(TimeDelta::MAX),
             );
+            self.meta_dirty = true;
             let t = Trigger {
                 rule: r.name.clone(),
                 jail: jail.to_owned(),
@@ -314,6 +411,24 @@ impl Correlator {
     pub fn tracked(&self) -> usize {
         self.seen.len()
     }
+
+    #[cfg(test)]
+    fn seen_for_test(&self) -> Vec<Stored> {
+        self.seen
+            .iter()
+            .flat_map(|((jail, key), q)| {
+                q.iter().map(move |s| Stored {
+                    jail: jail.clone(),
+                    key: *key,
+                    agent: s.agent.clone(),
+                    group: s.group.clone(),
+                    at: s.at,
+                    failures: s.failures,
+                    banned: s.banned,
+                })
+            })
+            .collect()
+    }
 }
 
 /// How long observations are kept for these rules.
@@ -327,7 +442,7 @@ pub fn keep_for(rules: &[Rule]) -> Duration {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn rule(kind: RuleKind, min_agents: u32, min_failures: u32) -> Rule {
@@ -357,6 +472,60 @@ mod tests {
             failures,
             banned,
         }
+    }
+
+    #[test]
+    fn persistence_round_trip() {
+        let now = Utc::now();
+        let key: IpNet = "198.51.100.7/32".parse().unwrap();
+        let mut c = Correlator::default();
+        // out of order across agents: kept sorted
+        c.record("sshd", key, seen("a2", "web", now, 3, false));
+        c.record(
+            "sshd",
+            key,
+            seen("a1", "web", now - TimeDelta::minutes(2), 2, false),
+        );
+        let mut monitor = rule(RuleKind::Threshold, 2, 5);
+        monitor.monitor = true;
+        assert_eq!(
+            c.evaluate(&[monitor.clone()], "sshd", key, "web", now)
+                .len(),
+            1
+        );
+        let (obs, meta) = c.take_unsaved();
+        assert_eq!(obs.len(), 2);
+        let meta = meta.expect("fired changed");
+        assert_eq!((meta.fired.len(), meta.hits.len()), (1, 1));
+        assert_eq!(c.take_unsaved(), (vec![], None), "nothing new");
+
+        // a fresh correlator from what was stored, plus one too old
+        let mut old = obs[0].clone();
+        old.at = now - TimeDelta::hours(3);
+        let mut r = Correlator::default();
+        let meta = serde_json::from_slice(&serde_json::to_vec(&meta).unwrap()).unwrap();
+        let n = r.restore(obs.into_iter().chain([old]), Some(meta), now, MIN_KEEP);
+        assert_eq!(n, 2, "the old one is skipped");
+        assert_eq!(r.recent(&key).len(), 2);
+        assert_eq!(r.hits().len(), 1);
+        assert!(
+            r.evaluate(&[monitor.clone()], "sshd", key, "web", now)
+                .is_empty(),
+            "the pause survives"
+        );
+        assert_eq!(r.take_unsaved(), (vec![], None), "replayed, not new");
+        // expired pauses are not restored
+        let mut r = Correlator::default();
+        let expired = Meta {
+            fired: vec![("r".into(), "sshd".into(), key, now - TimeDelta::seconds(1))],
+            hits: vec![],
+        };
+        r.restore(c.seen_for_test(), Some(expired), now, MIN_KEEP);
+        assert_eq!(r.evaluate(&[monitor], "sshd", key, "web", now).len(), 1);
+        // sorted: pruning keeps the newer one
+        r.prune(now, Duration::from_secs(60));
+        assert_eq!(r.recent(&key).len(), 1);
+        assert_eq!(r.recent(&key)[0].2.agent, "a2");
     }
 
     #[test]

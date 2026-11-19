@@ -6,8 +6,9 @@
 //! with roles, manual ban/unban, agents, audit log), web UI with local users
 //! or OpenID Connect and live updates (SSE).
 //!
-//! TODO: observation rollups and correlation policies, sqlx storage, log
-//! compaction.
+//! Also: central policies and jails, correlation rules with escalation.
+//!
+//! TODO: sqlx storage, log compaction.
 
 mod api;
 mod central;
@@ -431,11 +432,28 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         }
     };
 
+    // correlation observations to the database (a restart loses at most
+    // the last few seconds)
+    let flush = {
+        let ctl = ctl.clone();
+        async move {
+            let mut t = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                t.tick().await;
+                let c = ctl.clone();
+                let _ = tokio::task::spawn_blocking(move || c.flush_observations()).await;
+            }
+        }
+    };
+
     tokio::select! {
         r = grpc => r.context("agent service")?,
         () = rest => {}
         _ = housekeeping => {}
+        _ = flush => {}
     }
+    let c = ctl.clone();
+    let _ = tokio::task::spawn_blocking(move || c.flush_observations()).await;
     info!("shut down");
     Ok(())
 }
