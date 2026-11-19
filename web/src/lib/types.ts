@@ -8,6 +8,7 @@ export interface Me {
   auth: 'session' | 'token';
   method: 'password' | 'oidc' | 'token';
   csrf_token: string | null;
+  must_change_password: boolean;
 }
 
 export interface AuthMethods {
@@ -108,4 +109,13 @@ export interface SessionInfo {
   remote_addr: string | null;
   user_agent: string | null;
   current: boolean;
+}
+
+export interface UserInfo {
+  name: string;
+  role: Role;
+  created_at: string;
+  password_changed_at: string;
+  must_change_password: boolean;
+  sessions: number;
 }

@@ -11,11 +11,15 @@
   import Ip from './pages/Ip.svelte';
   import Login from './pages/Login.svelte';
   import Sessions from './pages/Sessions.svelte';
+  import Users from './pages/Users.svelte';
+  import Account from './pages/Account.svelte';
+  import ChangePassword from './components/ChangePassword.svelte';
 
   checkSession();
 
   $effect(() => {
-    if (session.me) startLive();
+    // a temporary password allows nothing but changing it
+    if (session.me && !session.me.must_change_password) startLive();
     else stopLive();
   });
 
@@ -30,16 +34,27 @@
     { id: 'bans', label: 'Bans', show: true },
     { id: 'agents', label: 'Agents', show: true },
     { id: 'ip', label: 'Address lookup', show: true },
+    { id: 'users', label: 'Users', show: can('admin') },
     { id: 'sessions', label: 'Sessions', show: can('admin') },
     { id: 'audit', label: 'Audit log', show: can('admin') },
   ]);
   let menuOpen = $state(false);
+  const adminPages = ['users', 'sessions', 'audit'];
 </script>
 
 {#if !session.checked}
   <div class="empty">Loading…</div>
 {:else if !session.me}
   <Login />
+{:else if session.me.must_change_password}
+  <main class="forced">
+    <div class="card">
+      <h1>Choose a new password</h1>
+      <p class="muted">Signed in as {session.me.name}.</p>
+      <ChangePassword forced />
+      <button class="link out" onclick={logout}>Sign out</button>
+    </div>
+  </main>
 {:else}
   <div class="shell">
     <header>
@@ -58,7 +73,7 @@
         <span class="dot" class:on={liveConnected()}></span>
         <span class="live-text">{liveConnected() ? 'live' : 'offline'}</span>
       </span>
-      <span class="user">{session.me.name} <span class="faint">· {session.me.role}</span></span>
+      <a class="user" href={href('account')} title="Your account">{session.me.name} <span class="faint">· {session.me.role}</span></a>
       {#if session.me.auth === 'session'}
         <button onclick={logout}>Log out</button>
       {/if}
@@ -72,9 +87,15 @@
         <Agents selected={route.parts[1] ?? null} />
       {:else if page === 'ip'}
         {#key route.parts[1]}<Ip addr={route.parts.slice(1).join('/')} />{/key}
-      {:else if page === 'sessions' && can('admin')}
+      {:else if page === 'account'}
+        <Account />
+      {:else if adminPages.includes(page) && !can('admin')}
+        <div class="card empty">This page needs the admin role. <a href={href()}>Go to the overview</a></div>
+      {:else if page === 'users'}
+        <Users />
+      {:else if page === 'sessions'}
         <Sessions />
-      {:else if page === 'audit' && can('admin')}
+      {:else if page === 'audit'}
         <Audit />
       {:else}
         <div class="card empty">Page not found. <a href={href()}>Go to the overview</a></div>
@@ -101,7 +122,11 @@
   .live { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12.5px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); }
   .dot.on { background: var(--good); }
-  .user { font-weight: 550; }
+  .user { font-weight: 550; color: var(--text); }
+  .forced { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+  .forced .card { width: min(420px, 100%); display: grid; gap: 12px; padding: 24px; }
+  .forced p { margin: 0; }
+  .out { justify-self: start; }
   main { padding: 24px; max-width: 1400px; margin: 0 auto; }
   .menu-btn { display: none; }
   @media (max-width: 760px) {

@@ -87,7 +87,9 @@ cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl user add ada --role ad
 # also: user list, user passwd ada, user set-role ada viewer, user delete ada
 ```
 
-Then open `https://<controller>:7444/`. With the internal CA the browser warns
+Further users can be added by an admin on the "Users" page (with a temporary
+password the user must change at the first sign-in). Then open
+`https://<controller>:7444/`. With the internal CA the browser warns
 until you trust `<state-dir>/ca.pem` and use the name `df2b-controller` (or a
 `--name`); for a public name use `--https-cert/--https-key`.
 

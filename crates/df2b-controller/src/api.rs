@@ -109,6 +109,18 @@ pub struct Caller {
     pub role: Role,
     pub addr: Option<SocketAddr>,
     pub auth: Auth,
+    /// Local user with a temporary password (set by an admin).
+    pub must_change_password: bool,
+}
+
+/// What a session with a temporary password may still do.
+fn allowed_before_password_change(method: &Method, path: &str) -> bool {
+    matches!(
+        (method, path),
+        (&Method::GET, "/api/v1/whoami")
+            | (&Method::POST, "/api/v1/session/password")
+            | (&Method::DELETE, "/api/v1/session")
+    )
 }
 
 fn unauthorized(m: &str) -> ApiError {
@@ -120,7 +132,7 @@ fn unauthorized(m: &str) -> ApiError {
 fn session_user(
     ctl: &Controller,
     secret: &str,
-) -> anyhow::Result<Option<(String, Role, session::Session)>> {
+) -> anyhow::Result<Option<(String, Role, bool, session::Session)>> {
     let Some(s) = ctl.sessions.get(secret) else {
         return Ok(None);
     };
@@ -129,7 +141,7 @@ fn session_user(
             password_changed_at,
         } => match files::load_user(&ctl.settings.state_dir, &s.user)? {
             Some(u) if u.password_changed_at == *password_changed_at => {
-                Ok(Some((u.name, u.role, s)))
+                Ok(Some((u.name, u.role, u.must_change_password, s)))
             }
             _ => {
                 // user deleted or password changed
@@ -137,7 +149,7 @@ fn session_user(
                 Ok(None)
             }
         },
-        session::Kind::Oidc { role, .. } => Ok(Some((s.user.clone(), *role, s))),
+        session::Kind::Oidc { role, .. } => Ok(Some((s.user.clone(), *role, false, s))),
     }
 }
 
@@ -215,6 +227,7 @@ impl FromRequestParts<Arc<Controller>> for Caller {
                     role: f.role,
                     addr,
                     auth: Auth::Token(token),
+                    must_change_password: false,
                 }),
                 None => {
                     warn!(?addr, "rejected API request with unknown or expired token");
@@ -234,7 +247,7 @@ impl FromRequestParts<Arc<Controller>> for Caller {
             .await
             .map_err(ApiError::internal)?
             .map_err(ApiError::internal)?;
-        let Some((name, role, sess)) = found else {
+        let Some((name, role, must_change, sess)) = found else {
             return Err(unauthorized("session expired, please log in again"));
         };
         // cookies are sent by the browser automatically; the CSRF token
@@ -251,10 +264,17 @@ impl FromRequestParts<Arc<Controller>> for Caller {
                 ));
             }
         }
+        if must_change && !allowed_before_password_change(&parts.method, parts.uri.path()) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "you must change your temporary password first",
+            ));
+        }
         Ok(Caller {
             name,
             role,
             addr,
+            must_change_password: must_change,
             auth: Auth::Session {
                 secret,
                 csrf: sess.csrf,
@@ -284,6 +304,13 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/session", post(login).delete(logout))
         .route("/api/v1/auth-methods", get(auth_methods))
         .route("/api/v1/sessions", get(list_sessions).delete(end_sessions))
+        .route("/api/v1/session/password", post(change_own_password))
+        .route("/api/v1/users", get(list_users).post(create_user))
+        .route(
+            "/api/v1/users/:name",
+            axum::routing::patch(update_user).delete(delete_user),
+        )
+        .route("/api/v1/users/:name/password", post(reset_password))
         .route("/api/v1/sessions/:id", axum::routing::delete(end_session))
         .route("/api/v1/oidc/login", get(oidc_login))
         .route("/api/v1/oidc/callback", get(oidc_callback))
@@ -329,6 +356,7 @@ async fn whoami(caller: Caller) -> Json<Value> {
     Json(json!({
         "name": caller.name, "role": caller.role, "auth": auth,
         "method": method, "csrf_token": csrf,
+        "must_change_password": caller.must_change_password,
     }))
 }
 
@@ -432,6 +460,7 @@ async fn login(
         Json(json!({
             "name": user.name, "role": user.role, "auth": "session",
             "method": "password", "csrf_token": sess.csrf,
+            "must_change_password": user.must_change_password,
         })),
     )
         .into_response())
@@ -452,6 +481,317 @@ async fn logout(caller: Caller, State(ctl): State<Arc<Controller>>) -> Response 
         Json(json!({ "logged_out": true, "logout_url": logout_url })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------- users (local)
+
+fn conflict(m: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, m)
+}
+
+/// Rules that do not need the file system.
+fn check_new_password(name: &str, pw: &str) -> Result<(), ApiError> {
+    files::check_password(name, pw).map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnPasswordChange {
+    current_password: String,
+    new_password: String,
+}
+
+/// Any local user: change the own password (current one required). The
+/// session is replaced (new cookie and CSRF token); other sessions end.
+async fn change_own_password(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<OwnPasswordChange>,
+) -> Result<Response, ApiError> {
+    let Auth::Session { oidc: false, .. } = &caller.auth else {
+        return Err(ApiError::bad_request(
+            "only local users signed in with a password can change it here",
+        ));
+    };
+    let name = caller.name.clone();
+    check_new_password(&name, &req.new_password)?;
+    if req.new_password == req.current_password {
+        return Err(ApiError::bad_request(
+            "the new password must differ from the current one",
+        ));
+    }
+    if req.current_password.len() > files::MAX_PASSWORD_LEN {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "the current password is wrong",
+        ));
+    }
+    let ip = Some(addr.ip());
+    if !ctl.sessions.login_allowed(ip, &name) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many wrong passwords, try again in 15 minutes",
+        ));
+    }
+    let _slot = LOGIN_SLOTS.acquire().await.map_err(ApiError::internal)?;
+    let c = ctl.clone();
+    let n = name.clone();
+    let changed = blocking(move || {
+        let dir = &c.settings.state_dir;
+        let user = files::load_user(dir, &n)?;
+        let ok = files::verify_password(
+            user.as_ref().map(|u| u.password_hash.as_str()),
+            &req.current_password,
+        );
+        if !ok {
+            return Ok(None);
+        }
+        let at = files::set_password(dir, &n, &req.new_password, false)?;
+        Ok(Some((at, user.map(|u| u.role))))
+    })
+    .await?;
+    let Some((changed_at, role)) = changed else {
+        // 403, not 401: the session itself is fine
+        ctl.sessions.login_failed(ip, &name);
+        warn!(%addr, user = %name, "wrong current password");
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "the current password is wrong",
+        ));
+    };
+    ctl.sessions.end_user(Some(&name));
+    let (secret, sess) = ctl.sessions.create(
+        &name,
+        session::Kind::Password {
+            password_changed_at: changed_at,
+        },
+        session::MAX_AGE,
+        session::Client::new(addr, user_agent(&headers)),
+    );
+    let c = ctl.clone();
+    let n = name.clone();
+    blocking(move || {
+        c.audit(
+            &n,
+            Some(addr.to_string()),
+            "user.password_change",
+            json!({}),
+        )
+    })
+    .await?;
+    Ok((
+        [(header::SET_COOKIE, session::set_cookie(&secret))],
+        Json(json!({
+            "name": name, "role": role, "auth": "session", "method": "password",
+            "csrf_token": sess.csrf, "must_change_password": false,
+        })),
+    )
+        .into_response())
+}
+
+/// Admin: local users with their number of live sessions.
+async fn list_users(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    let users = blocking(move || files::list_users(&c.settings.state_dir)).await?;
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for s in ctl.sessions.list() {
+        if s.method == "password" {
+            *counts.entry(s.user).or_default() += 1;
+        }
+    }
+    let list: Vec<Value> = users
+        .iter()
+        .map(|u| {
+            json!({
+                "name": u.name, "role": u.role, "created_at": u.created_at,
+                "password_changed_at": u.password_changed_at,
+                "must_change_password": u.must_change_password,
+                "sessions": counts.get(&u.name).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "users": list,
+        "password_login": ctl.settings.oidc.as_ref().map_or(true, |o| !o.config.disable_password_login),
+    })))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewUser {
+    name: String,
+    role: Role,
+    password: String,
+    /// must be changed at the first login (default)
+    #[serde(default = "default_true")]
+    temporary: bool,
+}
+
+/// Admin: creates a local user.
+async fn create_user(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Json(req): Json<NewUser>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    caller.require(Role::Admin)?;
+    if !files::valid_name(&req.name) {
+        return Err(ApiError::bad_request(
+            "invalid user name (letters, digits, - _ . @; at most 64)",
+        ));
+    }
+    check_new_password(&req.name, &req.password)?;
+    let c = ctl.clone();
+    let n = req.name.clone();
+    let taken = blocking(move || {
+        let dir = &c.settings.state_dir;
+        Ok(files::load_user(dir, &n)?.is_some()
+            || files::list_api_tokens(dir)?.iter().any(|t| t.name == n))
+    })
+    .await?;
+    if taken {
+        return Err(conflict(format!(
+            "{:?} is already a user or API token name",
+            req.name
+        )));
+    }
+    let _slot = LOGIN_SLOTS.acquire().await.map_err(ApiError::internal)?;
+    let c = ctl.clone();
+    let (name, role, temporary) = (req.name.clone(), req.role, req.temporary);
+    blocking(move || {
+        files::create_user_with(&c.settings.state_dir, &name, role, &req.password, temporary)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "user.create",
+            json!({ "user": name, "role": role, "temporary_password": temporary }),
+        )
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "created": req.name, "role": req.role })),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserUpdate {
+    role: Role,
+}
+
+async fn load_existing(ctl: &Arc<Controller>, name: &str) -> Result<files::UserFile, ApiError> {
+    let c = ctl.clone();
+    let n = name.to_owned();
+    blocking(move || files::load_user(&c.settings.state_dir, &n))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no user {name:?}")))
+}
+
+/// Admin: changes a user's role (effective on their next request).
+async fn update_user(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Json(req): Json<UserUpdate>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let old = load_existing(&ctl, &name).await?;
+    if name == caller.name && req.role < Role::Admin {
+        return Err(conflict(
+            "you cannot lower your own role (ask another admin, or use df2b-controller on the host)",
+        ));
+    }
+    let c = ctl.clone();
+    let n = name.clone();
+    blocking(move || {
+        files::update_user(&c.settings.state_dir, &n, Some(req.role), None)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "user.update",
+            json!({ "user": n, "role": req.role, "previous_role": old.role }),
+        )
+    })
+    .await?;
+    Ok(Json(json!({ "user": name, "role": req.role })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordReset {
+    password: String,
+    #[serde(default = "default_true")]
+    temporary: bool,
+}
+
+/// Admin: sets a new (by default temporary) password; the user's sessions
+/// end.
+async fn reset_password(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Json(req): Json<PasswordReset>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    load_existing(&ctl, &name).await?;
+    if name == caller.name {
+        return Err(conflict(
+            "change your own password with your current one (account menu)",
+        ));
+    }
+    check_new_password(&name, &req.password)?;
+    let _slot = LOGIN_SLOTS.acquire().await.map_err(ApiError::internal)?;
+    let c = ctl.clone();
+    let n = name.clone();
+    let temporary = req.temporary;
+    blocking(move || {
+        files::set_password(&c.settings.state_dir, &n, &req.password, temporary)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "user.password_reset",
+            json!({ "user": n, "temporary_password": temporary }),
+        )
+    })
+    .await?;
+    let ended = ctl.sessions.end_user(Some(&name));
+    Ok(Json(json!({ "user": name, "sessions_ended": ended })))
+}
+
+/// Admin: deletes a local user; their sessions end.
+async fn delete_user(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let old = load_existing(&ctl, &name).await?;
+    if name == caller.name {
+        return Err(conflict(
+            "you cannot delete yourself (ask another admin, or use df2b-controller on the host)",
+        ));
+    }
+    let c = ctl.clone();
+    let n = name.clone();
+    blocking(move || {
+        files::delete_user(&c.settings.state_dir, &n)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "user.delete",
+            json!({ "user": n, "role": old.role }),
+        )
+    })
+    .await?;
+    let ended = ctl.sessions.end_user(Some(&name));
+    Ok(Json(json!({ "deleted": name, "sessions_ended": ended })))
 }
 
 // ------------------------------------------------------ session management
@@ -1739,6 +2079,395 @@ mod tests {
                 "ada:session.end_user",
                 "ada:session.end"
             ]
+        );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn user_management_and_password_changes() {
+        let env = Env::new("users").await;
+        files::create_user(&env.dir, "ada", Role::Admin, "correct horse battery").unwrap();
+        files::create_user(&env.dir, "otto", Role::Operator, "operator password").unwrap();
+        env.token("ci", Role::Viewer);
+        let (_, ada, v) = login(&env, "ada", "correct horse battery").await;
+        let csrf = v["csrf_token"].as_str().unwrap().to_owned();
+        assert_eq!(v["must_change_password"], false);
+        let (_, otto, ov) = login(&env, "otto", "operator password").await;
+        let otto_csrf = ov["csrf_token"].as_str().unwrap().to_owned();
+        let call =
+            |m: &'static str, path: String, cookie: String, csrf: Option<String>, body: Value| {
+                let env = &env;
+                async move { with_cookie(env, m, &path, &cookie, csrf.as_deref(), body).await }
+            };
+
+        // operators cannot manage users
+        let (st, _) = call("GET", "/api/v1/users".into(), otto.clone(), None, json!({})).await;
+        assert_eq!(st, S::FORBIDDEN);
+        let (st, _) = call(
+            "POST",
+            "/api/v1/users".into(),
+            otto.clone(),
+            Some(otto_csrf.clone()),
+            json!({ "name": "x", "role": "admin", "password": "long enough password" }),
+        )
+        .await;
+        assert_eq!(st, S::FORBIDDEN);
+
+        // create: validation, name space, success
+        for (body, want) in [
+            (
+                json!({ "name": "bad/name", "role": "viewer", "password": "long enough password" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                json!({ "name": "olga", "role": "viewer", "password": "short" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                json!({ "name": "olga1234567890", "role": "viewer", "password": "OLGA1234567890" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                json!({ "name": "oidc-provider", "role": "viewer", "password": "long enough password" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                json!({ "name": "otto", "role": "viewer", "password": "long enough password" }),
+                S::CONFLICT,
+            ),
+            (
+                json!({ "name": "ci", "role": "viewer", "password": "long enough password" }),
+                S::CONFLICT,
+            ),
+            (
+                json!({ "name": "olga", "role": "operator", "password": "temporary password" }),
+                S::CREATED,
+            ),
+        ] {
+            let (st, v) = call(
+                "POST",
+                "/api/v1/users".into(),
+                ada.clone(),
+                Some(csrf.clone()),
+                body.clone(),
+            )
+            .await;
+            assert_eq!(st, want, "{body} {v}");
+        }
+        let (_, v) = call("GET", "/api/v1/users".into(), ada.clone(), None, json!({})).await;
+        let users: Vec<(String, bool, u64)> = v["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| {
+                (
+                    u["name"].as_str().unwrap().into(),
+                    u["must_change_password"].as_bool().unwrap(),
+                    u["sessions"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            users,
+            [
+                ("ada".into(), false, 1),
+                ("olga".into(), true, 0),
+                ("otto".into(), false, 1)
+            ]
+        );
+        assert!(
+            !v.to_string().contains("argon2"),
+            "no password hashes in the API"
+        );
+
+        // temporary password: only whoami, password change and logout work
+        let (_, olga, v) = login(&env, "olga", "temporary password").await;
+        assert_eq!(v["must_change_password"], true);
+        let ocsrf = v["csrf_token"].as_str().unwrap().to_owned();
+        let (st, v) = call(
+            "GET",
+            "/api/v1/status".into(),
+            olga.clone(),
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, S::FORBIDDEN, "{v}");
+        assert_eq!(
+            call(
+                "GET",
+                "/api/v1/events".into(),
+                olga.clone(),
+                None,
+                json!({})
+            )
+            .await
+            .0,
+            S::FORBIDDEN
+        );
+        let (st, v) = call(
+            "GET",
+            "/api/v1/whoami".into(),
+            olga.clone(),
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            (st, v["must_change_password"].as_bool()),
+            (S::OK, Some(true))
+        );
+        let pw = |cur: &str, new: &str| json!({ "current_password": cur, "new_password": new });
+        let path = || "/api/v1/session/password".to_string();
+        // wrong current password: 403, and the session stays valid
+        let (st, _) = call(
+            "POST",
+            path(),
+            olga.clone(),
+            Some(ocsrf.clone()),
+            pw("wrong password!", "olga's own password"),
+        )
+        .await;
+        assert_eq!(st, S::FORBIDDEN);
+        assert_eq!(
+            call(
+                "GET",
+                "/api/v1/whoami".into(),
+                olga.clone(),
+                None,
+                json!({})
+            )
+            .await
+            .0,
+            S::OK
+        );
+        let (st, _) = call(
+            "POST",
+            path(),
+            olga.clone(),
+            Some(ocsrf.clone()),
+            pw("temporary password", "temporary password"),
+        )
+        .await;
+        assert_eq!(st, S::BAD_REQUEST, "same password");
+        let (st, _) = call(
+            "POST",
+            path(),
+            olga.clone(),
+            None,
+            pw("temporary password", "olga's own password"),
+        )
+        .await;
+        assert_eq!(st, S::FORBIDDEN, "CSRF");
+        // success: a new session replaces the old one
+        let r = env
+            .http
+            .post(format!("{}{}", env.base, path()))
+            .header("cookie", &olga)
+            .header("x-csrf-token", &ocsrf)
+            .json(&pw("temporary password", "olga's own password"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        let olga2 = r.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["must_change_password"], false);
+        assert_ne!(v["csrf_token"].as_str().unwrap(), ocsrf);
+        assert_eq!(
+            call(
+                "GET",
+                "/api/v1/whoami".into(),
+                olga.clone(),
+                None,
+                json!({})
+            )
+            .await
+            .0,
+            S::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                "GET",
+                "/api/v1/status".into(),
+                olga2.clone(),
+                None,
+                json!({})
+            )
+            .await
+            .0,
+            S::OK
+        );
+
+        // admins cannot lock themselves out
+        let u = |n: &str| format!("/api/v1/users/{n}");
+        for (m, path, body) in [
+            ("PATCH", u("ada"), json!({ "role": "operator" })),
+            ("DELETE", u("ada"), json!({})),
+            (
+                "POST",
+                format!("{}/password", u("ada")),
+                json!({ "password": "another long password" }),
+            ),
+        ] {
+            let r = env
+                .http
+                .request(m.parse().unwrap(), format!("{}{path}", env.base))
+                .header("cookie", &ada)
+                .header("x-csrf-token", &csrf)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), S::CONFLICT, "{m} {path}");
+        }
+        // role change applies at once
+        let r = env
+            .http
+            .patch(format!("{}{}", env.base, u("olga")))
+            .header("cookie", &ada)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({ "role": "viewer" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        let (_, v) = call(
+            "GET",
+            "/api/v1/whoami".into(),
+            olga2.clone(),
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(v["role"], "viewer");
+        // reset: temporary again, sessions end
+        let (st, v) = call(
+            "POST",
+            format!("{}/password", u("olga")),
+            ada.clone(),
+            Some(csrf.clone()),
+            json!({ "password": "new temporary pass" }),
+        )
+        .await;
+        assert_eq!((st, v["sessions_ended"].as_u64()), (S::OK, Some(1)));
+        assert_eq!(
+            call(
+                "GET",
+                "/api/v1/whoami".into(),
+                olga2.clone(),
+                None,
+                json!({})
+            )
+            .await
+            .0,
+            S::UNAUTHORIZED
+        );
+        let (_, _, v) = login(&env, "olga", "new temporary pass").await;
+        assert_eq!(v["must_change_password"], true);
+        // delete
+        let (st, v) = call(
+            "DELETE",
+            u("olga"),
+            ada.clone(),
+            Some(csrf.clone()),
+            json!({}),
+        )
+        .await;
+        assert_eq!((st, v["sessions_ended"].as_u64()), (S::OK, Some(1)));
+        assert_eq!(
+            call(
+                "DELETE",
+                u("olga"),
+                ada.clone(),
+                Some(csrf.clone()),
+                json!({})
+            )
+            .await
+            .0,
+            S::NOT_FOUND
+        );
+        assert_eq!(
+            call(
+                "POST",
+                format!("{}/password", u("nobody")),
+                ada.clone(),
+                Some(csrf.clone()),
+                json!({ "password": "long enough password" })
+            )
+            .await
+            .0,
+            S::NOT_FOUND
+        );
+
+        // API tokens have no password to change
+        let tok = env.token("adm", Role::Admin);
+        let r = env
+            .http
+            .post(format!("{}{}", env.base, path()))
+            .bearer_auth(&tok)
+            .json(&pw("x", "long enough password"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::BAD_REQUEST);
+
+        // wrong current passwords are rate limited like logins
+        for _ in 0..10 {
+            call(
+                "POST",
+                path(),
+                otto.clone(),
+                Some(otto_csrf.clone()),
+                pw("guess guess guess", "whatever whatever"),
+            )
+            .await;
+        }
+        let (st, _) = call(
+            "POST",
+            path(),
+            otto.clone(),
+            Some(otto_csrf.clone()),
+            pw("operator password", "a fresh new password"),
+        )
+        .await;
+        assert_eq!(st, S::TOO_MANY_REQUESTS);
+
+        let (_, v) = env
+            .call("GET", "/api/v1/audit?limit=100", &tok, json!({}))
+            .await;
+        let actions: Vec<_> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}",
+                    e["actor"].as_str().unwrap(),
+                    e["action"].as_str().unwrap()
+                )
+            })
+            .filter(|a| a.contains(":user."))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "ada:user.delete",
+                "ada:user.password_reset",
+                "ada:user.update",
+                "olga:user.password_change",
+                "ada:user.create"
+            ]
+        );
+        assert!(
+            !v.to_string().contains("temporary password"),
+            "no passwords in the audit log"
         );
         let _ = std::fs::remove_dir_all(&env.dir);
     }

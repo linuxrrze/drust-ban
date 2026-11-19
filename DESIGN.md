@@ -547,8 +547,23 @@ df2bctl config check | reload
   not lock anybody out: delete the local user or disable them at the
   provider. User agents are stored without control characters, at most 200
   characters.
-- Not yet: front-channel logout, user management and own password change
-  in the UI,
+- **User management** (admin; local users only, OIDC users live at the
+  provider): `GET/POST /api/v1/users`, `PATCH|DELETE /api/v1/users/<name>`
+  (role, delete), `POST /api/v1/users/<name>/password` (reset) and the
+  "Users" page with a password generator (20 random characters, rejection
+  sampling). Passwords set by an admin are **temporary** by default: until
+  the user picks their own, the session can only call `whoami`, change the
+  password or log out (403 otherwise), and the UI shows only the change
+  form. A reset or deletion ends the user's sessions; role changes apply at
+  the next request. Admins cannot lower their own role, delete themselves
+  or reset their own password through the API (another admin or the host
+  CLI can), so nobody locks themselves out by accident. Password rules: 12
+  to 1024 characters, not the user name. All audited, never with passwords.
+- **Own password** (`POST /api/v1/session/password`, account page): needs
+  the current password (wrong guesses count towards the login limits and
+  return 403, not 401, so the session stays); the session is replaced with
+  a new cookie and CSRF token and all other sessions of the user end.
+- Not yet: front-channel logout, API token management in the UI,
   observation timelines and sample log lines (needs observation reporting),
   ASN/GeoIP, "allow for X" after unban, policies/jails and allowlist editing,
   changing an agent's group.

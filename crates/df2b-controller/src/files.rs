@@ -283,6 +283,28 @@ pub struct UserFile {
     pub created_at: DateTime<Utc>,
     /// Sessions created before this are invalid.
     pub password_changed_at: DateTime<Utc>,
+    /// Set by an admin (temporary password): the user must choose a new
+    /// one before doing anything else.
+    #[serde(default)]
+    pub must_change_password: bool,
+}
+
+/// Longest accepted password (argon2 hashes anything, but bound the work).
+pub const MAX_PASSWORD_LEN: usize = 1024;
+
+/// Password rules (length; not the user name).
+pub fn check_password(name: &str, password: &str) -> anyhow::Result<()> {
+    let n = password.chars().count();
+    if n < MIN_PASSWORD_LEN {
+        bail!("password must have at least {MIN_PASSWORD_LEN} characters");
+    }
+    if password.len() > MAX_PASSWORD_LEN {
+        bail!("password is too long");
+    }
+    if password.trim().eq_ignore_ascii_case(name) {
+        bail!("password must not be the user name");
+    }
+    Ok(())
 }
 
 fn user_path(dir: &Path, name: &str) -> PathBuf {
@@ -335,6 +357,17 @@ fn write_user(dir: &Path, u: &UserFile) -> anyhow::Result<()> {
 }
 
 pub fn create_user(dir: &Path, name: &str, role: Role, password: &str) -> anyhow::Result<()> {
+    create_user_with(dir, name, role, password, false)
+}
+
+/// `temporary`: the user must change the password at the first login.
+pub fn create_user_with(
+    dir: &Path,
+    name: &str,
+    role: Role,
+    password: &str,
+    temporary: bool,
+) -> anyhow::Result<()> {
     if !valid_name(name) {
         bail!("invalid user name {name:?} (allowed: letters, digits, - _ . @)");
     }
@@ -346,6 +379,7 @@ pub fn create_user(dir: &Path, name: &str, role: Role, password: &str) -> anyhow
             "{name:?} is an API token name; API tokens and users share one namespace (audit log)"
         );
     }
+    check_password(name, password)?;
     let now = Utc::now();
     write_user(
         dir,
@@ -355,6 +389,7 @@ pub fn create_user(dir: &Path, name: &str, role: Role, password: &str) -> anyhow
             password_hash: hash_password(password)?,
             created_at: now,
             password_changed_at: now,
+            must_change_password: temporary,
         },
     )
 }
@@ -399,10 +434,31 @@ pub fn update_user(
         u.role = r;
     }
     if let Some(p) = password {
+        check_password(name, p)?;
         u.password_hash = hash_password(p)?;
         u.password_changed_at = Utc::now();
+        u.must_change_password = false;
     }
     write_user(dir, &u)
+}
+
+/// Sets a password; `temporary` (admin reset) forces a change at the next
+/// login. Ends the user's sessions. Returns the new `password_changed_at`.
+pub fn set_password(
+    dir: &Path,
+    name: &str,
+    password: &str,
+    temporary: bool,
+) -> anyhow::Result<DateTime<Utc>> {
+    let mut u = load_user(dir, name)?.with_context(|| format!("no user {name:?}"))?;
+    check_password(name, password)?;
+    u.password_hash = hash_password(password)?;
+    // strictly later than before, so older sessions never match
+    u.password_changed_at =
+        Utc::now().max(u.password_changed_at + chrono::Duration::microseconds(1));
+    u.must_change_password = temporary;
+    write_user(dir, &u)?;
+    Ok(u.password_changed_at)
 }
 
 /// False if there is no such user.
@@ -554,6 +610,29 @@ mod tests {
             "a new long password"
         ));
         assert_eq!(list_users(&dir).unwrap().len(), 1);
+        assert!(
+            set_password(&dir, "alice", "alice", false).is_err(),
+            "too short"
+        );
+        assert!(set_password(&dir, "alice", "Alice", false).is_err());
+        create_user(&dir, "longername1234", Role::Viewer, "longername1234").unwrap_err();
+        let t = set_password(&dir, "alice", "temporary password", true).unwrap();
+        let w = load_user(&dir, "alice").unwrap().unwrap();
+        assert!(w.must_change_password && w.password_changed_at == t && t > v.password_changed_at);
+        update_user(&dir, "alice", None, Some("chosen by alice herself")).unwrap();
+        assert!(
+            !load_user(&dir, "alice")
+                .unwrap()
+                .unwrap()
+                .must_change_password
+        );
+        // files from before the flag existed still load
+        let old = r#"{"name":"old","role":"viewer","password_hash":"$argon2id$x","created_at":"2026-01-01T00:00:00Z","password_changed_at":"2026-01-01T00:00:00Z"}"#;
+        assert!(
+            !serde_json::from_str::<UserFile>(old)
+                .unwrap()
+                .must_change_password
+        );
         assert!(delete_user(&dir, "alice").unwrap());
         assert!(!delete_user(&dir, "alice").unwrap());
         let _ = fs::remove_dir_all(&dir);

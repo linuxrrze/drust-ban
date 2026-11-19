@@ -1,3 +1,4 @@
+import { route } from './router.svelte';
 import { session } from './session.svelte';
 import type { Me } from './types';
 
@@ -61,6 +62,9 @@ export async function logout(): Promise<void> {
     next = r.logout_url;
   } finally {
     session.me = null;
+    // the next person to sign in starts on the overview, not on this page
+    history.replaceState(null, '', location.pathname);
+    route.parts = [];
   }
   // single sign-on: end the provider session too, or "Sign in" would log
   // straight back in
