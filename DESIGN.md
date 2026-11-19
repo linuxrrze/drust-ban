@@ -375,11 +375,41 @@ Rules:
 
 ### 4.5 Abuse safeguards
 
-- Per-agent rate limits on observation reports.
-- Controller and agents never ban the controller's address, management
-  networks or anything on the allowlist.
-- Circuit breaker: global cap on new global bans per minute; tripping it
-  raises an alert and requires operator confirmation.
+What a compromised agent, a malicious controller or an outside attacker
+can do is bounded (security review 2026-11-19, regression tests for each):
+
+- **Agent reports** (controller): 20 000 observations per agent and
+  minute; valid jail names (<= 64 characters); bans must carry an expiry,
+  capped at 90 days; at most 20 000 active bans per agent; reserved ranges
+  (loopback, unspecified, link-local, multicast, broadcast) are never
+  banned by anyone; the controller allowlist (including ASN entries) wins.
+  Correlation keeps at most 64 entries per agent and address and lets one
+  agent bring in at most an eighth of its address table. The clock skew
+  is clamped to +-1 day, heartbeat strings are bounded, at most 4 decision
+  streams per agent, streams close when the certificate expires.
+- **Controller decisions** (agent): bans overlapping the agent's own or the
+  central allowlist, wider than /8 resp. /16, or covering the controller's
+  address are refused; central jails and policies with findtime > 7 days
+  or ban times > 10 years are dropped; central file paths must really be
+  below `central_paths` (no glob or symlink tricks, regular files only);
+  filters are bounded (100 patterns each, 4 KiB per pattern, 2 MiB per
+  compiled regex); messages up to 64 MiB.
+- **Listeners**: at most 10 000 connections each, idle connections close
+  after 2 minutes, HTTP request headers within 30 s; enrollment checks the
+  token before any signing work.
+- **REST API**: per-client request rate; login failures counted atomically
+  per client and user name (tables full: the least-attacked entries go);
+  API tokens cannot create tokens or manage users; at most 10 pending OIDC
+  logins per client and 100 per network; 10 event streams per caller;
+  filter tests off the async workers, two at a time; user text cleaned of
+  control characters before it reaches decisions, the audit log or logs.
+- **Local**: the agent's state is private (0600, unit UMask 0077), the
+  control socket is 0600 with SO_PEERCRED; log lines over 16 KiB are cut
+  and their rest skipped, live lines cannot claim old time stamps; sshd
+  lines in syslog files are only taken from the sshd program (journald is
+  preferred: it knows the sending unit).
+- Not yet: a circuit breaker (global cap on new global bans per minute
+  that needs an operator to confirm).
 
 ---
 
