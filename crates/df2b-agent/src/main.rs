@@ -9,6 +9,7 @@ mod central;
 mod config;
 mod engine;
 mod link;
+mod outbox;
 mod remote;
 mod state;
 mod tracker;
@@ -194,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
                 tls_dir: cfg.agent.state_dir.join("tls"),
                 enroll_token,
                 firewall_backend: backend.name(),
+                state: state.clone(),
             },
             stats.clone(),
         )),
@@ -396,6 +398,9 @@ async fn main() -> anyhow::Result<()> {
             _ = &mut ctrl_c => { info!("interrupted, shutting down"); break; }
             _ = sigterm.recv() => { info!("terminated, shutting down"); break; }
         }
+    }
+    if let Some(l) = link {
+        l.shutdown(Duration::from_secs(5)).await;
     }
     state
         .flush_async(pending)

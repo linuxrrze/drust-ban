@@ -8,12 +8,12 @@
 //!   verifier pinned to the CA fingerprint in the token, send CSR + token,
 //!   store `<state_dir>/tls/{ca.pem, agent.pem, identity.json}`.
 //! - **Session**: mutual TLS 1.3; `Subscribe(last_seq)` for decisions,
-//!   heartbeats every 10 s, local bans reported every second.
+//!   heartbeats every 10 s, local bans reported every second. Reports not
+//!   sent yet are kept in `agent.redb` (see `outbox.rs`).
 //! - **Renewal**: after 2/3 of the certificate lifetime a new key + CSR is
 //!   sent over the authenticated channel; then the session reconnects with
 //!   the new certificate.
 
-use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -37,12 +37,11 @@ use tonic::Code;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::outbox::Outbox;
+
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const REPORT_BATCH: usize = 1000;
-/// Reports kept while the controller is unreachable (oldest dropped first).
-/// TODO: persist in redb so a restart does not lose them.
-const MAX_PENDING: usize = 10_000;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 pub struct LinkConfig {
@@ -51,6 +50,8 @@ pub struct LinkConfig {
     pub tls_dir: PathBuf,
     pub enroll_token: Option<EnrollToken>,
     pub firewall_backend: &'static str,
+    /// Where unsent reports are kept.
+    pub state: crate::state::State,
 }
 
 /// Values the main loop publishes for heartbeats.
@@ -184,26 +185,45 @@ pub fn parse_allowlist(a: v1::AllowlistUpdate) -> Option<FromController> {
 pub struct Link {
     pub reports: mpsc::Sender<v1::Observation>,
     pub events: mpsc::Receiver<FromController>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Link {
+    /// Stops the link and waits (at most `timeout`) until the reports not
+    /// sent yet are saved.
+    pub async fn shutdown(self, timeout: Duration) {
+        let Link {
+            reports,
+            events,
+            task,
+        } = self;
+        drop((reports, events));
+        if tokio::time::timeout(timeout, task).await.is_err() {
+            warn!("controller link did not stop in time; recent reports may be lost");
+        }
+    }
 }
 
 pub fn spawn(cfg: LinkConfig, stats: Arc<LinkStats>) -> Link {
     let (report_tx, report_rx) = mpsc::channel(4096);
     let (event_tx, event_rx) = mpsc::channel(1024);
-    tokio::spawn(async move {
+    let outbox = Outbox::open(Some(cfg.state.clone()));
+    let task = tokio::spawn(async move {
         let mut task = Task {
             cfg,
             stats,
             reports: report_rx,
             events: event_tx,
-            pending: VecDeque::new(),
-            dropped: 0,
+            outbox,
             last_seq: 0,
         };
         task.run().await;
+        task.drain_and_persist().await;
     });
     Link {
         reports: report_tx,
         events: event_rx,
+        task,
     }
 }
 
@@ -405,8 +425,7 @@ struct Task {
     stats: Arc<LinkStats>,
     reports: mpsc::Receiver<v1::Observation>,
     events: mpsc::Sender<FromController>,
-    pending: VecDeque<v1::Observation>,
-    dropped: u64,
+    outbox: Outbox,
     last_seq: u64,
 }
 
@@ -571,10 +590,15 @@ impl Task {
                     }
                 }
                 r = self.reports.recv() => match r {
-                    Some(o) => self.push(o),
+                    Some(o) => self.outbox.push(o),
                     None => return Ok(End::Shutdown),
                 },
-                _ = flush.tick() => self.flush(&mut client).await?,
+                _ = flush.tick() => {
+                    let sent = self.flush(&mut client).await;
+                    // whatever is left goes to disk
+                    self.outbox.persist().await;
+                    sent?;
+                }
                 _ = heartbeat.tick() => {
                     let hb = client.heartbeat(v1::HeartbeatRequest {
                         agent_version: env!("CARGO_PKG_VERSION").into(),
@@ -638,60 +662,52 @@ impl Task {
         Ok(())
     }
 
-    fn push(&mut self, o: v1::Observation) {
-        if self.pending.len() >= MAX_PENDING {
-            // failure counts go first: ban reports drive propagation and
-            // quorum rules
-            match self.pending.iter().position(|p| !p.locally_banned) {
-                Some(i) => {
-                    self.pending.remove(i);
-                }
-                None => {
-                    self.pending.pop_front();
-                }
-            }
-            self.dropped += 1;
-            if self.dropped.is_power_of_two() {
-                warn!(
-                    dropped = self.dropped,
-                    "controller unreachable, dropping old reports"
-                );
-            }
-        }
-        self.pending.push_back(o);
-    }
-
     async fn flush(&mut self, client: &mut AgentServiceClient<Channel>) -> anyhow::Result<()> {
-        while !self.pending.is_empty() {
-            let n = self.pending.len().min(REPORT_BATCH);
-            let batch: Vec<_> = self.pending.drain(..n).collect();
-            if let Err(e) = client
-                .report(v1::ObservationBatch {
-                    observations: batch.clone(),
-                })
-                .await
-            {
-                // keep them for the next connection
-                for o in batch.into_iter().rev() {
-                    self.pending.push_front(o);
+        while !self.outbox.is_empty() {
+            let batch = self.outbox.take(REPORT_BATCH);
+            let observations = batch.iter().map(|e| e.obs.clone()).collect();
+            match client.report(v1::ObservationBatch { observations }).await {
+                Ok(_) => self.outbox.sent(batch),
+                Err(e) => {
+                    // keep them for the next connection
+                    self.outbox.unsent(batch);
+                    return Err(e.into());
                 }
-                return Err(e.into());
             }
         }
         Ok(())
     }
 
+    /// On shutdown: takes the reports still in the channel and saves all
+    /// unsent ones.
+    async fn drain_and_persist(&mut self) {
+        self.reports.close();
+        while let Ok(o) = self.reports.try_recv() {
+            self.outbox.push(o);
+        }
+        self.outbox.persist().await;
+        if !self.outbox.is_empty() {
+            info!(
+                count = self.outbox.len(),
+                "unsent reports saved for the next start"
+            );
+        }
+    }
+
     /// Sleeps while still accepting reports. `false`: shutting down.
+    /// Saves new reports to disk once per report interval meanwhile.
     async fn wait(&mut self, d: Duration) -> bool {
         let sleep = tokio::time::sleep(d);
         tokio::pin!(sleep);
+        let mut save = tokio::time::interval(REPORT_INTERVAL);
         loop {
             tokio::select! {
                 _ = &mut sleep => return true,
                 r = self.reports.recv() => match r {
-                    Some(o) => self.push(o),
+                    Some(o) => self.outbox.push(o),
                     None => return false,
                 },
+                _ = save.tick() => self.outbox.persist().await,
             }
         }
     }

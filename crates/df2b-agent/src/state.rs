@@ -6,7 +6,9 @@
 //! - **offender records** (offense count + ban expiry per jail and key), so
 //!   active bans are re-applied after a restart and escalation continues;
 //! - the **central allowlist** last received from the controller, so it
-//!   applies after a restart even while the controller is unreachable.
+//!   applies after a restart even while the controller is unreachable;
+//! - **unsent reports** for the controller (see `outbox.rs`), so bans and
+//!   failure counts from an offline period survive a restart.
 //!
 //! Writes are buffered in [`Pending`] and committed in one transaction (one
 //! fsync) per flush interval, not per batch: at high volume, per-batch commits
@@ -29,6 +31,8 @@ use crate::engine::OffenderRecord;
 const POSITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("positions");
 const OFFENDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("offenders");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// Queue id → protobuf-encoded `v1::Observation`.
+const REPORTS: TableDefinition<u64, &[u8]> = TableDefinition::new("reports");
 const CENTRAL_ALLOWLIST: &str = "central_allowlist";
 const JAIL_POLICIES: &str = "jail_policies";
 const CENTRAL_JAILS: &str = "central_jails";
@@ -154,6 +158,7 @@ impl State {
         tx.open_table(POSITIONS)?;
         tx.open_table(OFFENDERS)?;
         tx.open_table(META)?;
+        tx.open_table(REPORTS)?;
         tx.commit()?;
         Ok(Self {
             db: Arc::new(db),
@@ -248,6 +253,36 @@ impl State {
         let tx = self.db.begin_write()?;
         tx.open_table(META)?
             .insert(CENTRAL_ALLOWLIST, serde_json::to_vec(a)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Unsent reports in queue order. Blocking.
+    pub fn load_reports(&self) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for item in tx.open_table(REPORTS)?.iter()? {
+            let (k, v) = item?;
+            out.push((k.value(), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Adds and removes unsent reports in one transaction. Blocking.
+    pub fn save_reports(&self, add: &[(u64, Vec<u8>)], remove: &[u64]) -> anyhow::Result<()> {
+        if add.is_empty() && remove.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(REPORTS)?;
+            for (id, bytes) in add {
+                t.insert(*id, bytes.as_slice())?;
+            }
+            for id in remove {
+                t.remove(*id)?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -404,6 +439,27 @@ mod tests {
         }
         let st = State::open(&dir).unwrap();
         assert_eq!(st.load().unwrap().central_redaction, Some(r));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reports_persist_in_order() {
+        let dir = tmp("reports");
+        {
+            let st = State::open(&dir).unwrap();
+            assert!(st.load_reports().unwrap().is_empty());
+            st.save_reports(
+                &[(2, b"b".to_vec()), (10, b"c".to_vec()), (1, b"a".to_vec())],
+                &[],
+            )
+            .unwrap();
+            st.save_reports(&[], &[2]).unwrap();
+        }
+        let st = State::open(&dir).unwrap();
+        assert_eq!(
+            st.load_reports().unwrap(),
+            vec![(1, b"a".to_vec()), (10, b"c".to_vec())]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -291,8 +291,9 @@ Rules:
   decision still covers the prefix; an unban decision also lifts local bans
   (offense history is kept for escalation).
 - **Revocation** also via `df2bctl agents revoke <id>` (REST, admin).
-- Not yet: reports queued only in memory while disconnected (max 10 000),
-  observations without a ban (correlation), per-source stats in heartbeats.
+- Reports queued while disconnected (max 10 000) are kept in `agent.redb`
+  across restarts (§6). Not yet: per-source stats in heartbeats; the
+  agent ignores `retry_after_ms`.
 
 #### Implementation (REST API)
 
@@ -374,8 +375,14 @@ cloud firewall APIs, webhooks (chat, SIEM).
     continues. Records are forgotten `offense_memory` (default 30 days) after
     their ban expired.
   - agent identity and certificate in `<state_dir>/tls/` (§4.4).
-  - later: queue of unsent observations. Remote decisions are not stored:
-    after a restart the agent subscribes from 0 and gets a snapshot.
+  - **unsent reports** – observations the controller has not accepted yet
+    (unreachable, or the send failed) are written once per second and
+    deleted once sent; while connected the queue is normally empty and
+    nothing is written. At most 10 000 are kept (failure counts dropped
+    before ban reports); on shutdown the rest is saved as well, so bans
+    from an offline period reach the controller after a restart. Remote
+    decisions are not stored: after a restart the agent subscribes from 0
+    and gets a snapshot.
 
   Writes are buffered and committed in **one transaction per second** (one
   fsync), not per batch – at high volume that would mean thousands of fsyncs

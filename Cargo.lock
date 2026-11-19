@@ -604,6 +604,7 @@ dependencies = [
  "humantime",
  "humantime-serde",
  "ipnet",
+ "prost",
  "redb",
  "serde",
  "serde_json",
