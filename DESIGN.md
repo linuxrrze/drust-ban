@@ -5,7 +5,9 @@ A fail2ban replacement written in Rust, with:
 - efficient ingestion of **journald** and **plain log files**,
 - **distributed** collection of attacker IPs (IPv4 and IPv6),
 - **distributed countermeasures** (bans propagated to many hosts),
-- a CLI (`df2bctl`) and a **web frontend** for management and overview.
+- a CLI (`df2bctl`) and a **web frontend** for management and overview,
+- **encrypted and mutually authenticated communication between all nodes**
+  (see §4.4).
 
 Binaries: `df2b-agent` (runs on every protected host), `df2b-controller`
 (central coordinator + web UI), `df2bctl` (CLI).
@@ -181,14 +183,49 @@ struct Decision {
 - Expiry uses absolute `expires_at`. Agents report clock skew in heartbeats
   (shown in the UI) and clamp expiries if skew is large.
 
-### 4.4 Transport and identity
+### 4.4 Transport, encryption and identity
 
-- gRPC (`tonic`) bidirectional streams over **mTLS**.
-- Enrollment: `df2bctl agents enroll-token --group web` creates a one-time
-  token. The agent generates a key pair and sends a CSR + token; the controller
-  signs it with its internal CA. Revoking an agent invalidates its certificate.
+**Requirement: every link between nodes is encrypted and authenticated.**
+Observations contain attacker and user IPs and sample log lines, and
+decisions control firewalls; neither may cross the network in plaintext or be
+accepted from an unauthenticated peer.
+
+| Link                                  | Protection                                                      |
+|---------------------------------------|-----------------------------------------------------------------|
+| agent ↔ controller (gRPC)             | TLS 1.3, **mutual** auth: agent client cert + controller server cert, both from the internal CA |
+| `df2bctl` / browser → controller      | TLS 1.3 (HTTPS); users authenticate with session/OIDC, CLI with API tokens; optional client certs |
+| controller ↔ controller (HA)          | TLS 1.3 with mutual auth; PostgreSQL connections with `sslmode=verify-full` |
+| controller → external actions         | TLS with system trust store (cloud APIs, webhooks); BGP sessions with TCP-AO/MD5 where the peer supports it |
+| `df2bctl --local` → agent             | Unix socket only (no network), access by file permissions / `SO_PEERCRED` |
+
+Rules:
+
+- **rustls only, TLS 1.3 only**, no cipher-suite configuration surface. No
+  plaintext listener except an explicit `--insecure-dev` flag that refuses to
+  bind to non-loopback addresses.
+- **Internal CA** on the controller (ECDSA P-256 or Ed25519). Agent
+  certificates are short-lived (default 30 days) and renewed automatically
+  over the existing mTLS channel; the CN/SAN is the agent id. An operator may
+  supply an external CA instead.
+- **Enrollment without trust-on-first-use**:
+  `df2bctl agents enroll-token --group web` creates a one-time, short-lived
+  token that embeds the **SHA-256 fingerprint of the controller CA**
+  (`df2b1.<secret>.<ca-fingerprint>`). The agent pins that fingerprint during
+  the first TLS handshake, so a man in the middle cannot impersonate the
+  controller. The agent generates its key pair locally (the private key never
+  leaves the host), sends a CSR + token, and receives its signed certificate.
+- **Revocation**: revoking an agent puts its certificate serial on a deny
+  list that the controller checks on every handshake and stream; open streams
+  are closed immediately. Short lifetimes bound the damage of a missed
+  revocation.
+- **Identity from the certificate only**: the controller derives the agent id
+  from the verified client certificate, never from message fields.
+- **Keys at rest**: agent key `0600`, owned by the agent user, in
+  `state_dir`; controller CA key separately protected (file `0600`, or
+  PKCS#11/TPM later).
 - Heartbeats carry: version, ingest rate, per-source lag, active ban count,
-  clock skew, firewall backend health. These feed the "connected clients" view.
+  clock skew, firewall backend health, **certificate expiry**. These feed the
+  "connected clients" view, which flags certificates close to expiry.
 
 ### 4.5 Abuse safeguards
 
@@ -381,6 +418,7 @@ systemd hardening.
 | `df2bctl filter test`        | implemented; other commands are stubs            |
 | Controller                   | health endpoint only                             |
 | gRPC protocol                | `.proto` drafted, codegen wired                  |
+| Encrypted transport (§4.4)   | TODO (milestone 2); scaffold controller serves plain HTTP on loopback only |
 | Web UI                       | placeholder                                      |
 
 ---
