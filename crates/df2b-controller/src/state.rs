@@ -49,6 +49,9 @@ pub struct Settings {
     pub allowlist: Allowlist,
     /// Web UI login with an OpenID Connect provider.
     pub oidc: Option<Arc<crate::oidc::Oidc>>,
+    /// The REST API uses a certificate from the internal CA (clients pin
+    /// its fingerprint), not an operator-provided one.
+    pub https_internal_ca: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -132,6 +135,8 @@ pub struct Controller {
     inner: Mutex<Inner>,
     events: broadcast::Sender<Arc<Decision>>,
     pub sessions: Sessions,
+    /// API token name → last request (since the controller started).
+    token_last_used: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 fn apply(active: &mut HashMap<Uuid, Decision>, d: &Decision, now: DateTime<Utc>) {
@@ -171,6 +176,7 @@ impl Controller {
             inner: Mutex::new(inner),
             events: broadcast::channel(4096).0,
             sessions: Sessions::default(),
+            token_last_used: Mutex::new(HashMap::new()),
         })
     }
 
@@ -324,6 +330,21 @@ impl Controller {
         self.sessions.prune();
     }
 
+    pub fn token_used(&self, name: &str) {
+        self.token_last_used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_owned(), Utc::now());
+    }
+
+    pub fn token_last_used(&self, name: &str) -> Option<DateTime<Utc>> {
+        self.token_last_used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .copied()
+    }
+
     /// Live decisions (for the UI); the receiver lags rather than blocks.
     pub fn events(&self) -> broadcast::Receiver<Arc<Decision>> {
         self.events.subscribe()
@@ -469,6 +490,7 @@ mod tests {
             propagate: Propagate::Global,
             allowlist: Allowlist::default(),
             oidc: None,
+            https_internal_ca: true,
         };
         let c = Controller::open(
             settings,
@@ -559,6 +581,7 @@ mod tests {
                 propagate: Propagate::Global,
                 allowlist: Allowlist::default(),
                 oidc: None,
+                https_internal_ca: true,
             },
             Ca::generate("t").unwrap(),
             Store::open(&dir).unwrap(),

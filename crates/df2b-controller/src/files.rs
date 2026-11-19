@@ -173,6 +173,9 @@ pub struct ApiTokenFile {
     pub role: Role,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// User who created it in the web UI; none: on the controller host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
 }
 
 /// Audit actor for back-channel logouts; not available as a name.
@@ -211,6 +214,16 @@ pub fn create_api_token(
     role: Role,
     ttl: Option<Duration>,
 ) -> anyhow::Result<ApiToken> {
+    create_api_token_by(dir, name, role, ttl, None)
+}
+
+pub fn create_api_token_by(
+    dir: &Path,
+    name: &str,
+    role: Role,
+    ttl: Option<Duration>,
+    created_by: Option<&str>,
+) -> anyhow::Result<ApiToken> {
     if !valid_name(name) {
         bail!("invalid token name {name:?} (allowed: letters, digits, - _ . @)");
     }
@@ -230,6 +243,7 @@ pub fn create_api_token(
             .map(chrono::Duration::from_std)
             .transpose()?
             .map(|d| now + d),
+        created_by: created_by.map(str::to_owned),
     };
     let tdir = dir.join(API_TOKENS);
     fs::create_dir_all(&tdir)?;

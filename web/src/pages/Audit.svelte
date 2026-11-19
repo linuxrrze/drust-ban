@@ -37,6 +37,8 @@
     'session.login': 'logged in',
     'session.end': 'session ended',
     'user.create': 'user created',
+    'token.create': 'API token created',
+    'token.revoke': 'API token revoked',
     'user.update': 'role changed',
     'user.password_reset': 'password reset',
     'user.password_change': 'own password changed',

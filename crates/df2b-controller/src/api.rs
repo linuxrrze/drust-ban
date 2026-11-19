@@ -222,13 +222,16 @@ impl FromRequestParts<Arc<Controller>> for Caller {
                 .await
                 .map_err(ApiError::internal)?;
             return match file {
-                Some(f) => Ok(Caller {
-                    name: f.name,
-                    role: f.role,
-                    addr,
-                    auth: Auth::Token(token),
-                    must_change_password: false,
-                }),
+                Some(f) => {
+                    ctl.token_used(&f.name);
+                    Ok(Caller {
+                        name: f.name,
+                        role: f.role,
+                        addr,
+                        auth: Auth::Token(token),
+                        must_change_password: false,
+                    })
+                }
                 None => {
                     warn!(?addr, "rejected API request with unknown or expired token");
                     Err(unauthorized("invalid or expired API token"))
@@ -306,6 +309,11 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/sessions", get(list_sessions).delete(end_sessions))
         .route("/api/v1/session/password", post(change_own_password))
         .route("/api/v1/users", get(list_users).post(create_user))
+        .route("/api/v1/api-tokens", get(list_tokens).post(create_token))
+        .route(
+            "/api/v1/api-tokens/:name",
+            axum::routing::delete(revoke_token),
+        )
         .route(
             "/api/v1/users/:name",
             axum::routing::patch(update_user).delete(delete_user),
@@ -792,6 +800,157 @@ async fn delete_user(
     .await?;
     let ended = ctl.sessions.end_user(Some(&name));
     Ok(Json(json!({ "deleted": name, "sessions_ended": ended })))
+}
+
+// ------------------------------------------------------------- API tokens
+
+/// Longest API token lifetime that can be chosen in the UI/API ("never"
+/// is allowed too, but has to be asked for explicitly).
+const MAX_TOKEN_TTL: Duration = Duration::from_secs(5 * 365 * 86400);
+
+/// Admin: API tokens (never the secrets: only hashes are stored).
+async fn list_tokens(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    let tokens = blocking(move || files::list_api_tokens(&c.settings.state_dir)).await?;
+    let now = Utc::now();
+    let own = match &caller.auth {
+        Auth::Token(_) => Some(caller.name.as_str()),
+        Auth::Session { .. } => None,
+    };
+    let list: Vec<Value> = tokens
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name, "role": t.role, "created_at": t.created_at,
+                "created_by": t.created_by, "expires_at": t.expires_at,
+                "expired": t.expires_at.is_some_and(|e| e <= now),
+                "last_used_at": ctl.token_last_used(&t.name),
+                "current": own == Some(t.name.as_str()),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "tokens": list,
+        // for the df2bctl configuration shown after creating a token
+        "ca_fingerprint": ctl.settings.https_internal_ca.then(|| df2b_tls::hex(&ctl.ca.fingerprint())),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewToken {
+    name: String,
+    role: Role,
+    /// e.g. "90d"; "never" for no expiry
+    ttl: String,
+}
+
+/// Admin, browser session only: creates a token and returns it once.
+/// Tokens cannot create tokens, so a leaked token cannot be used to plant
+/// new ones that survive its revocation.
+async fn create_token(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Json(req): Json<NewToken>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    caller.require(Role::Admin)?;
+    if matches!(caller.auth, Auth::Token(_)) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "API tokens cannot create API tokens; use the web UI or df2b-controller api-token create",
+        ));
+    }
+    if !files::valid_name(&req.name) {
+        return Err(ApiError::bad_request(
+            "invalid token name (letters, digits, - _ . @; at most 64)",
+        ));
+    }
+    let ttl = match req.ttl.as_str() {
+        "never" => None,
+        t => {
+            let d = parse_duration(t, "ttl")?;
+            if d.is_zero() || d > MAX_TOKEN_TTL {
+                return Err(ApiError::bad_request(
+                    "ttl must be between 1s and 5 years, or \"never\"",
+                ));
+            }
+            Some(d)
+        }
+    };
+    let c = ctl.clone();
+    let n = req.name.clone();
+    let taken = blocking(move || {
+        let dir = &c.settings.state_dir;
+        Ok(files::load_user(dir, &n)?.is_some()
+            || files::list_api_tokens(dir)?.iter().any(|t| t.name == n))
+    })
+    .await?;
+    if taken {
+        return Err(conflict(format!(
+            "{:?} is already a user or API token name",
+            req.name
+        )));
+    }
+    let c = ctl.clone();
+    let (name, role) = (req.name.clone(), req.role);
+    let token = blocking(move || {
+        let t = files::create_api_token_by(
+            &c.settings.state_dir,
+            &name,
+            role,
+            ttl,
+            Some(&caller.name),
+        )?;
+        let expires_at = ttl
+            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .map(|d| Utc::now() + d);
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "token.create",
+            json!({ "token": name, "role": role, "expires_at": expires_at }),
+        )?;
+        Ok((t, expires_at))
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "token": token.0.to_string(),
+            "name": req.name,
+            "role": req.role,
+            "expires_at": token.1,
+        })),
+    ))
+}
+
+/// Admin: revokes a token at once (also with a token, e.g. its own).
+async fn revoke_token(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    let n = name.clone();
+    let found = blocking(move || {
+        let found = files::revoke_api_token(&c.settings.state_dir, &n)?;
+        if found {
+            c.audit(
+                &caller.name,
+                caller.addr(),
+                "token.revoke",
+                json!({ "token": n }),
+            )?;
+        }
+        Ok(found)
+    })
+    .await?;
+    if !found {
+        return Err(ApiError::not_found(format!("no API token {name:?}")));
+    }
+    Ok(Json(json!({ "revoked": name })))
 }
 
 // ------------------------------------------------------ session management
@@ -1563,6 +1722,7 @@ mod tests {
                 propagate: Propagate::Global,
                 allowlist: Allowlist::new(["10.0.0.0/8".parse().unwrap()]),
                 oidc: None,
+                https_internal_ca: true,
             };
             let ctl = Arc::new(Controller::open(settings, ca, Store::open(&dir).unwrap()).unwrap());
             let (chain, key) = ctl.ca.issue_server(&[]).unwrap();
@@ -2468,6 +2628,184 @@ mod tests {
         assert!(
             !v.to_string().contains("temporary password"),
             "no passwords in the audit log"
+        );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn api_tokens_managed_in_the_ui() {
+        let env = Env::new("tokens").await;
+        files::create_user(&env.dir, "ada", Role::Admin, "correct horse battery").unwrap();
+        files::create_user(&env.dir, "otto", Role::Operator, "operator password").unwrap();
+        let (_, ada, v) = login(&env, "ada", "correct horse battery").await;
+        let csrf = v["csrf_token"].as_str().unwrap().to_owned();
+        let (_, otto, _) = login(&env, "otto", "operator password").await;
+        let create = |body: Value| {
+            let (env, ada, csrf) = (&env, ada.clone(), csrf.clone());
+            async move { with_cookie(env, "POST", "/api/v1/api-tokens", &ada, Some(&csrf), body).await }
+        };
+
+        assert_eq!(
+            with_cookie(&env, "GET", "/api/v1/api-tokens", &otto, None, json!({}))
+                .await
+                .0,
+            S::FORBIDDEN
+        );
+        for (body, want) in [
+            (
+                json!({ "name": "bad name", "role": "viewer", "ttl": "90d" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                json!({ "name": "ci", "role": "viewer", "ttl": "soon" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                json!({ "name": "ci", "role": "viewer", "ttl": "3650d" }),
+                S::BAD_REQUEST,
+            ),
+            (
+                json!({ "name": "ci", "role": "viewer" }),
+                S::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({ "name": "otto", "role": "viewer", "ttl": "90d" }),
+                S::CONFLICT,
+            ),
+        ] {
+            assert_eq!(create(body.clone()).await.0, want, "{body}");
+        }
+        let (st, v) = create(json!({ "name": "ci", "role": "operator", "ttl": "90d" })).await;
+        assert_eq!(st, S::CREATED, "{v}");
+        let ci = v["token"].as_str().unwrap().to_owned();
+        assert!(ci.starts_with("df2bapi1."));
+        assert!(v["expires_at"].is_string());
+        assert_eq!(
+            create(json!({ "name": "ci", "role": "viewer", "ttl": "1d" }))
+                .await
+                .0,
+            S::CONFLICT
+        );
+        let (_, v) = create(json!({ "name": "ops", "role": "admin", "ttl": "never" })).await;
+        let ops = v["token"].as_str().unwrap().to_owned();
+        assert!(v["expires_at"].is_null());
+
+        // the new tokens work with their roles
+        let (st, v) = env.call("GET", "/api/v1/whoami", &ci, json!({})).await;
+        assert_eq!((st, v["role"].as_str()), (S::OK, Some("operator")));
+        // ... but a token cannot create tokens
+        let (st, v) = env
+            .call(
+                "POST",
+                "/api/v1/api-tokens",
+                &ops,
+                json!({ "name": "x", "role": "admin", "ttl": "1d" }),
+            )
+            .await;
+        assert_eq!(st, S::FORBIDDEN, "{v}");
+
+        files::create_api_token(&env.dir, "old", Role::Viewer, Some(Duration::ZERO)).unwrap();
+        let (_, v) = env.call("GET", "/api/v1/api-tokens", &ops, json!({})).await;
+        let row = |n: &str| {
+            v["tokens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == n)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row("ci")["created_by"], "ada");
+        assert!(row("old")["created_by"].is_null(), "created on the host");
+        assert_eq!(row("old")["expired"], true);
+        assert_eq!(row("ops")["current"], true);
+        assert!(row("ci")["last_used_at"].is_string() && row("old")["last_used_at"].is_null());
+        assert_eq!(v["ca_fingerprint"].as_str().unwrap().len(), 64);
+        let text = v.to_string();
+        assert!(
+            !text.contains(&ci[9..]) && !text.contains(&ops[9..]),
+            "no secrets"
+        );
+
+        // revoke from the UI: effective at once
+        let (st, _) = with_cookie(
+            &env,
+            "DELETE",
+            "/api/v1/api-tokens/ci",
+            &ada,
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, S::FORBIDDEN, "CSRF");
+        let (st, _) = with_cookie(
+            &env,
+            "DELETE",
+            "/api/v1/api-tokens/ci",
+            &ada,
+            Some(&csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, S::OK);
+        assert_eq!(
+            env.call("GET", "/api/v1/whoami", &ci, json!({})).await.0,
+            S::UNAUTHORIZED
+        );
+        assert_eq!(
+            with_cookie(
+                &env,
+                "DELETE",
+                "/api/v1/api-tokens/ci",
+                &ada,
+                Some(&csrf),
+                json!({})
+            )
+            .await
+            .0,
+            S::NOT_FOUND
+        );
+        // a token may revoke itself
+        let r = env
+            .http
+            .delete(format!("{}/api/v1/api-tokens/ops", env.base))
+            .bearer_auth(&ops)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        assert_eq!(
+            env.call("GET", "/api/v1/whoami", &ops, json!({})).await.0,
+            S::UNAUTHORIZED
+        );
+
+        let (_, v) = with_cookie(&env, "GET", "/api/v1/audit", &ada, None, json!({})).await;
+        let actions: Vec<_> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}:{}",
+                    e["actor"].as_str().unwrap(),
+                    e["action"].as_str().unwrap(),
+                    e["details"]["token"].as_str().unwrap_or("")
+                )
+            })
+            .filter(|a| a.contains(":token."))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "ops:token.revoke:ops",
+                "ada:token.revoke:ci",
+                "ada:token.create:ops",
+                "ada:token.create:ci"
+            ]
+        );
+        assert!(
+            !v.to_string().contains("df2bapi1."),
+            "no secrets in the audit log"
         );
         let _ = std::fs::remove_dir_all(&env.dir);
     }

@@ -236,10 +236,11 @@ fn api_token(dir: &std::path::Path, cmd: ApiTokenCmd) -> anyhow::Result<()> {
                     |e| e.to_rfc3339_opts(SecondsFormat::Secs, true),
                 );
                 println!(
-                    "{:<24} {:<9} created {}  expires {exp}",
+                    "{:<24} {:<9} created {} by {}  expires {exp}",
                     t.name,
                     format!("{:?}", t.role).to_lowercase(),
-                    t.created_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+                    t.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    t.created_by.as_deref().unwrap_or("(host)"),
                 );
             }
         }
@@ -347,6 +348,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
             propagate: a.propagate,
             allowlist: Allowlist::new(a.allowlist),
             oidc: oidc.clone(),
+            https_internal_ca: a.https_cert.is_none(),
         },
         ca,
         store,

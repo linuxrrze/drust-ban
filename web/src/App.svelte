@@ -12,6 +12,7 @@
   import Login from './pages/Login.svelte';
   import Sessions from './pages/Sessions.svelte';
   import Users from './pages/Users.svelte';
+  import Tokens from './pages/Tokens.svelte';
   import Account from './pages/Account.svelte';
   import ChangePassword from './components/ChangePassword.svelte';
 
@@ -35,11 +36,12 @@
     { id: 'agents', label: 'Agents', show: true },
     { id: 'ip', label: 'Address lookup', show: true },
     { id: 'users', label: 'Users', show: can('admin') },
+    { id: 'tokens', label: 'API tokens', show: can('admin') },
     { id: 'sessions', label: 'Sessions', show: can('admin') },
     { id: 'audit', label: 'Audit log', show: can('admin') },
   ]);
   let menuOpen = $state(false);
-  const adminPages = ['users', 'sessions', 'audit'];
+  const adminPages = ['users', 'tokens', 'sessions', 'audit'];
 </script>
 
 {#if !session.checked}
@@ -93,6 +95,8 @@
         <div class="card empty">This page needs the admin role. <a href={href()}>Go to the overview</a></div>
       {:else if page === 'users'}
         <Users />
+      {:else if page === 'tokens'}
+        <Tokens />
       {:else if page === 'sessions'}
         <Sessions />
       {:else if page === 'audit'}

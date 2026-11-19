@@ -344,6 +344,7 @@ mod tests {
             propagate: Propagate::Global,
             allowlist: Allowlist::new(["10.0.0.0/8".parse().unwrap()]),
             oidc: None,
+            https_internal_ca: true,
         };
         let ctl = Arc::new(Controller::open(settings, ca, Store::open(dir).unwrap()).unwrap());
         let (chain, key) = ctl.ca.issue_server(&[]).unwrap();

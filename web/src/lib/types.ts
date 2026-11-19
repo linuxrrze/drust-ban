@@ -119,3 +119,14 @@ export interface UserInfo {
   must_change_password: boolean;
   sessions: number;
 }
+
+export interface TokenInfo {
+  name: string;
+  role: Role;
+  created_at: string;
+  created_by: string | null;
+  expires_at: string | null;
+  expired: boolean;
+  last_used_at: string | null;
+  current: boolean;
+}

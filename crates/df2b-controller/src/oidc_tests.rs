@@ -251,6 +251,7 @@ async fn env_with(
             o.min_refresh = min_refresh;
             o
         })),
+        https_internal_ca: true,
     };
     let ctl = Arc::new(Controller::open(settings, ca, Store::open(&dir).unwrap()).unwrap());
     let (chain, key) = ctl.ca.issue_server(&[]).unwrap();

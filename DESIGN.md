@@ -563,7 +563,17 @@ df2bctl config check | reload
   the current password (wrong guesses count towards the login limits and
   return 403, not 401, so the session stays); the session is replaced with
   a new cookie and CSRF token and all other sessions of the user end.
-- Not yet: front-channel logout, API token management in the UI,
+- **API tokens in the UI** (admin): `GET /api/v1/api-tokens` (name, role,
+  created by and when, expiry, last use since the controller started; the
+  caller's own token marked), `POST /api/v1/api-tokens` (name, role, ttl up
+  to 5 years or "never") and `DELETE /api/v1/api-tokens/<name>`; the
+  "API tokens" page shows a new token once, with a ready `df2bctl.toml`
+  (with the CA fingerprint when the internal CA serves HTTPS). **Tokens
+  cannot create tokens** (browser session or host CLI only), so a leaked
+  admin token cannot plant replacements that outlive its revocation; tokens
+  can list and revoke (also themselves). Tokens record their creator
+  (`created_by`, absent for host-created ones). Audited without secrets.
+- Not yet: front-channel logout,
   observation timelines and sample log lines (needs observation reporting),
   ASN/GeoIP, "allow for X" after unban, policies/jails and allowlist editing,
   changing an agent's group.
