@@ -77,9 +77,19 @@ struct Jail {
 #[derive(Debug)]
 pub struct Engine {
     jails: Vec<Jail>,
+    /// From the agent's configuration.
     allowlist: Allowlist,
+    /// The controller's allowlist (replaced on every update).
+    central: Allowlist,
     prefix: PrefixPolicy,
     offense_memory: TimeDelta,
+}
+
+/// Local (configuration) or central (controller) allowlist.
+fn allowed(local: &Allowlist, central: &Allowlist, ip: &std::net::IpAddr, net: &IpNet) -> bool {
+    [local, central]
+        .iter()
+        .any(|a| a.contains_addr(ip) || a.overlaps(net))
 }
 
 impl Engine {
@@ -103,6 +113,7 @@ impl Engine {
         Ok(Self {
             jails,
             allowlist: Allowlist::new(cfg.agent.allowlist.iter().copied()),
+            central: Allowlist::default(),
             prefix: PrefixPolicy {
                 v4: cfg.agent.ipv4_prefix,
                 v6: cfg.agent.ipv6_prefix,
@@ -166,7 +177,7 @@ impl Engine {
             {
                 continue;
             }
-            if self.allowlist.contains_addr(&m.ip) || self.allowlist.overlaps(&key.net()) {
+            if allowed(&self.allowlist, &self.central, &m.ip, &key.net()) {
                 debug!(ip = %m.ip, jail = %jail.name, "allowlisted, ignoring");
                 continue;
             }
@@ -224,6 +235,32 @@ impl Engine {
     /// Ends local bans of keys inside `net` (an unban decision): failures are
     /// counted again from now on, the offense history is kept. Returns the
     /// changed records for the state store.
+    /// Replaces the controller's allowlist.
+    pub fn set_central_allowlist(&mut self, nets: impl IntoIterator<Item = IpNet>) {
+        self.central = Allowlist::new(nets);
+    }
+
+    /// Lifts active bans that overlap the controller's allowlist (a /64 ban
+    /// containing an allowlisted address included). Offense history is kept.
+    pub fn lift_allowlisted(&mut self, now: DateTime<Utc>) -> Vec<OffenderRecord> {
+        let mut changed = Vec::new();
+        for j in &mut self.jails {
+            for (key, o) in j.offenders.iter_mut() {
+                if o.banned_until > now && self.central.overlaps(&key.net()) {
+                    o.banned_until = now;
+                    j.tracker.reset(key);
+                    changed.push(OffenderRecord {
+                        jail: j.name.clone(),
+                        key: *key,
+                        offenses: o.offenses,
+                        banned_until: now,
+                    });
+                }
+            }
+        }
+        changed
+    }
+
     pub fn lift(&mut self, net: &IpNet, now: DateTime<Utc>) -> Vec<OffenderRecord> {
         let mut changed = Vec::new();
         for j in &mut self.jails {
@@ -405,6 +442,49 @@ mod tests {
         let a = e.process(&line("auth", "198.51.100.1"), later);
         assert_eq!(a[0].offense, 2);
         assert_eq!(a[0].duration, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn central_allowlist() {
+        let mut e = engine();
+        let now = Utc::now();
+        let ban = |e: &mut Engine, ip: &str| {
+            e.process(&line("auth", ip), now);
+            e.process(&line("auth", ip), now)
+        };
+        assert_eq!(ban(&mut e, "203.0.113.7").len(), 1);
+        assert_eq!(ban(&mut e, "2001:db8::5").len(), 1, "banned as its /64");
+        assert_eq!(ban(&mut e, "198.51.100.1").len(), 1);
+
+        // the controller allowlists one address inside the /64 and a /24
+        e.set_central_allowlist([
+            "2001:db8::7/128".parse().unwrap(),
+            "203.0.113.0/24".parse().unwrap(),
+        ]);
+        let mut lifted: Vec<String> = e
+            .lift_allowlisted(now)
+            .iter()
+            .map(|r| r.key.to_string())
+            .collect();
+        lifted.sort();
+        assert_eq!(lifted, ["2001:db8::/64", "203.0.113.7/32"]);
+        assert!(
+            e.is_banned(&"198.51.100.1/32".parse().unwrap(), now),
+            "others stay"
+        );
+        assert!(e.lift_allowlisted(now).is_empty(), "nothing left to lift");
+        // and nothing new is banned there
+        assert!(ban(&mut e, "203.0.113.99").is_empty());
+        assert!(ban(&mut e, "2001:db8::1").is_empty());
+        assert!(
+            ban(&mut e, "10.9.9.9").is_empty(),
+            "local allowlist still applies"
+        );
+
+        // a new list replaces the old one; offense history was kept
+        e.set_central_allowlist([]);
+        let again = ban(&mut e, "203.0.113.7");
+        assert_eq!((again.len(), again[0].offense), (1, 2));
     }
 
     #[test]

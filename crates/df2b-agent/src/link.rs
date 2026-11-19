@@ -57,6 +57,8 @@ pub struct LinkConfig {
 #[derive(Debug, Default)]
 pub struct LinkStats {
     pub active_bans: AtomicU64,
+    /// Version of the central allowlist the main loop has applied.
+    pub allowlist_version: std::sync::Mutex<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +85,26 @@ pub enum FromController {
     /// Replaces all previously received decisions.
     Snapshot(Vec<RemoteDecision>),
     Decision(RemoteDecision),
+    /// The complete central allowlist (replaces the previous one).
+    Allowlist {
+        version: String,
+        networks: Vec<IpNet>,
+    },
+}
+
+/// Parses an allowlist update; `None` if any entry is malformed (a partial
+/// list must not replace a complete one).
+pub fn parse_allowlist(a: v1::AllowlistUpdate) -> Option<FromController> {
+    let networks = a
+        .networks
+        .iter()
+        .map(|n| n.parse::<IpNet>().map(|n| n.trunc()))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(FromController::Allowlist {
+        version: a.version,
+        networks,
+    })
 }
 
 pub struct Link {
@@ -445,6 +467,10 @@ impl Task {
                                 None => { warn!("ignoring malformed decision"); continue; }
                             }
                         }
+                        Some(Event::Allowlist(a)) => match parse_allowlist(a) {
+                            Some(ev) => ev,
+                            None => { warn!("ignoring malformed allowlist update, keeping the previous one"); continue; }
+                        },
                         None => continue,
                     };
                     if self.events.send(out).await.is_err() {
@@ -465,6 +491,7 @@ impl Task {
                         firewall_backend: self.cfg.firewall_backend.into(),
                         firewall_healthy: true, // TODO: backend health check
                         last_applied_seq: self.last_seq,
+                        allowlist_version: self.stats.allowlist_version.lock().map(|v| v.clone()).unwrap_or_default(),
                     }).await?;
                     if id.needs_renewal(Utc::now()) {
                         self.renew(&mut client, id).await?;
@@ -607,5 +634,24 @@ mod tests {
         assert!(!loaded.needs_renewal(Utc::now()));
         assert!(loaded.needs_renewal(Utc::now() + chrono::Duration::days(21)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowlist_updates() {
+        let ok = parse_allowlist(v1::AllowlistUpdate {
+            version: "v1".into(),
+            networks: vec!["192.0.2.7/24".into(), "2001:db8::/48".into()],
+        });
+        let Some(FromController::Allowlist { version, networks }) = ok else {
+            panic!()
+        };
+        assert_eq!(version, "v1");
+        assert_eq!(networks[0].to_string(), "192.0.2.0/24", "normalized");
+        // one bad entry: the whole update is ignored, not applied partially
+        assert!(parse_allowlist(v1::AllowlistUpdate {
+            version: "v2".into(),
+            networks: vec!["192.0.2.0/24".into(), "nonsense".into()],
+        })
+        .is_none());
     }
 }

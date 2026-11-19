@@ -595,14 +595,24 @@ df2bctl config check | reload
   network by default (`unban: false` / `--keep-bans` to keep them). Refused:
   prefixes broader than /8 or /16 (a /0 would switch banning off),
   duplicates and networks already covered by an entry (409). Comments are
-  stored without control characters (max 200). Audited. Agents still apply
-  their own allowlist only: a local ban of a centrally allowlisted address
-  stays local (it is not propagated) until the controller allowlist is
-  distributed to agents.
+  stored without control characters (max 200). Audited.
+- **Allowlist distribution**: the decision stream carries
+  `AllowlistUpdate { version, networks }` with the complete central list
+  (fixed + API entries), after the snapshot/backlog and on every change;
+  `version` is a content hash (stable across restarts). Agents keep it apart
+  from their configured allowlist and check both before banning, lift local
+  bans overlapping it (also a /64 containing an allowlisted address; offense
+  history is kept; the firewall entry stays while a controller ban covers
+  that exact prefix, e.g. after `--keep-bans`), store it in `agent.redb`
+  (applies after a restart while the controller is unreachable) and report
+  the applied version in heartbeats. A malformed update is ignored as a
+  whole, never applied partially. The UI shows per agent whether its list
+  is current and how many connected agents use the current one. Older
+  agents ignore the new event (protobuf) and show as "unknown".
 - Not yet:
   observation timelines and sample log lines (needs observation reporting),
   ASN/GeoIP, "allow for X" after unban, policies/jails editing,
-  distributing the allowlist to agents, changing an agent's group.
+  changing an agent's group.
 
 Pages:
 
@@ -672,7 +682,7 @@ systemd hardening.
 | Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
 | REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions (password, OIDC) with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
 | gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |
-| Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans applied |
+| Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans and central allowlist applied |
 | Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI/browser → controller (HTTPS) done; HA, external actions, local socket TODO |
 | Web UI                       | Svelte, embedded: login, overview, bans, agents, address lookup, audit log; live updates; login with local users or OIDC |
 

@@ -4,13 +4,14 @@
   import { go, href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
   import { notify } from '../lib/toast.svelte';
-  import type { Agent } from '../lib/types';
+  import type { Agent, Status } from '../lib/types';
   import Dialog from '../components/Dialog.svelte';
   import EnrollDialog from '../components/EnrollDialog.svelte';
 
   let { selected = null }: { selected?: string | null } = $props();
 
   let agents = $state<Agent[]>([]);
+  let allowVersion = $state('');
   let loaded = $state(false);
   let error = $state('');
   let filter = $state('');
@@ -20,7 +21,9 @@
 
   async function load() {
     try {
-      agents = (await get<{ agents: Agent[] }>('/agents')).agents;
+      const [a, s] = await Promise.all([get<{ agents: Agent[] }>('/agents'), get<Status>('/status')]);
+      agents = a.agents;
+      allowVersion = s.allowlist_version;
       error = '';
       now = Date.now();
     } catch (e) {
@@ -143,6 +146,13 @@
         </dd>
         <dt>Clock skew</dt><dd>{skew(current.status.clock_skew_ms)}</dd>
         <dt>Applied decisions</dt><dd>up to #{current.status.last_applied_seq}</dd>
+        <dt>Allowlist</dt>
+        <dd>
+          {#if !current.status.last_seen}–
+          {:else if current.status.allowlist_version === allowVersion}<span class="pill good">current</span>
+          {:else if !current.status.allowlist_version}<span class="pill plain" title="This agent version does not report it">unknown</span>
+          {:else}<span class="pill warn">outdated</span>{/if}
+        </dd>
         <dt>Certificate</dt><dd>valid until {dateTime(current.cert_not_after)}<br /><span class="faint small">renewed automatically</span></dd>
         <dt>Serial</dt><dd class="mono small">{current.serials[0] ?? '–'}</dd>
       </dl>

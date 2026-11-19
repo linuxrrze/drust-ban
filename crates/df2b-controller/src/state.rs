@@ -67,6 +67,8 @@ pub struct AgentStatus {
     pub last_applied_seq: u64,
     /// Open decision streams (> 0 = connected).
     pub streams: u32,
+    /// Central allowlist version the agent applies ("" = unknown).
+    pub allowlist_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,6 +142,29 @@ pub struct Controller {
     token_last_used: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Allowlist entries added through the API (persisted in the store).
     allow_entries: Mutex<Vec<AllowEntry>>,
+    /// The complete allowlist as sent to agents; changes wake up streams.
+    allow_tx: tokio::sync::watch::Sender<Arc<AllowSnapshot>>,
+}
+
+/// The central allowlist as distributed to agents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowSnapshot {
+    /// Content hash (16 hex digits): stable across restarts.
+    pub version: String,
+    pub networks: Vec<IpNet>,
+}
+
+impl AllowSnapshot {
+    pub fn new(mut networks: Vec<IpNet>) -> Self {
+        networks.sort();
+        networks.dedup();
+        let text: Vec<String> = networks.iter().map(|n| n.to_string()).collect();
+        let hash = df2b_tls::sha256(text.join("\n").as_bytes());
+        Self {
+            version: df2b_tls::hex(&hash[..8]),
+            networks,
+        }
+    }
 }
 
 /// Where an allowlist entry comes from.
@@ -198,6 +223,15 @@ impl Controller {
             last_seq = inner.last_seq,
             "controller state loaded"
         );
+        let allow_tx = tokio::sync::watch::channel(Arc::new(AllowSnapshot::new(
+            settings
+                .allowlist
+                .iter()
+                .copied()
+                .chain(allow_entries.iter().map(|e| e.net))
+                .collect(),
+        )))
+        .0;
         Ok(Self {
             settings,
             ca,
@@ -206,6 +240,7 @@ impl Controller {
             events: broadcast::channel(4096).0,
             sessions: Sessions::default(),
             token_last_used: Mutex::new(HashMap::new()),
+            allow_tx,
             allow_entries: Mutex::new(allow_entries),
         })
     }
@@ -423,7 +458,29 @@ impl Controller {
         }
         self.store.put_allow(&e)?;
         entries.push(e);
+        self.publish_allowlist(&entries);
         Ok(())
+    }
+
+    fn publish_allowlist(&self, entries: &[AllowEntry]) {
+        let snap = AllowSnapshot::new(
+            self.settings
+                .allowlist
+                .iter()
+                .copied()
+                .chain(entries.iter().map(|e| e.net))
+                .collect(),
+        );
+        self.allow_tx.send_replace(Arc::new(snap));
+    }
+
+    /// The current allowlist for agents, and a receiver for changes.
+    pub fn allowlist_watch(&self) -> tokio::sync::watch::Receiver<Arc<AllowSnapshot>> {
+        self.allow_tx.subscribe()
+    }
+
+    pub fn allowlist_version(&self) -> String {
+        self.allow_tx.borrow().version.clone()
     }
 
     /// Removes an API entry (blocking).
@@ -436,6 +493,7 @@ impl Controller {
             return Err(AllowError::Missing(*net));
         }
         entries.retain(|e| e.net != *net);
+        self.publish_allowlist(&entries);
         Ok(())
     }
 

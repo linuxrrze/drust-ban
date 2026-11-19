@@ -10,6 +10,7 @@
   import Dialog from '../components/Dialog.svelte';
 
   let entries = $state<AllowEntry[]>([]);
+  let coverage = $state<{ connected: number; current: number } | null>(null);
   let loaded = $state(false);
   let error = $state('');
   let now = $state(Date.now());
@@ -20,7 +21,9 @@
 
   async function load() {
     try {
-      entries = (await get<{ entries: AllowEntry[] }>('/allowlist')).entries;
+      const r = await get<{ entries: AllowEntry[]; agents: { connected: number; current: number } }>('/allowlist');
+      entries = r.entries;
+      coverage = r.agents;
       error = '';
       now = Date.now();
     } catch (e) {
@@ -32,7 +35,13 @@
 
   $effect(() => {
     load();
-    return onChange(load, 1000);
+    const off = onChange(load, 1000);
+    // agents confirm a new list with their next heartbeat (10 s)
+    const t = setInterval(load, 10_000);
+    return () => {
+      off();
+      clearInterval(t);
+    };
   });
 
   async function remove() {
@@ -59,6 +68,17 @@
 </div>
 
 {#if error}<div class="error-box">{error}</div>{/if}
+
+{#if coverage && coverage.connected > 0}
+  <p class="coverage">
+    {#if coverage.current === coverage.connected}
+      <span class="pill good">all {coverage.connected} connected agents use this list</span>
+    {:else}
+      <span class="pill warn">{coverage.current} of {coverage.connected} connected agents use this list</span>
+      <span class="faint small">Agents confirm changes within about 10 seconds; older agent versions do not receive it.</span>
+    {/if}
+  </p>
+{/if}
 
 <div class="card">
   {#if loaded && entries.length === 0}
@@ -105,10 +125,11 @@
 </div>
 
 <p class="faint small">
-  The controller refuses manual bans and ignores agents' ban reports that overlap these networks.
-  Agents also have their own allowlist in their configuration, which applies to local bans before
-  anything reaches the controller; add critical networks there too. Entries from
-  <code>--allow</code> can only be changed on the controller's command line.
+  Connected agents receive this list at once: they stop banning these networks, lift their local
+  bans on them, and keep the list across restarts even while the controller is unreachable. The
+  controller also refuses manual bans and agent reports that overlap it. Each agent's own
+  allowlist from its configuration applies as well. Entries from <code>--allow</code> can only be
+  changed on the controller's command line.
 </p>
 
 <AllowDialog bind:open={addOpen} ondone={load} />
@@ -125,6 +146,7 @@
 
 <style>
   .danger-link { color: var(--bad); }
+  .coverage { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0 0 12px; }
   p { margin: 12px 0 0; }
   p.confirm-text { margin: 0; }
 </style>

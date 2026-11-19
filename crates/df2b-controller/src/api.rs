@@ -830,7 +830,20 @@ async fn list_allow(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiRe
             v
         })
         .collect();
-    Ok(Json(json!({ "entries": entries })))
+    let current = ctl.allowlist_version();
+    let live: Vec<_> = ctl
+        .agents()
+        .into_iter()
+        .filter(|a| a.connected && !a.revoked)
+        .collect();
+    Ok(Json(json!({
+        "entries": entries,
+        "version": current,
+        "agents": {
+            "connected": live.len(),
+            "current": live.iter().filter(|a| a.status.allowlist_version == current).count(),
+        },
+    })))
 }
 
 fn default_unban() -> bool {
@@ -1577,6 +1590,7 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         "last_seq": ctl.last_seq(),
         "propagate": ctl.settings.propagate,
         "allowlist": ctl.allowlist().iter().map(|e| e.net).collect::<Vec<_>>(),
+        "allowlist_version": ctl.allowlist_version(),
         "sessions": ctl.sessions.count(),
     })))
 }

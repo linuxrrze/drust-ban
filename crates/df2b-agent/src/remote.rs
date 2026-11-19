@@ -60,6 +60,12 @@ impl RemoteBans {
         self.bans.values().filter(|b| !b.own).count()
     }
 
+    /// Whether a controller ban (including this agent's own, propagated
+    /// ones) still covers exactly this prefix.
+    pub fn covers(&self, net: &IpNet) -> bool {
+        self.covered(net)
+    }
+
     fn covered(&self, net: &IpNet) -> bool {
         self.bans.values().any(|b| b.target == *net)
     }
@@ -132,6 +138,8 @@ impl RemoteBans {
                 // TODO: allow entries (temporary allowlist)
                 RemoteKind::Ban | RemoteKind::Allow => {}
             },
+            // handled by the main loop (engine + firewall)
+            FromController::Allowlist { .. } => {}
         }
         c
     }

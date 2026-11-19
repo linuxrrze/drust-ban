@@ -45,6 +45,7 @@ export interface AgentStatus {
   firewall_healthy: boolean;
   last_applied_seq: number;
   streams: number;
+  allowlist_version: string;
 }
 
 export interface Agent {
@@ -66,6 +67,7 @@ export interface Status {
   last_seq: number;
   propagate: string;
   allowlist: string[];
+  allowlist_version: string;
   sessions: number;
 }
 

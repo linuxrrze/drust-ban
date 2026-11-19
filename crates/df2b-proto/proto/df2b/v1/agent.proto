@@ -68,6 +68,8 @@ message HeartbeatRequest {
   string firewall_backend = 5;
   bool firewall_healthy = 6;
   uint64 last_applied_seq = 7;
+  // Version of the central allowlist the agent applies ("" = none / old agent).
+  string allowlist_version = 8;
 }
 
 message HeartbeatResponse {
@@ -137,7 +139,17 @@ message DecisionEvent {
     // Sent first when the agent's from_seq is too old: replaces all state.
     Snapshot snapshot = 1;
     Decision decision = 2;
+    // The complete central allowlist: sent after the snapshot/backlog and
+    // whenever it changes. Replaces the previous one.
+    AllowlistUpdate allowlist = 3;
   }
+}
+
+message AllowlistUpdate {
+  // Content hash; the same list always has the same version.
+  string version = 1;
+  // Networks never to ban, e.g. "192.0.2.0/24".
+  repeated string networks = 2;
 }
 
 message Snapshot {

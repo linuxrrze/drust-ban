@@ -175,6 +175,7 @@ impl AgentService for Service {
             s.firewall_backend = h.firewall_backend;
             s.firewall_healthy = h.firewall_healthy;
             s.last_applied_seq = h.last_applied_seq;
+            s.allowlist_version = h.allowlist_version;
         });
         Ok(Response::new(v1::HeartbeatResponse {
             controller_time_unix_ms: now_ms,
@@ -265,6 +266,7 @@ impl AgentService for Service {
                 .map_err(internal)?
         };
         let (tx, rx) = mpsc::channel(256);
+        let mut allow = ctl.allowlist_watch();
         tokio::spawn(async move {
             let id = record.id.clone();
             ctl.update_status(&id, |s| s.streams += 1);
@@ -287,9 +289,30 @@ impl AgentService for Service {
                     seq
                 }
             };
+            // the central allowlist after the decisions, then on every change
+            let send_allow = |snap: &crate::state::AllowSnapshot| {
+                event(Event::Allowlist(v1::AllowlistUpdate {
+                    version: snap.version.clone(),
+                    networks: snap.networks.iter().map(|n| n.to_string()).collect(),
+                }))
+            };
+            let first = send_allow(&allow.borrow_and_update());
+            if tx.send(Ok(first)).await.is_err() {
+                ctl.update_status(&id, |s| s.streams = s.streams.saturating_sub(1));
+                return;
+            }
             let mut check = tokio::time::interval(REVOCATION_CHECK);
             loop {
                 tokio::select! {
+                    changed = allow.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let ev = send_allow(&allow.borrow_and_update());
+                        if tx.send(Ok(ev)).await.is_err() {
+                            break;
+                        }
+                    }
                     ev = live.recv() => match ev {
                         Ok(d) => {
                             if d.seq <= last || !applies(&d, &record) {
@@ -390,6 +413,112 @@ mod tests {
         }
     }
 
+    /// Enrolls an agent and returns a client for it.
+    async fn enrolled(
+        addr: &str,
+        ctl: &Controller,
+        dir: &std::path::Path,
+        host: &str,
+    ) -> AgentServiceClient<Channel> {
+        let token = files::create_token(dir, "web", Duration::from_secs(3600)).unwrap();
+        let pinned = transport::enrollment_client_config(token.ca_fingerprint).unwrap();
+        let key = AgentKey::generate(host).unwrap();
+        let resp = client(addr, pinned)
+            .await
+            .enroll(v1::EnrollRequest {
+                token: token.to_string(),
+                hostname: host.into(),
+                csr_der: key.csr_der.clone(),
+                agent_version: "test".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        client(addr, agent_cfg(ctl, resp.certificate_der, &key)).await
+    }
+
+    async fn next(s: &mut tonic::Streaming<v1::DecisionEvent>) -> Option<Event> {
+        tokio::time::timeout(Duration::from_secs(5), s.message())
+            .await
+            .expect("event in time")
+            .unwrap()
+            .unwrap()
+            .event
+    }
+
+    #[tokio::test]
+    async fn allowlist_is_distributed() {
+        let dir = std::env::temp_dir().join(format!("df2b-ctl-grpc-allow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (addr, ctl) = start(&dir).await;
+        let mut a = enrolled(&addr, &ctl, &dir, "host-b").await;
+        let mut stream = a
+            .subscribe(v1::SubscribeRequest { from_seq: 0 })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(next(&mut stream).await, Some(Event::Snapshot(_))));
+        let Some(Event::Allowlist(first)) = next(&mut stream).await else {
+            panic!("allowlist expected")
+        };
+        assert_eq!(first.networks, ["10.0.0.0/8"]);
+
+        // a change reaches open streams at once, as the complete list
+        let entry = |net: &str| crate::store::AllowEntry {
+            net: net.parse().unwrap(),
+            comment: String::new(),
+            created_by: "ada".into(),
+            created_at: Utc::now(),
+        };
+        ctl.add_allow(entry("192.0.2.0/24")).unwrap();
+        let Some(Event::Allowlist(second)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        assert_eq!(second.networks, ["10.0.0.0/8", "192.0.2.0/24"]);
+        assert_ne!(second.version, first.version);
+        ctl.remove_allow(&"192.0.2.0/24".parse().unwrap()).unwrap();
+        let Some(Event::Allowlist(third)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        assert_eq!(
+            third.version, first.version,
+            "the version is a content hash"
+        );
+
+        // a resuming agent (backlog instead of snapshot) gets it too
+        a.report(v1::ObservationBatch {
+            observations: vec![obs("203.0.113.9/32", true)],
+        })
+        .await
+        .unwrap();
+        assert_eq!(ctl.last_seq(), 1);
+        let mut again = a
+            .subscribe(v1::SubscribeRequest {
+                from_seq: ctl.last_seq(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let Some(Event::Allowlist(r)) = again.message().await.unwrap().unwrap().event else {
+            panic!("allowlist expected after an empty backlog")
+        };
+        assert_eq!(r.version, first.version);
+
+        // the agent reports what it applied
+        let id = ctl.agents()[0].record.id.clone();
+        a.heartbeat(v1::HeartbeatRequest {
+            allowlist_version: first.version.clone(),
+            ..heartbeat()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            ctl.agent(&id).unwrap().status.allowlist_version,
+            first.version
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn enrollment_authentication_renewal_revocation() {
         let dir = std::env::temp_dir().join(format!("df2b-ctl-grpc-{}", std::process::id()));
@@ -443,6 +572,12 @@ mod tests {
             panic!("expected snapshot first")
         };
         assert!(s.active.is_empty());
+        // then the central allowlist
+        let Some(Event::Allowlist(al)) = stream.message().await.unwrap().unwrap().event else {
+            panic!("expected the allowlist after the snapshot")
+        };
+        assert_eq!(al.networks, ["10.0.0.0/8"]);
+        assert_eq!(al.version, ctl.allowlist_version());
 
         // local ban → decision; allowlisted, too broad and non-ban ignored
         let ack = a

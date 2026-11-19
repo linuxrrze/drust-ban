@@ -4,7 +4,9 @@
 //! - **source positions** (journal cursor, file dev/inode/offset), so a
 //!   restart neither re-reads nor skips log lines;
 //! - **offender records** (offense count + ban expiry per jail and key), so
-//!   active bans are re-applied after a restart and escalation continues.
+//!   active bans are re-applied after a restart and escalation continues;
+//! - the **central allowlist** last received from the controller, so it
+//!   applies after a restart even while the controller is unreachable.
 //!
 //! Writes are buffered in [`Pending`] and committed in one transaction (one
 //! fsync) per flush interval, not per batch: at high volume, per-batch commits
@@ -26,6 +28,15 @@ use crate::engine::OffenderRecord;
 
 const POSITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("positions");
 const OFFENDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("offenders");
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const CENTRAL_ALLOWLIST: &str = "central_allowlist";
+
+/// The controller's allowlist as last applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CentralAllowlist {
+    pub version: String,
+    pub networks: Vec<ipnet::IpNet>,
+}
 
 /// Key of a source position: one per journald source, one per file path.
 pub fn position_key(source: &str, position: &Position) -> String {
@@ -80,6 +91,7 @@ impl Pending {
 pub struct Loaded {
     pub positions: HashMap<String, Position>,
     pub offenders: Vec<OffenderRecord>,
+    pub central_allowlist: Option<CentralAllowlist>,
 }
 
 #[derive(Clone)]
@@ -99,6 +111,7 @@ impl State {
         let tx = db.begin_write()?;
         tx.open_table(POSITIONS)?;
         tx.open_table(OFFENDERS)?;
+        tx.open_table(META)?;
         tx.commit()?;
         Ok(Self {
             db: Arc::new(db),
@@ -133,7 +146,22 @@ impl State {
                 }
             }
         }
+        if let Some(v) = tx.open_table(META)?.get(CENTRAL_ALLOWLIST)? {
+            match serde_json::from_slice(v.value()) {
+                Ok(a) => loaded.central_allowlist = Some(a),
+                Err(e) => tracing::warn!(error = %e, "ignoring unreadable saved central allowlist"),
+            }
+        }
         Ok(loaded)
+    }
+
+    /// Saves the central allowlist (rare: only when it changes). Blocking.
+    pub fn save_central_allowlist(&self, a: &CentralAllowlist) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?
+            .insert(CENTRAL_ALLOWLIST, serde_json::to_vec(a)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Commits `pending` in one transaction. Blocking (fsync): call it from
@@ -241,6 +269,23 @@ mod tests {
         let s = State::open(&dir).unwrap();
         s.flush(Pending::default()).unwrap();
         assert!(s.load().unwrap().positions.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn central_allowlist_persists() {
+        let dir = tmp("central");
+        let a = CentralAllowlist {
+            version: "abcd".into(),
+            networks: vec!["192.0.2.0/24".parse().unwrap()],
+        };
+        {
+            let st = State::open(&dir).unwrap();
+            assert!(st.load().unwrap().central_allowlist.is_none());
+            st.save_central_allowlist(&a).unwrap();
+        }
+        let st = State::open(&dir).unwrap();
+        assert_eq!(st.load().unwrap().central_allowlist, Some(a));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
