@@ -1,15 +1,10 @@
 //! dist-f2b command line tool.
 //!
-//! Implemented: `filter test` (offline) and the controller commands
-//! (status, whoami, agents, bans, ban, unban, audit, sessions, allowlist) over
-//! the HTTPS
-//! REST API.
-//! `--local` talks to the agent on this host over its control socket
-//! (status, jails list, bans list, ban, unban, config check|reload).
-//! TODO: ip.
-
-// Stub commands carry arguments that are only read once implemented.
-#![allow(dead_code)]
+//! `filter test` (offline), the controller commands over the HTTPS REST
+//! API (status, lookup, whoami, audit, agents, sessions, bans, ban, unban,
+//! allowlist, jails, correlation, redaction, propagate, filter), and with
+//! `--local` the agent on this host over its control socket (status, jails
+//! list, bans list, ban, unban, config check|reload).
 
 mod client;
 mod commands;
@@ -120,11 +115,6 @@ enum Command {
         /// (temporary allowlist entry; operators: at most 7d).
         #[arg(long, value_parser = humantime::parse_duration)]
         allow_for: Option<Duration>,
-    },
-    /// Show observations and decision history for an address.
-    Ip {
-        #[arg(value_parser = parse_target)]
-        target: IpNet,
     },
     /// Manage the allowlist.
     #[command(subcommand)]
@@ -716,6 +706,5 @@ async fn run() -> anyhow::Result<()> {
             "config check|reload act on the agent on this host: use --local \
              (to check a file offline: df2b-agent --check --config FILE)"
         ),
-        other => bail!("not implemented yet: {other:?}"),
     }
 }

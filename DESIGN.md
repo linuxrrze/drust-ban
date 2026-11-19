@@ -979,8 +979,8 @@ systemd hardening.
 | File tailer                  | inotify wake-ups (2 s fallback poll), resumes from saved offset (also across rotation), drains rotated files, glob paths |
 | journald                     | implemented (dlopen, dedicated thread, batches, resumes from saved cursor) |
 | Tracker / engine             | implemented + tests; one firewall transaction per batch |
-| nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |
-| Agent state (redb)           | source positions + offender records, flushed every 1 s; bans re-applied on start |
+| nftables backend             | via `nft -f -`, set listing (`nft -j`), chain check, reconcile loop every 5 min; netlink TODO |
+| Agent state (redb)           | source positions, offender records, manual bans, unsent reports, central settings; flushed every 1 s; bans re-applied on start |
 | `df2bctl`                    | `filter test`, controller commands, `--local` (agent socket) incl. config check/reload |
 | Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
 | REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions (password, OIDC) with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
