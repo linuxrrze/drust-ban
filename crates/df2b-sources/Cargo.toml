@@ -1,0 +1,17 @@
+[package]
+name = "df2b-sources"
+description = "Log sources for dist-f2b: file tailer and journald"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# journald via libsystemd (currently a stub, see src/journald.rs)
+journald = []
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+memchr.workspace = true
+tokio.workspace = true
+tracing.workspace = true

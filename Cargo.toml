@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# internal crates
+df2b-core = { path = "crates/df2b-core" }
+df2b-firewall = { path = "crates/df2b-firewall" }
+df2b-matcher = { path = "crates/df2b-matcher" }
+df2b-proto = { path = "crates/df2b-proto" }
+df2b-sources = { path = "crates/df2b-sources" }
+
+# external crates
+aho-corasick = "1"
+anyhow = "1"
+axum = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+humantime = "2"
+humantime-serde = "1"
+ipnet = { version = "2", features = ["serde"] }
+memchr = "2"
+prost = "0.13"
+protoc-bin-vendored = "3"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tonic = "0.12"
+tonic-build = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

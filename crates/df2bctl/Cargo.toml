@@ -1,0 +1,14 @@
+[package]
+name = "df2bctl"
+description = "dist-f2b command line tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+df2b-core.workspace = true
+df2b-matcher.workspace = true
+humantime.workspace = true
+ipnet.workspace = true

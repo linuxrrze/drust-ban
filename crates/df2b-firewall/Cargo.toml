@@ -1,0 +1,11 @@
+[package]
+name = "df2b-firewall"
+description = "Firewall backends for dist-f2b"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ipnet.workspace = true
+tracing.workspace = true

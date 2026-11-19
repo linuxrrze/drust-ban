@@ -1,0 +1,24 @@
+# OpenSSH authentication failures.
+#
+# Works for journald MESSAGE fields and for syslog-formatted files
+# (patterns are not anchored at the start).
+#
+# Patterns end with `$` and use a greedy `.*` before "from <HOST>", so that a
+# user name like "x from 10.0.0.1 port 1" cannot redirect the ban to another IP.
+
+literals = [
+  "Failed password",
+  "Failed publickey",
+  "Invalid user",
+  "Connection closed by authenticating user",
+  "maximum authentication attempts exceeded",
+]
+
+failregex = [
+  'Failed (?:password|publickey) for .* from <HOST> port \d+(?: ssh2)?$',
+  'Invalid user .* from <HOST> port \d+$',
+  'Connection closed by authenticating user .* <HOST> port \d+ \[preauth\]$',
+  'maximum authentication attempts exceeded for .* from <HOST> port \d+ ssh2 \[preauth\]$',
+]
+
+ignoreregex = []

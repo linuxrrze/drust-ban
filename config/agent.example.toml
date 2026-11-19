@@ -1,0 +1,42 @@
+# dist-f2b agent configuration example.
+# Validate with: df2b-agent --config agent.toml --check
+
+[agent]
+# Controller URL; omit for standalone mode.
+# controller = "https://df2b.example.org:7443"
+group = "default"
+
+# Prefix lengths used to aggregate offenders.
+ipv4_prefix = 32
+ipv6_prefix = 64
+
+# Relative paths are resolved against this file's directory.
+filter_dir = "../filters"
+state_dir = "/var/lib/df2b"
+
+# "nftables" or "dry-run"
+firewall = "dry-run"
+
+# Never ban these (CIDR notation).
+allowlist = ["127.0.0.0/8", "::1/128"]
+
+[[source]]
+name = "sshd-journal"
+type = "journald"
+matches = ["_SYSTEMD_UNIT=sshd.service"]
+
+[[source]]
+name = "auth-log"
+type = "file"
+paths = ["/var/log/auth.log"]
+start_at_end = true
+
+[[jail]]
+name = "sshd"
+sources = ["sshd-journal", "auth-log"]
+filter = "sshd"
+maxretry = 5
+findtime = "10m"
+bantime = "1h"
+bantime_factor = 2.0
+max_bantime = "30d"

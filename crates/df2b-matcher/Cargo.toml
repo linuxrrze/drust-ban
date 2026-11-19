@@ -1,0 +1,13 @@
+[package]
+name = "df2b-matcher"
+description = "Log line matching for dist-f2b: literal prefilter + RegexSet + host capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aho-corasick.workspace = true
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true

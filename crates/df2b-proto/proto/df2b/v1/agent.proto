@@ -1,0 +1,129 @@
+// Agent <-> controller protocol. Transport: gRPC over mTLS.
+// The agent identity is taken from the client certificate, never from
+// message fields (except during Enroll, which is authenticated by token).
+syntax = "proto3";
+
+package df2b.v1;
+
+service AgentService {
+  // Exchange a one-time enrollment token + CSR for a signed client cert.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // Periodic liveness + health; drives the "connected clients" view.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Batched observations (failures per key/jail) for central correlation.
+  rpc Report(ObservationBatch) returns (ReportAck);
+
+  // Decision log stream, resumable from the last applied sequence number.
+  rpc Subscribe(SubscribeRequest) returns (stream DecisionEvent);
+}
+
+// ---------------------------------------------------------------- enrollment
+
+message EnrollRequest {
+  string token = 1;
+  string hostname = 2;
+  bytes csr_der = 3;
+  string agent_version = 4;
+}
+
+message EnrollResponse {
+  string agent_id = 1;
+  bytes certificate_der = 2;
+  bytes ca_certificate_der = 3;
+}
+
+// ----------------------------------------------------------------- heartbeat
+
+message SourceStatus {
+  string name = 1;
+  uint64 lines_per_second = 2;
+  // How far behind the newest log entry the source is, in milliseconds.
+  uint64 lag_ms = 3;
+  string error = 4;
+}
+
+message HeartbeatRequest {
+  string agent_version = 1;
+  int64 agent_time_unix_ms = 2;
+  repeated SourceStatus sources = 3;
+  uint64 active_bans = 4;
+  string firewall_backend = 5;
+  bool firewall_healthy = 6;
+  uint64 last_applied_seq = 7;
+}
+
+message HeartbeatResponse {
+  int64 controller_time_unix_ms = 1;
+  // Groups the controller has assigned to this agent.
+  repeated string groups = 2;
+}
+
+// -------------------------------------------------------------- observations
+
+message Observation {
+  // Normalized prefix, e.g. "203.0.113.7/32" or "2001:db8::/64".
+  string key = 1;
+  string jail = 2;
+  uint32 count = 3;
+  int64 first_seen_unix_ms = 4;
+  int64 last_seen_unix_ms = 5;
+  // Optional sample log line (may be dropped by privacy settings).
+  string sample = 6;
+  // Set when this observation caused a local ban.
+  bool locally_banned = 7;
+  int64 local_ban_expires_unix_ms = 8;
+}
+
+message ObservationBatch {
+  repeated Observation observations = 1;
+}
+
+message ReportAck {
+  uint32 accepted = 1;
+  // Non-zero if the agent is being rate limited.
+  uint32 retry_after_ms = 2;
+}
+
+// ----------------------------------------------------------------- decisions
+
+message SubscribeRequest {
+  // Last sequence number the agent has applied; 0 = full snapshot.
+  uint64 from_seq = 1;
+}
+
+enum DecisionKind {
+  DECISION_KIND_UNSPECIFIED = 0;
+  DECISION_KIND_BAN = 1;
+  DECISION_KIND_UNBAN = 2;
+  DECISION_KIND_ALLOW = 3;
+}
+
+message Decision {
+  uint64 seq = 1;
+  string id = 2;
+  DecisionKind kind = 3;
+  string target = 4;
+  string jail = 5;
+  int64 created_unix_ms = 6;
+  // 0 = permanent
+  int64 expires_unix_ms = 7;
+  // For UNBAN: id of the revoked decision.
+  string revokes = 8;
+  string origin = 9;
+  string reason = 10;
+}
+
+message DecisionEvent {
+  oneof event {
+    // Sent first when the agent's from_seq is too old: replaces all state.
+    Snapshot snapshot = 1;
+    Decision decision = 2;
+  }
+}
+
+message Snapshot {
+  uint64 seq = 1;
+  repeated Decision active = 2;
+}
