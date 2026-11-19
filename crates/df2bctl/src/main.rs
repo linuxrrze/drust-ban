@@ -1,7 +1,8 @@
 //! dist-f2b command line tool.
 //!
 //! Implemented: `filter test` (offline) and the controller commands
-//! (status, whoami, agents, bans, ban, unban, audit, sessions) over the HTTPS
+//! (status, whoami, agents, bans, ban, unban, audit, sessions, allowlist) over
+//! the HTTPS
 //! REST API.
 //! TODO: `--local` (agent control socket), ip, allowlist, jails, config.
 
@@ -171,13 +172,19 @@ enum SessionsCmd {
 
 #[derive(Debug, Subcommand)]
 enum AllowlistCmd {
+    /// Networks the controller never bans.
     List,
+    /// Add a network (admin); lifts active bans overlapping it.
     Add {
         #[arg(value_parser = parse_target)]
         target: IpNet,
         #[arg(long)]
         comment: Option<String>,
+        /// Keep active bans overlapping the network.
+        #[arg(long)]
+        keep_bans: bool,
     },
+    /// Remove a network added through the API (admin).
     Rm {
         #[arg(value_parser = parse_target)]
         target: IpNet,
@@ -283,6 +290,18 @@ async fn run() -> anyhow::Result<()> {
                 reason,
             };
             commands::ban(&client()?, args, json).await
+        }
+        Command::Allowlist(cmd) => {
+            let c = client()?;
+            match cmd {
+                AllowlistCmd::List => commands::allowlist_list(&c, json).await,
+                AllowlistCmd::Add {
+                    target,
+                    comment,
+                    keep_bans,
+                } => commands::allowlist_add(&c, target, comment, !keep_bans, json).await,
+                AllowlistCmd::Rm { target } => commands::allowlist_rm(&c, target, json).await,
+            }
         }
         Command::Sessions(cmd) => {
             let c = client()?;

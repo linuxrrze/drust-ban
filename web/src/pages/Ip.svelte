@@ -7,6 +7,7 @@
   import type { Decision, History } from '../lib/types';
   import BanDialog from '../components/BanDialog.svelte';
   import UnbanDialog from '../components/UnbanDialog.svelte';
+  import AllowDialog from '../components/AllowDialog.svelte';
 
   let { addr = '' }: { addr?: string } = $props();
 
@@ -15,6 +16,7 @@
   let error = $state('');
   let banOpen = $state(false);
   let unbanOpen = $state(false);
+  let allowOpen = $state(false);
 
   async function load() {
     if (!addr) {
@@ -71,7 +73,7 @@
         {:else}
           <span class="pill good">not banned</span>
         {/if}
-        {#if data.allowlisted}<span class="pill plain">on the controller allowlist</span>{/if}
+        {#if data.allowlisted}<a class="pill plain" href={href('allowlist')}>on the controller allowlist</a>{/if}
       </div>
     </div>
     <span class="spacer"></span>
@@ -82,6 +84,9 @@
       {#if !data.allowlisted}
         <button class="primary" onclick={() => (banOpen = true)}>Ban…</button>
       {/if}
+    {/if}
+    {#if can('admin') && !data.allowlisted}
+      <button onclick={() => (allowOpen = true)}>Allowlist…</button>
     {/if}
   </div>
 
@@ -144,6 +149,7 @@
 
   <BanDialog bind:open={banOpen} initialTarget={addr} ondone={load} />
   <UnbanDialog bind:open={unbanOpen} targets={[addr]} ondone={load} />
+  <AllowDialog bind:open={allowOpen} initialNet={addr} ondone={load} />
 {/if}
 
 <style>

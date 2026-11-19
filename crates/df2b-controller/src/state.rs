@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::files;
 use crate::session::Sessions;
-use crate::store::{AgentRecord, AuditEntry, Store};
+use crate::store::{AgentRecord, AllowEntry, AuditEntry, Store};
 
 /// A resuming subscriber further behind than this gets a snapshot instead.
 const MAX_BACKLOG: u64 = 10_000;
@@ -46,6 +46,7 @@ pub struct Settings {
     pub state_dir: PathBuf,
     pub cert_lifetime: Duration,
     pub propagate: Propagate,
+    /// Fixed entries (`--allow`); more can be added through the API.
     pub allowlist: Allowlist,
     /// Web UI login with an OpenID Connect provider.
     pub oidc: Option<Arc<crate::oidc::Oidc>>,
@@ -137,6 +138,33 @@ pub struct Controller {
     pub sessions: Sessions,
     /// API token name → last request (since the controller started).
     token_last_used: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// Allowlist entries added through the API (persisted in the store).
+    allow_entries: Mutex<Vec<AllowEntry>>,
+}
+
+/// Where an allowlist entry comes from.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllowView {
+    pub net: IpNet,
+    /// "command line" for `--allow`, else the creator
+    pub source: &'static str,
+    pub comment: String,
+    pub created_by: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AllowError {
+    #[error("{0} is already on the allowlist")]
+    Exists(IpNet),
+    #[error("{0} is already covered by the allowlist entry {1}")]
+    Covered(IpNet, IpNet),
+    #[error("{0} comes from --allow on the command line")]
+    Fixed(IpNet),
+    #[error("{0} is not on the allowlist")]
+    Missing(IpNet),
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
 }
 
 fn apply(active: &mut HashMap<Uuid, Decision>, d: &Decision, now: DateTime<Utc>) {
@@ -160,6 +188,7 @@ impl Controller {
             apply(&mut inner.active, &d, now);
             inner.count(&d);
         })?;
+        let allow_entries = store.allow_entries()?;
         for a in store.agents()? {
             inner.agents.insert(a.id.clone(), a);
         }
@@ -177,6 +206,7 @@ impl Controller {
             events: broadcast::channel(4096).0,
             sessions: Sessions::default(),
             token_last_used: Mutex::new(HashMap::new()),
+            allow_entries: Mutex::new(allow_entries),
         })
     }
 
@@ -328,6 +358,85 @@ impl Controller {
         inner.hourly.retain(|h, _| *h >= oldest);
         drop(inner);
         self.sessions.prune();
+    }
+
+    fn allow_lock(&self) -> MutexGuard<'_, Vec<AllowEntry>> {
+        self.allow_entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether banning `net` would touch an allowlisted address (fixed and
+    /// API entries).
+    pub fn allowlisted(&self, net: &IpNet) -> bool {
+        self.settings.allowlist.overlaps(net)
+            || self
+                .allow_lock()
+                .iter()
+                .any(|e| e.net.contains(net) || net.contains(&e.net))
+    }
+
+    /// All entries: `--allow` first, then API entries by network.
+    pub fn allowlist(&self) -> Vec<AllowView> {
+        let mut v: Vec<AllowView> = self
+            .settings
+            .allowlist
+            .iter()
+            .map(|n| AllowView {
+                net: *n,
+                source: "command line",
+                comment: String::new(),
+                created_by: None,
+                created_at: None,
+            })
+            .collect();
+        let mut added: Vec<AllowView> = self
+            .allow_lock()
+            .iter()
+            .map(|e| AllowView {
+                net: e.net,
+                source: "api",
+                comment: e.comment.clone(),
+                created_by: Some(e.created_by.clone()),
+                created_at: Some(e.created_at),
+            })
+            .collect();
+        added.sort_by_key(|e| e.net);
+        v.extend(added);
+        v
+    }
+
+    /// Adds an entry (blocking: one fsync).
+    pub fn add_allow(&self, e: AllowEntry) -> Result<(), AllowError> {
+        let mut entries = self.allow_lock();
+        let all = self
+            .settings
+            .allowlist
+            .iter()
+            .copied()
+            .chain(entries.iter().map(|x| x.net));
+        for n in all {
+            if n == e.net {
+                return Err(AllowError::Exists(e.net));
+            }
+            if n.contains(&e.net) {
+                return Err(AllowError::Covered(e.net, n));
+            }
+        }
+        self.store.put_allow(&e)?;
+        entries.push(e);
+        Ok(())
+    }
+
+    /// Removes an API entry (blocking).
+    pub fn remove_allow(&self, net: &IpNet) -> Result<(), AllowError> {
+        if self.settings.allowlist.iter().any(|n| n == net) {
+            return Err(AllowError::Fixed(*net));
+        }
+        let mut entries = self.allow_lock();
+        if !self.store.delete_allow(net)? {
+            return Err(AllowError::Missing(*net));
+        }
+        entries.retain(|e| e.net != *net);
+        Ok(())
     }
 
     pub fn token_used(&self, name: &str) {
@@ -610,6 +719,62 @@ mod tests {
             .unwrap();
         let d = rx.recv().await.unwrap();
         assert_eq!(d.seq, seq + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowlist_entries_persist() {
+        let (c, dir) = ctl("allow");
+        let net: IpNet = "192.0.2.0/24".parse().unwrap();
+        let e = AllowEntry {
+            net,
+            comment: "partner".into(),
+            created_by: "ada".into(),
+            created_at: Utc::now(),
+        };
+        c.add_allow(e.clone()).unwrap();
+        assert!(matches!(c.add_allow(e), Err(AllowError::Exists(_))));
+        assert!(c.allowlisted(&"192.0.2.7/32".parse().unwrap()));
+        assert!(
+            c.allowlisted(&"192.0.0.0/16".parse().unwrap()),
+            "a ban containing it"
+        );
+        drop(c);
+        let settings = Settings {
+            state_dir: dir.clone(),
+            cert_lifetime: Duration::from_secs(3600),
+            propagate: Propagate::Global,
+            allowlist: Allowlist::new(["10.0.0.0/8".parse().unwrap()]),
+            oidc: None,
+            https_internal_ca: true,
+        };
+        let c = Controller::open(
+            settings,
+            Ca::generate("t").unwrap(),
+            Store::open(&dir).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            c.allowlisted(&"192.0.2.7/32".parse().unwrap()),
+            "after restart"
+        );
+        let list = c.allowlist();
+        assert_eq!(
+            list.iter()
+                .map(|e| (e.net.to_string(), e.source))
+                .collect::<Vec<_>>(),
+            [
+                ("10.0.0.0/8".to_string(), "command line"),
+                ("192.0.2.0/24".to_string(), "api")
+            ]
+        );
+        assert!(matches!(
+            c.remove_allow(&"10.0.0.0/8".parse().unwrap()),
+            Err(AllowError::Fixed(_))
+        ));
+        c.remove_allow(&net).unwrap();
+        assert!(matches!(c.remove_allow(&net), Err(AllowError::Missing(_))));
+        assert!(!c.allowlisted(&"192.0.2.7/32".parse().unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

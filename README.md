@@ -70,6 +70,8 @@ cargo run -p df2bctl -- ban 203.0.113.7 --for 24h --reason scanner
 cargo run -p df2bctl -- bans list
 cargo run -p df2bctl -- unban 203.0.113.7
 cargo run -p df2bctl -- audit
+cargo run -p df2bctl -- allowlist add 192.0.2.0/24 --comment office   # admin
+cargo run -p df2bctl -- allowlist list
 cargo run -p df2bctl -- sessions list            # web UI sessions (admin)
 cargo run -p df2bctl -- sessions end --user olga # or <id>, or --all
 

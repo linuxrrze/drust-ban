@@ -311,6 +311,10 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/api-tokens", get(list_tokens).post(create_token))
         .route(
+            "/api/v1/allowlist",
+            get(list_allow).post(add_allow).delete(remove_allow),
+        )
+        .route(
             "/api/v1/api-tokens/:name",
             axum::routing::delete(revoke_token),
         )
@@ -804,6 +808,137 @@ async fn delete_user(
     .await?;
     let ended = ctl.sessions.end_user(Some(&name));
     Ok(Json(json!({ "deleted": name, "sessions_ended": ended })))
+}
+
+// -------------------------------------------------------------- allowlist
+
+/// Everybody may read the allowlist (with the number of active bans each
+/// entry would lift); only admins change it.
+async fn list_allow(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    let active = ctl.active_decisions();
+    let entries: Vec<Value> = ctl
+        .allowlist()
+        .into_iter()
+        .map(|e| {
+            let overlapping = active
+                .iter()
+                .filter(|d| d.target.contains(&e.net) || e.net.contains(&d.target))
+                .count();
+            let mut v = serde_json::to_value(&e).unwrap_or(Value::Null);
+            v["active_bans"] = json!(overlapping);
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "entries": entries })))
+}
+
+fn default_unban() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewAllow {
+    /// address or prefix
+    net: String,
+    #[serde(default)]
+    comment: String,
+    /// also lift active bans overlapping the network (default)
+    #[serde(default = "default_unban")]
+    unban: bool,
+}
+
+fn allow_error(e: crate::state::AllowError) -> ApiError {
+    use crate::state::AllowError as E;
+    match e {
+        E::Exists(_) | E::Covered(..) | E::Fixed(_) => conflict(e.to_string()),
+        E::Missing(_) => ApiError::not_found(e.to_string()),
+        E::Store(e) => ApiError::internal(e),
+    }
+}
+
+/// Admin: adds a network; by default also unbans what it overlaps.
+async fn add_allow(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Json(req): Json<NewAllow>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    caller.require(Role::Admin)?;
+    let net = target(&req.net)?.trunc();
+    // a /0 would silently switch banning off
+    if too_broad(&net) {
+        return Err(ApiError::bad_request(format!(
+            "{net} is too broad for the allowlist (at most /8 for IPv4, /16 for IPv6)"
+        )));
+    }
+    let comment: String = req
+        .comment
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let entry = crate::store::AllowEntry {
+        net,
+        comment: comment.trim().to_owned(),
+        created_by: caller.name.clone(),
+        created_at: Utc::now(),
+    };
+    let c = ctl.clone();
+    let unban = req.unban;
+    let unbanned = tokio::task::spawn_blocking(move || {
+        c.add_allow(entry).map_err(allow_error)?;
+        let lifted = if unban {
+            c.unban(net, caller.origin(), "allowlisted")
+                .map_err(ApiError::internal)?
+                .len()
+        } else {
+            0
+        };
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "allowlist.add",
+            json!({ "net": net, "comment": comment.trim(), "unbanned": lifted }),
+        )
+        .map_err(ApiError::internal)?;
+        Ok::<_, ApiError>(lifted)
+    })
+    .await
+    .map_err(ApiError::internal)??;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "net": net, "unbanned": unbanned })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AllowQuery {
+    net: String,
+}
+
+/// Admin: removes an entry added through the API (`?net=<prefix>`).
+async fn remove_allow(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Query(q): Query<AllowQuery>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let net = target(&q.net)?.trunc();
+    let c = ctl.clone();
+    tokio::task::spawn_blocking(move || {
+        c.remove_allow(&net).map_err(allow_error)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "allowlist.remove",
+            json!({ "net": net }),
+        )
+        .map_err(ApiError::internal)
+    })
+    .await
+    .map_err(ApiError::internal)??;
+    Ok(Json(json!({ "removed": net })))
 }
 
 // ------------------------------------------------------------- API tokens
@@ -1422,7 +1557,7 @@ async fn history(
     let history = blocking(move || c.history(net, limit)).await?;
     Ok(Json(json!({
         "target": net,
-        "allowlisted": ctl.settings.allowlist.overlaps(&net),
+        "allowlisted": ctl.allowlisted(&net),
         "active": active,
         "history": history,
     })))
@@ -1441,7 +1576,7 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         "active_decisions": ctl.active_decisions().len(),
         "last_seq": ctl.last_seq(),
         "propagate": ctl.settings.propagate,
-        "allowlist": ctl.settings.allowlist.iter().collect::<Vec<_>>(),
+        "allowlist": ctl.allowlist().iter().map(|e| e.net).collect::<Vec<_>>(),
         "sessions": ctl.sessions.count(),
     })))
 }
@@ -1636,7 +1771,7 @@ async fn ban(
             "{net} is too broad (minimum /8 for IPv4, /16 for IPv6)"
         )));
     }
-    if ctl.settings.allowlist.overlaps(&net) {
+    if ctl.allowlisted(&net) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!("{net} overlaps the controller allowlist"),
@@ -2865,6 +3000,180 @@ mod tests {
         assert!(
             !v.to_string().contains("df2bapi1."),
             "no secrets in the audit log"
+        );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn allowlist_editing() {
+        let env = Env::new("allow").await;
+        let viewer = env.token("vic", Role::Viewer);
+        let op = env.token("olga", Role::Operator);
+        let admin = env.token("ada", Role::Admin);
+        let add = |tok: &str, body: Value| {
+            let (env, tok) = (&env, tok.to_owned());
+            async move { env.call("POST", "/api/v1/allowlist", &tok, body).await }
+        };
+        let active = || {
+            let env = &env;
+            let op = op.clone();
+            async move {
+                let (_, v) = env.call("GET", "/api/v1/decisions", &op, json!({})).await;
+                v["decisions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| d["target"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let (st, v) = env
+            .call("GET", "/api/v1/allowlist", &viewer, json!({}))
+            .await;
+        assert_eq!(st, S::OK);
+        assert_eq!(
+            (
+                v["entries"][0]["net"].as_str(),
+                v["entries"][0]["source"].as_str()
+            ),
+            (Some("10.0.0.0/8"), Some("command line"))
+        );
+        assert_eq!(
+            add(&op, json!({ "net": "192.0.2.0/24" })).await.0,
+            S::FORBIDDEN
+        );
+
+        for t in ["198.51.100.7", "198.51.100.128/25", "203.0.113.5"] {
+            assert_eq!(
+                env.call(
+                    "POST",
+                    "/api/v1/bans",
+                    &op,
+                    json!({ "target": t, "duration": "1h" })
+                )
+                .await
+                .0,
+                S::CREATED
+            );
+        }
+        // adding lifts the bans it overlaps
+        let (st, v) = add(
+            &admin,
+            json!({ "net": "198.51.100.77/24", "comment": "partner\u{1b}[31m NOC" }),
+        )
+        .await;
+        assert_eq!(
+            (st, v["net"].as_str(), v["unbanned"].as_u64()),
+            (S::CREATED, Some("198.51.100.0/24"), Some(2))
+        );
+        assert_eq!(active().await, ["203.0.113.5/32"]);
+        let (st, _) = env
+            .call(
+                "POST",
+                "/api/v1/bans",
+                &op,
+                json!({ "target": "198.51.100.9" }),
+            )
+            .await;
+        assert_eq!(st, S::CONFLICT, "now allowlisted");
+        // ... unless asked not to
+        let (_, v) = add(&admin, json!({ "net": "203.0.113.0/24", "unban": false })).await;
+        assert_eq!(v["unbanned"], 0);
+        assert_eq!(active().await, ["203.0.113.5/32"]);
+
+        for (body, want) in [
+            (json!({ "net": "198.51.100.0/24" }), S::CONFLICT),
+            (json!({ "net": "198.51.100.64/26" }), S::CONFLICT),
+            (json!({ "net": "10.1.0.0/16" }), S::CONFLICT),
+            (json!({ "net": "0.0.0.0/4" }), S::BAD_REQUEST),
+            (json!({ "net": "2001:db8::/8" }), S::BAD_REQUEST),
+            (json!({ "net": "nope" }), S::BAD_REQUEST),
+        ] {
+            let (st, v) = add(&admin, body.clone()).await;
+            assert_eq!(st, want, "{body} {v}");
+        }
+
+        let (_, v) = env
+            .call("GET", "/api/v1/allowlist", &viewer, json!({}))
+            .await;
+        let e = &v["entries"];
+        assert_eq!(e.as_array().unwrap().len(), 3);
+        assert_eq!(
+            (e[1]["net"].as_str(), e[1]["created_by"].as_str()),
+            (Some("198.51.100.0/24"), Some("ada"))
+        );
+        assert_eq!(
+            e[1]["comment"], "partner[31m NOC",
+            "control characters removed"
+        );
+        assert_eq!(
+            (e[2]["net"].as_str(), e[2]["active_bans"].as_u64()),
+            (Some("203.0.113.0/24"), Some(1))
+        );
+        let (_, v) = env
+            .call(
+                "GET",
+                "/api/v1/history?target=198.51.100.9",
+                &viewer,
+                json!({}),
+            )
+            .await;
+        assert_eq!(v["allowlisted"], true);
+
+        // removing
+        let del = |net: &str| {
+            let (env, admin) = (&env, admin.clone());
+            let url = format!("{}/api/v1/allowlist", env.base);
+            let net = net.to_owned();
+            async move {
+                env.http
+                    .delete(url)
+                    .query(&[("net", net)])
+                    .bearer_auth(admin)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(del("10.0.0.0/8").await, S::CONFLICT, "command line entry");
+        assert_eq!(del("198.51.100.0/24").await, S::OK);
+        assert_eq!(del("198.51.100.0/24").await, S::NOT_FOUND);
+        assert_eq!(
+            env.call(
+                "POST",
+                "/api/v1/bans",
+                &op,
+                json!({ "target": "198.51.100.9" })
+            )
+            .await
+            .0,
+            S::CREATED
+        );
+
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let actions: Vec<_> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"].as_str().unwrap().starts_with("allowlist"))
+            .map(|e| {
+                format!(
+                    "{} {} {}",
+                    e["action"].as_str().unwrap(),
+                    e["details"]["net"].as_str().unwrap(),
+                    e["details"]["unbanned"]
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "allowlist.remove 198.51.100.0/24 null",
+                "allowlist.add 203.0.113.0/24 0",
+                "allowlist.add 198.51.100.0/24 2"
+            ]
         );
         let _ = std::fs::remove_dir_all(&env.dir);
     }

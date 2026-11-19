@@ -212,7 +212,7 @@ impl AgentService for Service {
                 warn!(agent = %record.id, %net, "ignoring overly broad ban");
                 continue;
             }
-            if self.ctl.settings.allowlist.overlaps(&net) {
+            if self.ctl.allowlisted(&net) {
                 warn!(agent = %record.id, %net, "ignoring ban overlapping the allowlist");
                 continue;
             }

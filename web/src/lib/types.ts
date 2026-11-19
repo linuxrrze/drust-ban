@@ -130,3 +130,12 @@ export interface TokenInfo {
   last_used_at: string | null;
   current: boolean;
 }
+
+export interface AllowEntry {
+  net: string;
+  source: 'command line' | 'api';
+  comment: string;
+  created_by: string | null;
+  created_at: string | null;
+  active_bans: number;
+}

@@ -1,5 +1,6 @@
 //! Persistent controller state in redb (`<state_dir>/controller.redb`):
-//! enrolled agents and the append-only decision log.
+//! enrolled agents, the append-only decision log, the audit log and the
+//! allowlist entries added through the API.
 //!
 //! Runtime status (last heartbeat, open streams) is kept in memory only: it
 //! changes every few seconds per agent and is worthless after a restart.
@@ -17,6 +18,17 @@ use serde::{Deserialize, Serialize};
 const AGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("agents");
 const DECISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("decisions");
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
+const ALLOWLIST: TableDefinition<&str, &[u8]> = TableDefinition::new("allowlist");
+
+/// An allowlist entry added through the API (`--allow` entries are not
+/// stored).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllowEntry {
+    pub net: ipnet::IpNet,
+    pub comment: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
 
 /// One administrative action (REST API or enrollment).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +68,7 @@ impl Store {
         tx.open_table(AGENTS)?;
         tx.open_table(DECISIONS)?;
         tx.open_table(AUDIT)?;
+        tx.open_table(ALLOWLIST)?;
         tx.commit()?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -113,6 +126,37 @@ impl Store {
         }
         tx.commit()?;
         Ok(e)
+    }
+
+    pub fn allow_entries(&self) -> anyhow::Result<Vec<AllowEntry>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for item in tx.open_table(ALLOWLIST)?.iter()? {
+            let (_, v) = item?;
+            out.push(serde_json::from_slice(v.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn put_allow(&self, e: &AllowEntry) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(ALLOWLIST)?.insert(
+            e.net.to_string().as_str(),
+            serde_json::to_vec(e)?.as_slice(),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// False if there was no such entry.
+    pub fn delete_allow(&self, net: &ipnet::IpNet) -> anyhow::Result<bool> {
+        let tx = self.db.begin_write()?;
+        let found = tx
+            .open_table(ALLOWLIST)?
+            .remove(net.to_string().as_str())?
+            .is_some();
+        tx.commit()?;
+        Ok(found)
     }
 
     /// Newest first, at most `limit`, with `seq < before`.

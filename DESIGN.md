@@ -586,10 +586,23 @@ df2bctl config check | reload
   CSP alone), plus `Cache-Control: no-cache, no-store`. Only effective
   logouts are audited, so junk requests cannot fill the audit log. The
   provider's logout page must be served from the issuer's origin.
+- **Allowlist editing**: `--allow` entries stay fixed ("command line");
+  admins add and remove more through `GET|POST|DELETE /api/v1/allowlist`,
+  the "Allowlist" page (read-only for other roles; also "Allowlist…" on the
+  address page) or `df2bctl allowlist list|add|rm`. Entries are stored in
+  redb (table `allowlist`), apply at once to manual bans and agent reports,
+  and survive restarts. Adding lifts the active bans overlapping the
+  network by default (`unban: false` / `--keep-bans` to keep them). Refused:
+  prefixes broader than /8 or /16 (a /0 would switch banning off),
+  duplicates and networks already covered by an entry (409). Comments are
+  stored without control characters (max 200). Audited. Agents still apply
+  their own allowlist only: a local ban of a centrally allowlisted address
+  stays local (it is not propagated) until the controller allowlist is
+  distributed to agents.
 - Not yet:
   observation timelines and sample log lines (needs observation reporting),
-  ASN/GeoIP, "allow for X" after unban, policies/jails and allowlist editing,
-  changing an agent's group.
+  ASN/GeoIP, "allow for X" after unban, policies/jails editing,
+  distributing the allowlist to agents, changing an agent's group.
 
 Pages:
 

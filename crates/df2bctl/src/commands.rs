@@ -411,3 +411,70 @@ pub async fn sessions_end(
     );
     Ok(())
 }
+
+pub async fn allowlist_list(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/allowlist").await?;
+    if json {
+        return json_out(&v);
+    }
+    let list = v["entries"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("the allowlist is empty");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<14} {:<10} {:>5}  COMMENT",
+        "NETWORK", "ADDED BY", "ADDED", "BANS"
+    );
+    for e in &list {
+        let by = if e["source"] == "command line" {
+            "--allow"
+        } else {
+            s(e, &["created_by"])
+        };
+        println!(
+            "{:<24} {:<14} {:<10} {:>5}  {}",
+            s(e, &["net"]),
+            by,
+            ago(&e["created_at"]),
+            e["active_bans"].to_string(),
+            e["comment"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+pub async fn allowlist_add(
+    c: &Client,
+    net: IpNet,
+    comment: Option<String>,
+    unban: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let v = c
+        .post(
+            "/api/v1/allowlist",
+            json!({ "net": net.to_string(), "comment": comment.unwrap_or_default(), "unban": unban }),
+        )
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    println!(
+        "{} allowlisted; {} active ban(s) lifted",
+        s(&v, &["net"]),
+        v["unbanned"]
+    );
+    Ok(())
+}
+
+pub async fn allowlist_rm(c: &Client, net: IpNet, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .delete("/api/v1/allowlist", &[("net", net.to_string())])
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("{} removed from the allowlist", s(&v, &["removed"]));
+    Ok(())
+}

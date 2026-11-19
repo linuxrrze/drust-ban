@@ -37,6 +37,8 @@
     'session.login': 'logged in',
     'session.end': 'session ended',
     'user.create': 'user created',
+    'allowlist.add': 'allowlisted',
+    'allowlist.remove': 'removed from allowlist',
     'token.create': 'API token created',
     'token.revoke': 'API token revoked',
     'user.update': 'role changed',
