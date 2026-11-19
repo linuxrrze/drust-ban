@@ -5,6 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# options as environment variables, e.g. DF2B_OIDC_CONFIG=/etc/df2b/oidc.toml,
+# DF2B_GEOIP=/var/lib/GeoIP/GeoLite2-ASN.mmdb,/var/lib/GeoIP/GeoLite2-Country.mmdb
+EnvironmentFile=-/etc/df2b/controller.env
 ExecStart=/usr/bin/df2b-controller
 Restart=on-failure
 RestartSec=2s

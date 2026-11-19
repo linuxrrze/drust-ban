@@ -1,0 +1,2 @@
+# dist-f2b agent: df2b-agent.service runs as User=df2b (StateDirectory=df2b)
+u df2b - "dist-f2b agent" /var/lib/df2b

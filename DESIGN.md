@@ -980,7 +980,7 @@ crates/
 web/                Svelte + Vite frontend (built into web/dist, embedded)
 config/             example configuration
 filters/            bundled filters
-packaging/          systemd units, later deb/rpm
+packaging/          systemd units, Debian packages (deb/, cargo-deb)
 ```
 
 The agent runs as a dedicated user, not root: `AmbientCapabilities=CAP_NET_ADMIN`,

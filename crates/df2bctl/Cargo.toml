@@ -19,3 +19,16 @@ df2b-core.workspace = true
 df2b-matcher.workspace = true
 humantime.workspace = true
 ipnet.workspace = true
+
+# Debian package (cargo-deb); build with packaging/deb/build.sh.
+[package.metadata.deb]
+maintainer = "Marcel Ritter <marcel@linux-ng.de>"
+section = "net"
+priority = "optional"
+extended-description = """\
+Command line tool for dist-f2b: talks to the controller's REST API, or with \
+--local to the agent on this host; also tests filters against log files."""
+depends = "$auto"
+assets = [
+    ["target/release/df2bctl", "usr/bin/", "755"],
+]

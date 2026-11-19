@@ -22,6 +22,46 @@ cargo test -p df2b-sources --features journald -- --ignored live_journal
 
 `protoc` is vendored (`protoc-bin-vendored`); set `PROTOC` to use a system one.
 
+## Debian packages
+
+CI (`.github/workflows/deb.yml`) builds `.deb` packages for amd64 and arm64
+(Debian 12+, Ubuntu 24.04+): download them from the workflow run's artifacts
+or, for `v*` tags, from the GitHub release. Locally: build the web UI, then
+`cargo install cargo-deb --locked && packaging/deb/build.sh` (→ `target/debian/`).
+
+| Package           | Contents                                                                                 |
+|-------------------|------------------------------------------------------------------------------------------|
+| `df2b-agent`      | `/usr/bin/df2b-agent`, `df2b-agent.service` (user `df2b`), `/etc/df2b/agent.toml`, `/etc/df2b/filters/` |
+| `df2b-controller` | `/usr/bin/df2b-controller` (web UI embedded), `df2b-controller.service`                   |
+| `df2bctl`         | `/usr/bin/df2bctl`                                                                       |
+
+```sh
+sudo apt install ./df2b-agent_*.deb ./df2bctl_*.deb   # pulls in nftables
+```
+
+The services are enabled and started on installation. The agent starts with
+`firewall = "dry-run"`: edit `/etc/df2b/agent.toml` (and the filters in
+`/etc/df2b/filters/`, both kept on upgrades), set `firewall = "nftables"`,
+then `sudo systemctl reload df2b-agent` (or `df2bctl --local config reload`).
+For a controller, put `DF2B_ENROLL_TOKEN=…` into `/etc/df2b/agent.env` and
+restart the agent.
+
+The controller keeps its state in `/var/lib/df2b-controller`; its options
+go into `/etc/df2b/controller.env` as environment variables
+(`DF2B_OIDC_CONFIG=/etc/df2b/oidc.toml`, `DF2B_GEOIP=a.mmdb,b.mmdb`, see
+`df2b-controller --help`). It runs with `DynamicUser=yes`, so run its
+management commands (`user`, `api-token`, `enroll-token`, `revoke`) as that
+user:
+
+```sh
+sudo systemd-run --pty --quiet -p DynamicUser=yes -p User=df2b-controller \
+    -p StateDirectory=df2b-controller \
+    /usr/bin/df2b-controller user add ada --role admin
+```
+
+`apt purge` also removes `/var/lib/df2b` and `/var/lib/df2b-controller`
+(agent keys, controller CA, users and tokens).
+
 ## Try it
 
 ```sh

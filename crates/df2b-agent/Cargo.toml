@@ -33,3 +33,27 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+# Debian package (cargo-deb); build with packaging/deb/build.sh, which
+# generates packaging/deb/generated/agent.toml from config/agent.example.toml.
+# The df2b user comes from the sysusers.d file (cargo-deb adds the postinst).
+[package.metadata.deb]
+maintainer = "Marcel Ritter <marcel@linux-ng.de>"
+section = "net"
+priority = "optional"
+extended-description = """\
+Reads logs (files and the systemd journal), detects abusive clients with \
+fail2ban-style filters and bans them with nftables, standalone or together \
+with a dist-f2b controller."""
+depends = "$auto, nftables"
+recommends = "df2bctl, libsystemd0"
+maintainer-scripts = "../../packaging/deb/df2b-agent/"
+systemd-units = { unit-scripts = "../../packaging/systemd", enable = true, start = true }
+assets = [
+    ["target/release/df2b-agent", "usr/bin/", "755"],
+    ["../../packaging/deb/generated/agent.toml", "etc/df2b/agent.toml", "644"],
+    ["../../filters/*.toml", "etc/df2b/filters/", "644"],
+    ["../../packaging/deb/df2b-agent.sysusers", "usr/lib/sysusers.d/df2b-agent.conf", "644"],
+    ["../../README.md", "usr/share/doc/df2b-agent/README.md", "644"],
+    ["../../config/agent.example.toml", "usr/share/doc/df2b-agent/examples/agent.example.toml", "644"],
+]

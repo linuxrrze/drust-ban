@@ -43,3 +43,22 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+
+# Debian package (cargo-deb); build with packaging/deb/build.sh (the web UI
+# in web/dist must be built first, it is embedded into the binary).
+[package.metadata.deb]
+maintainer = "Marcel Ritter <marcel@linux-ng.de>"
+section = "net"
+priority = "optional"
+extended-description = """\
+Central decision log, correlation, enrollment CA, REST API and web UI for \
+dist-f2b agents."""
+depends = "$auto"
+recommends = "df2bctl"
+maintainer-scripts = "../../packaging/deb/df2b-controller/"
+systemd-units = { unit-scripts = "../../packaging/systemd", enable = true, start = true }
+assets = [
+    ["target/release/df2b-controller", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/df2b-controller/README.md", "644"],
+    ["../../config/oidc.example.toml", "usr/share/doc/df2b-controller/examples/oidc.example.toml", "644"],
+]

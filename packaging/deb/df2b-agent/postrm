@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+if [ "$1" = "purge" ]; then
+    # offender database, positions, the agent's TLS key and certificate
+    rm -rf /var/lib/df2b
+    # the df2b user is kept (files elsewhere may still belong to it)
+fi
+
+exit 0
