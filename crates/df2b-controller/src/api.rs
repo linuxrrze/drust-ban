@@ -337,7 +337,7 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/events", get(events))
         .route("/api/v1/history", get(history))
         .route("/api/v1/agents", get(agents))
-        .route("/api/v1/agents/:id", get(agent))
+        .route("/api/v1/agents/:id", get(agent).patch(update_agent))
         .route("/api/v1/agents/:id/revoke", post(revoke_agent))
         .route("/api/v1/enroll-tokens", post(enroll_token))
         .route("/api/v1/decisions", get(decisions))
@@ -1612,6 +1612,52 @@ async fn agent(
     Ok(Json(json!({ "agent": a })))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentUpdate {
+    group: String,
+}
+
+/// Admin: moves an agent to another group. Bans scoped to the old group
+/// are removed from it and those of the new group applied, within seconds
+/// if it is connected, else at its next connection.
+async fn update_agent(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(id): Path<String>,
+    Json(req): Json<AgentUpdate>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let group = req.group.trim().to_owned();
+    if !files::valid_group(&group) {
+        return Err(ApiError::bad_request(
+            "invalid group name (letters, digits, - _ .; at most 64)",
+        ));
+    }
+    if ctl.agent(&id).map_or(true, |a| a.revoked) {
+        return Err(ApiError::not_found(format!("no active agent {id:?}")));
+    }
+    let c = ctl.clone();
+    let (i, g) = (id.clone(), group.clone());
+    let old = blocking(move || {
+        let old = c.set_group(&i, &g)?;
+        if let Some(old) = old.as_ref().filter(|o| **o != g) {
+            c.audit(
+                &caller.name,
+                caller.addr(),
+                "agent.group",
+                json!({ "agent": i, "from": old, "to": g }),
+            )?;
+        }
+        Ok(old)
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found(format!("no agent {id:?}")))?;
+    Ok(Json(
+        json!({ "agent": id, "group": group, "previous_group": old, "changed": old != group }),
+    ))
+}
+
 async fn revoke_agent(
     caller: Caller,
     State(ctl): State<Arc<Controller>>,
@@ -1916,6 +1962,7 @@ mod tests {
         base: String,
         http: reqwest::Client,
         dir: std::path::PathBuf,
+        ctl: Arc<Controller>,
     }
 
     impl Env {
@@ -1940,11 +1987,16 @@ mod tests {
             tokio::spawn(crate::https::serve(
                 l,
                 tls,
-                router(ctl),
+                router(ctl.clone()),
                 std::future::pending(),
             ));
             let http = client(Trust::PinnedCa(fp));
-            Self { base, http, dir }
+            Self {
+                base,
+                http,
+                dir,
+                ctl,
+            }
         }
 
         fn token(&self, name: &str, role: Role) -> String {
@@ -3188,6 +3240,108 @@ mod tests {
                 "allowlist.add 203.0.113.0/24 0",
                 "allowlist.add 198.51.100.0/24 2"
             ]
+        );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn change_agent_group() {
+        let env = Env::new("group").await;
+        env.ctl
+            .put_agent(crate::store::AgentRecord {
+                id: "web-01-abc".into(),
+                hostname: "web-01".into(),
+                group: "web".into(),
+                enrolled_at: Utc::now(),
+                serials: vec![],
+                cert_not_after: Utc::now(),
+                resync: false,
+            })
+            .unwrap();
+        let op = env.token("olga", Role::Operator);
+        let admin = env.token("ada", Role::Admin);
+        let patch = |tok: &str, id: &str, body: Value| {
+            let (env, tok) = (&env, tok.to_owned());
+            let url = format!("{}/api/v1/agents/{id}", env.base);
+            async move {
+                let r = env
+                    .http
+                    .patch(url)
+                    .bearer_auth(tok)
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                (r.status(), r.json::<Value>().await.unwrap_or(Value::Null))
+            }
+        };
+        assert_eq!(
+            patch(&op, "web-01-abc", json!({ "group": "db" })).await.0,
+            S::FORBIDDEN
+        );
+        for (body, want) in [
+            (json!({ "group": "" }), S::BAD_REQUEST),
+            (json!({ "group": "db servers" }), S::BAD_REQUEST),
+            (json!({ "group": "../x" }), S::BAD_REQUEST),
+            (
+                json!({ "group": "db", "extra": 1 }),
+                S::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            assert_eq!(
+                patch(&admin, "web-01-abc", body.clone()).await.0,
+                want,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            patch(&admin, "ghost", json!({ "group": "db" })).await.0,
+            S::NOT_FOUND
+        );
+
+        let (st, v) = patch(&admin, "web-01-abc", json!({ "group": " db " })).await;
+        assert_eq!(st, S::OK, "{v}");
+        assert_eq!(
+            (
+                v["group"].as_str(),
+                v["previous_group"].as_str(),
+                v["changed"].as_bool()
+            ),
+            (Some("db"), Some("web"), Some(true))
+        );
+        let (_, v) = env
+            .call("GET", "/api/v1/agents/web-01-abc", &op, json!({}))
+            .await;
+        assert_eq!(
+            (v["agent"]["group"].as_str(), v["agent"]["resync"].as_bool()),
+            (Some("db"), Some(true))
+        );
+        // unchanged: no audit entry
+        let (_, v) = patch(&admin, "web-01-abc", json!({ "group": "db" })).await;
+        assert_eq!(v["changed"], false);
+        // revoked agents cannot be moved
+        files::revoke(&env.dir, "web-01-abc").unwrap();
+        assert_eq!(
+            patch(&admin, "web-01-abc", json!({ "group": "web" }))
+                .await
+                .0,
+            S::NOT_FOUND
+        );
+
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let entries: Vec<_> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "agent.group")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            (
+                entries[0]["details"]["from"].as_str(),
+                entries[0]["details"]["to"].as_str()
+            ),
+            (Some("web"), Some("db"))
         );
         let _ = std::fs::remove_dir_all(&env.dir);
     }

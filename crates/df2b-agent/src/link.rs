@@ -218,6 +218,11 @@ impl Identity {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
         write_atomic(&dir.join(CA_FILE), cert_to_pem(&self.ca).as_bytes(), 0o644)?;
+        self.save_identity_file(dir)?;
+        self.save_cert(dir)
+    }
+
+    fn save_identity_file(&self, dir: &Path) -> anyhow::Result<()> {
         let id = IdentityFile {
             agent_id: self.agent_id.clone(),
             group: self.group.clone(),
@@ -227,7 +232,7 @@ impl Identity {
             &serde_json::to_vec_pretty(&id)?,
             0o644,
         )?;
-        self.save_cert(dir)
+        Ok(())
     }
 
     fn save_cert(&self, dir: &Path) -> anyhow::Result<()> {
@@ -284,6 +289,13 @@ fn is_permanent(e: &anyhow::Error) -> bool {
             Code::PermissionDenied | Code::InvalidArgument | Code::Unauthenticated
         )
     })
+}
+
+/// The controller closed the stream on purpose (group change, lagging
+/// stream) and expects an immediate resubscription.
+fn is_resubscribe(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<tonic::Status>()
+        .is_some_and(|s| s.code() == Code::Aborted)
 }
 
 pub fn parse_decision(d: v1::Decision, own_origin: &str) -> Option<RemoteDecision> {
@@ -343,6 +355,10 @@ impl Task {
                 Err(e) => {
                     if connected {
                         backoff = Duration::from_secs(1);
+                    }
+                    if connected && is_resubscribe(&e) {
+                        info!(reason = %fmt_err(&e), "controller asked to resubscribe");
+                        continue;
                     }
                     if is_permanent(&e) {
                         error!(error = %fmt_err(&e), "controller rejected this agent");
@@ -483,7 +499,7 @@ impl Task {
                 },
                 _ = flush.tick() => self.flush(&mut client).await?,
                 _ = heartbeat.tick() => {
-                    client.heartbeat(v1::HeartbeatRequest {
+                    let hb = client.heartbeat(v1::HeartbeatRequest {
                         agent_version: env!("CARGO_PKG_VERSION").into(),
                         agent_time_unix_ms: Utc::now().timestamp_millis(),
                         sources: Vec::new(), // TODO: per-source rate and lag
@@ -492,7 +508,16 @@ impl Task {
                         firewall_healthy: true, // TODO: backend health check
                         last_applied_seq: self.last_seq,
                         allowlist_version: self.stats.allowlist_version.lock().map(|v| v.clone()).unwrap_or_default(),
-                    }).await?;
+                    }).await?.into_inner();
+                    // the controller decides the group (it filters the
+                    // decisions); keep the local copy for logs up to date
+                    if let Some(g) = hb.groups.first().filter(|g| **g != id.group) {
+                        info!(from = %id.group, to = %g, "group changed by the controller");
+                        id.group = g.clone();
+                        if let Err(e) = id.save_identity_file(&self.cfg.tls_dir) {
+                            warn!(error = %format!("{e:#}"), "saving the new group failed");
+                        }
+                    }
                     if id.needs_renewal(Utc::now()) {
                         self.renew(&mut client, id).await?;
                         return Ok(End::Renewed);

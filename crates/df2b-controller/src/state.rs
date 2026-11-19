@@ -346,10 +346,28 @@ impl Controller {
     ) -> anyhow::Result<(Initial, broadcast::Receiver<Arc<Decision>>)> {
         let now = Utc::now();
         let (rx, last, snapshot) = {
-            let inner = self.lock();
+            let mut inner = self.lock();
             let rx = self.events.subscribe();
             let last = inner.last_seq;
-            let need_snapshot = from_seq == 0 || from_seq > last || last - from_seq > MAX_BACKLOG;
+            // the current record: the group may have changed since `agent`
+            // was read
+            let current = inner.agents.get(&agent.id).cloned();
+            let agent = current.as_ref().unwrap_or(agent);
+            let need_snapshot =
+                from_seq == 0 || from_seq > last || last - from_seq > MAX_BACKLOG || agent.resync;
+            if agent.resync {
+                // cleared under the lock, so a concurrent group change is
+                // never lost
+                let mut r = agent.clone();
+                r.resync = false;
+                self.store.put_agent(&r)?;
+                inner.agents.insert(r.id.clone(), r);
+            }
+            let agent = &inner
+                .agents
+                .get(&agent.id)
+                .cloned()
+                .unwrap_or_else(|| agent.clone());
             let snapshot = need_snapshot.then(|| {
                 let mut v: Vec<Decision> = inner
                     .active
@@ -375,6 +393,28 @@ impl Controller {
             },
         };
         Ok((initial, rx))
+    }
+
+    /// Moves an agent to another group (blocking: one fsync). Its open
+    /// streams close (see grpc.rs) and its next subscription gets a full
+    /// snapshot. Returns the previous group.
+    pub fn set_group(&self, id: &str, group: &str) -> anyhow::Result<Option<String>> {
+        let mut inner = self.lock();
+        let Some(mut r) = inner.agents.get(id).cloned() else {
+            return Ok(None);
+        };
+        let old = std::mem::replace(&mut r.group, group.to_owned());
+        if old != group {
+            r.resync = true;
+            self.store.put_agent(&r)?;
+            inner.agents.insert(r.id.clone(), r);
+        }
+        Ok(Some(old))
+    }
+
+    /// The agent's current group (`None`: unknown agent).
+    pub fn agent_group(&self, id: &str) -> Option<String> {
+        self.lock().agents.get(id).map(|a| a.group.clone())
     }
 
     pub fn update_status(&self, id: &str, f: impl FnOnce(&mut AgentStatus)) {
@@ -676,6 +716,7 @@ mod tests {
             enrolled_at: Utc::now(),
             serials: vec![],
             cert_not_after: Utc::now(),
+            resync: false,
         }
     }
 
@@ -833,6 +874,67 @@ mod tests {
         c.remove_allow(&net).unwrap();
         assert!(matches!(c.remove_allow(&net), Err(AllowError::Missing(_))));
         assert!(!c.allowlisted(&"192.0.2.7/32".parse().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_change_forces_a_snapshot() {
+        let (c, dir) = ctl("group");
+        c.put_agent(agent("a1", "web")).unwrap();
+        c.append(vec![
+            ban("192.0.2.1/32", Scope::Group("web".into()), Some(1)),
+            ban("192.0.2.2/32", Scope::Group("db".into()), Some(1)),
+            ban("192.0.2.3/32", Scope::Global, Some(1)),
+        ])
+        .unwrap();
+        let targets = |i: &Initial| match i {
+            Initial::Snapshot { active, .. } => active
+                .iter()
+                .map(|d| d.target.to_string())
+                .collect::<Vec<_>>(),
+            Initial::Backlog { .. } => panic!("expected a snapshot"),
+        };
+        let rec = |c: &Controller| c.agents()[0].record.clone();
+        let (i, _) = c.subscribe(0, &rec(&c)).unwrap();
+        assert_eq!(targets(&i), ["192.0.2.1/32", "192.0.2.3/32"]);
+
+        // up to date in "web"; moved to "db": snapshot although nothing is new
+        assert_eq!(c.set_group("a1", "db").unwrap().as_deref(), Some("web"));
+        assert!(rec(&c).resync);
+        let (i, _) = c.subscribe(c.last_seq(), &rec(&c)).unwrap();
+        assert_eq!(targets(&i), ["192.0.2.2/32", "192.0.2.3/32"]);
+        assert!(!rec(&c).resync, "cleared once sent");
+        let (i, _) = c.subscribe(c.last_seq(), &rec(&c)).unwrap();
+        assert!(
+            matches!(i, Initial::Backlog { .. }),
+            "then resuming works normally"
+        );
+
+        // the same group again: no resync; unknown agent: None
+        assert_eq!(c.set_group("a1", "db").unwrap().as_deref(), Some("db"));
+        assert!(!rec(&c).resync);
+        assert!(c.set_group("ghost", "db").unwrap().is_none());
+
+        // the flag survives a restart (agent offline during the change)
+        c.set_group("a1", "web").unwrap();
+        drop(c);
+        let settings = Settings {
+            state_dir: dir.clone(),
+            cert_lifetime: Duration::from_secs(3600),
+            propagate: Propagate::Global,
+            allowlist: Allowlist::default(),
+            oidc: None,
+            https_internal_ca: true,
+        };
+        let c = Controller::open(
+            settings,
+            Ca::generate("t").unwrap(),
+            Store::open(&dir).unwrap(),
+        )
+        .unwrap();
+        assert!(rec(&c).resync && rec(&c).group == "web");
+        let (i, _) = c.subscribe(c.last_seq(), &rec(&c)).unwrap();
+        assert_eq!(targets(&i), ["192.0.2.1/32", "192.0.2.3/32"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

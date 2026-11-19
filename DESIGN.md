@@ -609,10 +609,21 @@ df2bctl config check | reload
   whole, never applied partially. The UI shows per agent whether its list
   is current and how many connected agents use the current one. Older
   agents ignore the new event (protobuf) and show as "unknown".
+- **Changing an agent's group** (admin: `PATCH /api/v1/agents/<id>`
+  `{group}`, "Change…" in the agent details, `df2bctl agents set-group`):
+  the record is updated and marked `resync` (persisted, so it also works
+  while the agent is offline or across a controller restart). Open streams
+  of the agent are closed with `Aborted` within 5 s (the revocation check);
+  the agent resubscribes at once (logged at info level, no backoff) and the
+  `resync` flag turns that subscription into a full snapshot for the new
+  group, which removes the old group's bans and applies the new group's
+  (global and agent-scoped bans are unaffected). The flag is cleared under
+  the state lock when the snapshot is built. The agent learns its group
+  from the heartbeat response and updates `identity.json`. Revoked agents
+  cannot be moved; audited as `agent.group` (only real changes).
 - Not yet:
   observation timelines and sample log lines (needs observation reporting),
-  ASN/GeoIP, "allow for X" after unban, policies/jails editing,
-  changing an agent's group.
+  ASN/GeoIP, "allow for X" after unban, policies/jails editing.
 
 Pages:
 

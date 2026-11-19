@@ -52,6 +52,10 @@ pub struct AgentRecord {
     /// renewal, the previous one.
     pub serials: Vec<String>,
     pub cert_not_after: DateTime<Utc>,
+    /// The agent's group changed: its next subscription gets a full
+    /// snapshot (old group's bans removed, new group's applied).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resync: bool,
 }
 
 #[derive(Clone)]

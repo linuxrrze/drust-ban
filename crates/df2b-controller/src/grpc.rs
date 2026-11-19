@@ -109,6 +109,7 @@ impl AgentService for Service {
                 enrolled_at: Utc::now(),
                 serials: vec![info.serial],
                 cert_not_after: info.not_after,
+                resync: false,
             })
             .map_err(internal)?;
             info!(agent = %id, group = %token_file.group, ?peer, version = %r.agent_version, "agent enrolled");
@@ -333,6 +334,13 @@ impl AgentService for Service {
                         if ctl.is_revoked(&id) {
                             warn!(agent = %id, "agent revoked, closing stream");
                             let _ = tx.send(Err(Status::permission_denied("agent revoked"))).await;
+                            break;
+                        }
+                        // moved to another group: the agent resubscribes
+                        // and gets a snapshot for the new group
+                        if ctl.agent_group(&id).as_deref() != Some(record.group.as_str()) {
+                            info!(agent = %id, "group changed, closing stream for a resync");
+                            let _ = tx.send(Err(Status::aborted("group changed; resubscribe"))).await;
                             break;
                         }
                     }
@@ -644,6 +652,42 @@ mod tests {
             .await
             .expect("stream closed after revocation");
         assert_eq!(closed.unwrap_err().code(), Code::PermissionDenied);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn group_change_closes_the_stream() {
+        let dir = std::env::temp_dir().join(format!("df2b-ctl-grpc-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (addr, ctl) = start(&dir).await;
+        let mut a = enrolled(&addr, &ctl, &dir, "host-g").await;
+        let id = ctl.agents()[0].record.id.clone();
+        let mut stream = a
+            .subscribe(v1::SubscribeRequest { from_seq: 0 })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(next(&mut stream).await, Some(Event::Snapshot(_))));
+        assert!(matches!(next(&mut stream).await, Some(Event::Allowlist(_))));
+
+        ctl.set_group(&id, "db").unwrap();
+        // closed within the check interval (5 s)
+        let err = tokio::time::timeout(Duration::from_secs(10), stream.message())
+            .await
+            .expect("stream closed in time")
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Aborted);
+        // the agent resubscribes where it was and gets a snapshot
+        let mut stream = a
+            .subscribe(v1::SubscribeRequest {
+                from_seq: ctl.last_seq(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(next(&mut stream).await, Some(Event::Snapshot(_))));
+        let hb = a.heartbeat(heartbeat()).await.unwrap().into_inner();
+        assert_eq!(hb.groups, ["db"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

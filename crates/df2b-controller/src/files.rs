@@ -89,12 +89,17 @@ fn token_dir(dir: &Path) -> PathBuf {
 }
 
 /// Creates a one-time enrollment token. Only the secret's hash is stored.
-pub fn create_token(dir: &Path, group: &str, ttl: Duration) -> anyhow::Result<EnrollToken> {
-    if group.is_empty()
-        || !group
+/// Group names: letters, digits, - _ . (at most 64).
+pub fn valid_group(group: &str) -> bool {
+    !group.is_empty()
+        && group.len() <= 64
+        && group
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-    {
+}
+
+pub fn create_token(dir: &Path, group: &str, ttl: Duration) -> anyhow::Result<EnrollToken> {
+    if !valid_group(group) {
         bail!("invalid group name {group:?} (allowed: letters, digits, - _ .)");
     }
     let ca =

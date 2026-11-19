@@ -162,6 +162,11 @@ impl Client {
             .await
     }
 
+    pub async fn patch(&self, path: &str, body: Value) -> anyhow::Result<Value> {
+        self.send(self.http.patch(format!("{}{path}", self.base)).json(&body))
+            .await
+    }
+
     pub async fn delete(&self, path: &str, q: &[(&str, String)]) -> anyhow::Result<Value> {
         self.send(self.http.delete(format!("{}{path}", self.base)).query(q))
             .await

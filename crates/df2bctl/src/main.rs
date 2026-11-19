@@ -131,6 +131,12 @@ enum AgentsCmd {
     Revoke {
         id: String,
     },
+    /// Move an agent to another group (admin): bans of the old group are
+    /// removed from it, those of the new group applied.
+    SetGroup {
+        id: String,
+        group: String,
+    },
     /// Create a one-time enrollment token.
     EnrollToken {
         #[arg(long, default_value = "default")]
@@ -265,6 +271,9 @@ async fn run() -> anyhow::Result<()> {
                 AgentsCmd::List => commands::agents_list(&c, json).await,
                 AgentsCmd::Show { id } => commands::agents_show(&c, &id, json).await,
                 AgentsCmd::Revoke { id } => commands::agents_revoke(&c, &id, json).await,
+                AgentsCmd::SetGroup { id, group } => {
+                    commands::agents_set_group(&c, &id, &group, json).await
+                }
                 AgentsCmd::EnrollToken { group, valid_for } => {
                     commands::enroll_token(&c, &group, valid_for, json).await
                 }

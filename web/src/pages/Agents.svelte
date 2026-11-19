@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ApiError, get, post } from '../lib/api';
+  import { ApiError, api, get, post } from '../lib/api';
   import { dateTime, relative } from '../lib/format';
   import { go, href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
@@ -54,6 +54,38 @@
     if (!a.status.firewall_healthy) return { text: 'firewall error', cls: 'bad' };
     if (Date.parse(a.cert_not_after) - now < 3 * 86400e3) return { text: 'cert expiring', cls: 'warn' };
     return { text: 'online', cls: 'good' };
+  }
+
+  let groupOpen = $state(false);
+  let newGroup = $state('');
+  let groupError = $state('');
+  let groupBusy = $state(false);
+  const groups = $derived([...new Set(agents.map((a) => a.group))].sort());
+
+  function openGroup() {
+    newGroup = current?.group ?? '';
+    groupError = '';
+    groupOpen = true;
+  }
+
+  async function changeGroup() {
+    if (!current) return;
+    groupBusy = true;
+    groupError = '';
+    try {
+      const r = await api<{ changed: boolean; group: string }>(
+        'PATCH',
+        `/agents/${encodeURIComponent(current.id)}`,
+        { group: newGroup.trim() },
+      );
+      groupOpen = false;
+      if (r.changed) notify(`${current.id} moved to group ${r.group}`);
+      load();
+    } catch (e) {
+      groupError = e instanceof ApiError ? e.message : String(e);
+    } finally {
+      groupBusy = false;
+    }
   }
 
   async function revoke() {
@@ -132,7 +164,13 @@
       <span class="pill {st.cls}">{st.text}</span>
       <dl>
         <dt>Host name</dt><dd>{current.hostname}</dd>
-        <dt>Group</dt><dd>{current.group}</dd>
+        <dt>Group</dt>
+        <dd>
+          {current.group}
+          {#if can('admin') && !current.revoked}
+            <button class="link change" onclick={openGroup}>Change…</button>
+          {/if}
+        </dd>
         <dt>Enrolled</dt><dd>{dateTime(current.enrolled_at)}</dd>
         <dt>Last heartbeat</dt><dd>{current.status.last_seen ? dateTime(current.status.last_seen) : 'never (since controller start)'}</dd>
         <dt>Version</dt><dd>{current.status.agent_version || '–'}</dd>
@@ -168,6 +206,27 @@
 
 <EnrollDialog bind:open={enrollOpen} />
 
+<Dialog bind:open={groupOpen} title="Move {current?.id} to another group" onsubmit={changeGroup}>
+  <label class="field">
+    Group
+    <input bind:value={newGroup} list="known-groups" required maxlength="64" pattern="[A-Za-z0-9._\-]+" autocomplete="off" />
+    <datalist id="known-groups">
+      {#each groups as g (g)}<option value={g}></option>{/each}
+    </datalist>
+    <span class="hint">An existing group or a new one (letters, digits, - _ .).</span>
+  </label>
+  <p class="muted confirm-text">
+    Bans limited to the old group are removed from this host and those of the new group applied —
+    within seconds while it is connected, otherwise when it next connects. Global bans and its own
+    bans are not affected.
+  </p>
+  {#if groupError}<div class="error-box">{groupError}</div>{/if}
+  <div class="actions">
+    <button type="button" onclick={() => (groupOpen = false)}>Cancel</button>
+    <button type="submit" class="primary" disabled={groupBusy}>Move</button>
+  </div>
+</Dialog>
+
 <Dialog bind:open={revokeOpen} title="Revoke {current?.id}?" onsubmit={revoke}>
   <p class="muted">
     The agent's connections are closed within seconds and it can no longer connect. Bans it already
@@ -194,4 +253,5 @@
   dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
   .detail button { justify-self: start; }
   p { margin: 0; }
+  .change { margin-left: 8px; }
 </style>

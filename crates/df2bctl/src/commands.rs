@@ -478,3 +478,22 @@ pub async fn allowlist_rm(c: &Client, net: IpNet, json: bool) -> anyhow::Result<
     println!("{} removed from the allowlist", s(&v, &["removed"]));
     Ok(())
 }
+
+pub async fn agents_set_group(c: &Client, id: &str, group: &str, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .patch(&format!("/api/v1/agents/{id}"), json!({ "group": group }))
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    if v["changed"] == true {
+        println!(
+            "{id}: group {} -> {}; its bans follow within seconds while it is connected",
+            s(&v, &["previous_group"]),
+            s(&v, &["group"])
+        );
+    } else {
+        println!("{id} is already in group {}", s(&v, &["group"]));
+    }
+    Ok(())
+}

@@ -66,6 +66,7 @@ cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl \
 cargo run -p df2bctl -- status
 cargo run -p df2bctl -- agents list
 cargo run -p df2bctl -- agents enroll-token --group web
+cargo run -p df2bctl -- agents set-group <agent-id> db   # admin
 cargo run -p df2bctl -- ban 203.0.113.7 --for 24h --reason scanner
 cargo run -p df2bctl -- bans list
 cargo run -p df2bctl -- unban 203.0.113.7
