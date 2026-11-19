@@ -303,6 +303,8 @@ impl AgentService for Service {
                     active_bans: j.active_bans,
                     origin: j.origin.chars().take(16).collect(),
                     error: j.error.chars().take(512).collect(),
+                    tracked: j.tracked,
+                    evicted: j.evicted,
                 })
                 .collect();
         });

@@ -635,6 +635,8 @@ fn jail_status(j: engine::JailStatus) -> v1::JailStatus {
         active_bans: j.active_bans as u64,
         origin: j.origin.into(),
         error: j.error,
+        tracked: j.tracked as u64,
+        evicted: j.evicted,
     }
 }
 

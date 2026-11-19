@@ -1,4 +1,11 @@
 //! Sliding-window failure counter per key.
+//!
+//! Bounded to `max_keys`. When full, expired entries are pruned (at most
+//! once per second: pruning walks every key) and, if that does not make
+//! room, the key tracked longest is evicted, so a flood of new addresses
+//! is still counted instead of being ignored. Evictions are counted and
+//! reported in heartbeats; they mean failures were forgotten and
+//! `max_tracked` may be too small.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -7,11 +14,23 @@ use chrono::{DateTime, TimeDelta, Utc};
 use df2b_core::IpKey;
 
 #[derive(Debug)]
+struct Entry {
+    /// Matches this key's place in `order` (stale places are skipped).
+    generation: u64,
+    hits: VecDeque<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
 pub struct Tracker {
     maxretry: usize,
     findtime: TimeDelta,
     max_keys: usize,
-    hits: HashMap<IpKey, VecDeque<DateTime<Utc>>>,
+    hits: HashMap<IpKey, Entry>,
+    /// Keys in the order they started being tracked, for eviction.
+    order: VecDeque<(IpKey, u64)>,
+    next_generation: u64,
+    last_full_prune: Option<DateTime<Utc>>,
+    evicted: u64,
 }
 
 impl Tracker {
@@ -21,6 +40,10 @@ impl Tracker {
             findtime: TimeDelta::from_std(findtime).unwrap_or(TimeDelta::days(365)),
             max_keys: max_keys.max(1),
             hits: HashMap::new(),
+            order: VecDeque::new(),
+            next_generation: 0,
+            last_full_prune: None,
+            evicted: 0,
         }
     }
 
@@ -34,16 +57,20 @@ impl Tracker {
         if ts < cutoff {
             return false;
         }
-        if self.hits.len() >= self.max_keys && !self.hits.contains_key(&key) {
-            self.prune(now);
-            if self.hits.len() >= self.max_keys {
-                // TODO: count + expose as metric; consider evicting the
-                // oldest key instead of dropping the new one.
-                tracing::warn!(%key, "tracker full, dropping event");
-                return false;
-            }
+        if !self.hits.contains_key(&key) {
+            self.make_room(now);
+            let generation = self.next_generation;
+            self.next_generation += 1;
+            self.order.push_back((key, generation));
+            self.hits.insert(
+                key,
+                Entry {
+                    generation,
+                    hits: VecDeque::new(),
+                },
+            );
         }
-        let q = self.hits.entry(key).or_default();
+        let q = &mut self.hits.get_mut(&key).expect("inserted above").hits;
         q.push_back(ts);
         while q.front().is_some_and(|t| *t < cutoff) {
             q.pop_front();
@@ -53,6 +80,39 @@ impl Tracker {
             true
         } else {
             false
+        }
+    }
+
+    fn make_room(&mut self, now: DateTime<Utc>) {
+        if self.hits.len() < self.max_keys {
+            return;
+        }
+        if self
+            .last_full_prune
+            .map_or(true, |t| now - t >= TimeDelta::seconds(1))
+        {
+            self.last_full_prune = Some(now);
+            self.prune(now);
+        }
+        while self.hits.len() >= self.max_keys {
+            let Some((key, generation)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .hits
+                .get(&key)
+                .is_some_and(|e| e.generation == generation)
+            {
+                self.hits.remove(&key);
+                self.evicted += 1;
+                if self.evicted.is_power_of_two() {
+                    tracing::warn!(
+                        evicted = self.evicted,
+                        max_tracked = self.max_keys,
+                        "failure tracker full, forgetting the oldest addresses"
+                    );
+                }
+            }
         }
     }
 
@@ -66,20 +126,34 @@ impl Tracker {
     /// Drops expired timestamps and empty keys.
     pub fn prune(&mut self, now: DateTime<Utc>) {
         let cutoff = now - self.findtime;
-        self.hits.retain(|_, q| {
-            q.retain(|t| *t >= cutoff);
-            !q.is_empty()
+        self.hits.retain(|_, e| {
+            e.hits.retain(|t| *t >= cutoff);
+            !e.hits.is_empty()
         });
+        self.compact();
     }
 
-    #[allow(dead_code)] // used by unban handling (milestone 2)
     pub fn reset(&mut self, key: &IpKey) {
         self.hits.remove(key);
     }
 
-    #[allow(dead_code)]
+    /// Keys currently tracked.
     pub fn len(&self) -> usize {
         self.hits.len()
+    }
+
+    /// Keys forgotten because the tracker was full (since start).
+    pub fn evicted(&self) -> u64 {
+        self.evicted
+    }
+
+    /// Drops places of keys no longer tracked once they dominate `order`.
+    fn compact(&mut self) {
+        if self.order.len() > 2 * self.hits.len() + 64 {
+            let hits = &self.hits;
+            self.order
+                .retain(|(k, g)| hits.get(k).is_some_and(|e| e.generation == *g));
+        }
     }
 }
 
@@ -122,12 +196,52 @@ mod tests {
     }
 
     #[test]
-    fn bounded() {
-        let mut t = Tracker::new(5, Duration::from_secs(60), 2);
+    fn bounded_evicts_the_oldest() {
+        let mut t = Tracker::new(2, Duration::from_secs(60), 2);
         let now = Utc::now();
         t.record(key("192.0.2.1"), now, now);
         t.record(key("192.0.2.2"), now, now);
         t.record(key("192.0.2.3"), now, now);
-        assert_eq!(t.len(), 2);
+        assert_eq!((t.len(), t.evicted()), (2, 1));
+        // .1 was evicted: one more failure does not ban it; .3 is counted
+        assert!(!t.record(key("192.0.2.1"), now, now));
+        assert!(t.record(key("192.0.2.3"), now, now));
+    }
+
+    #[test]
+    fn full_tracker_prunes_expired_before_evicting() {
+        let mut t = Tracker::new(5, Duration::from_secs(60), 2);
+        let start = Utc::now();
+        t.record(key("192.0.2.1"), start, start);
+        t.record(key("192.0.2.2"), start, start);
+        let later = start + TimeDelta::seconds(120);
+        t.record(key("192.0.2.3"), later, later);
+        assert_eq!((t.len(), t.evicted()), (1, 0), "expired keys made room");
+    }
+
+    #[test]
+    fn stale_order_entries_are_skipped_and_compacted() {
+        let mut t = Tracker::new(1, Duration::from_secs(60), 2);
+        let now = Utc::now();
+        // maxretry 1: every key triggers and leaves at once
+        for i in 0..1000u32 {
+            assert!(t.record(key(&format!("10.0.{}.{}", i / 256, i % 256)), now, now));
+        }
+        assert_eq!(t.len(), 0);
+        t.prune(now);
+        assert!(t.order.len() <= 64, "compacted: {}", t.order.len());
+        // a key removed and tracked again is not evicted by its old place
+        let mut t = Tracker::new(5, Duration::from_secs(60), 2);
+        t.record(key("192.0.2.1"), now, now);
+        t.reset(&key("192.0.2.1"));
+        t.record(key("192.0.2.2"), now, now);
+        t.record(key("192.0.2.1"), now, now);
+        t.record(key("192.0.2.3"), now, now);
+        assert_eq!(t.evicted(), 1);
+        assert!(
+            t.hits.contains_key(&key("192.0.2.1")),
+            "newer place kept it"
+        );
+        assert!(!t.hits.contains_key(&key("192.0.2.2")));
     }
 }

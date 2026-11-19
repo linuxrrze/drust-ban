@@ -147,6 +147,12 @@ pub async fn jails(socket: &Path, json: bool) -> anyhow::Result<()> {
         if let Some(e) = j["error"].as_str().filter(|e| !e.is_empty()) {
             println!("{:<16} ^ {e}", "");
         }
+        if let Some(n) = j["evicted"].as_u64().filter(|n| *n > 0) {
+            println!(
+                "{:<16} ^ {n} addresses forgotten: failure tracker full ({} tracked; raise max_tracked?)",
+                "", j["tracked"]
+            );
+        }
     }
     Ok(())
 }

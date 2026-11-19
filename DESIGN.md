@@ -144,7 +144,12 @@ containing `from 1.2.3.4`) cannot inject a different IP.
   /64s from the same block misbehave. IPv4-mapped IPv6 addresses are treated
   as IPv4.
 - **Tracker**: per (jail, key) a small ring of timestamps forms a sliding
-  `findtime` window. Memory is bounded (per-jail key limits, pruning).
+  `findtime` window. Memory is bounded per jail (`max_tracked` keys,
+  default 100 000): when full, expired entries are pruned (at most once a
+  second) and then the key tracked longest is evicted, so a flood of new
+  addresses is still counted. Evictions are logged (at powers of two),
+  reported per jail in heartbeats (`tracked`, `evicted`), shown on the
+  Policies page and in `df2bctl --local jails list`.
 - **Escalating ban times** (recidive built in):
   `bantime = base × factor^(n-1)`, capped at `max_bantime`. Offense history is
   kept per key.

@@ -253,6 +253,9 @@
                   {#each problems(j) as p (p.agent)}
                     <div class="problem small" title={p.jail.error}>⚠ {p.agent}: {p.jail.error}</div>
                   {/each}
+                  {#each j.agents.filter((a) => a.jail.evicted > 0) as p (p.agent)}
+                    <div class="problem small" title="The jail tracks at most max_tracked addresses; the oldest were forgotten with their failures">⚠ {p.agent}: {p.jail.evicted.toLocaleString()} addresses forgotten (tracker full)</div>
+                  {/each}
                 </td>
                 <td>
                   {#if j.agents.length}

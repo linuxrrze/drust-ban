@@ -242,6 +242,10 @@ pub struct JailView {
     pub origin: String,
     /// why a central jail does not run
     pub error: String,
+    /// addresses with counted failures, and those forgotten because the
+    /// tracker was full (since agent start)
+    pub tracked: u64,
+    pub evicted: u64,
 }
 
 /// The central allowlist as distributed to agents.

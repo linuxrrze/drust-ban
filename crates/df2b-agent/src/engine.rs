@@ -133,6 +133,10 @@ pub struct JailStatus {
     pub origin: &'static str,
     /// why a central jail does not run (then `params` are zero)
     pub error: String,
+    /// Keys with counted failures now.
+    pub tracked: usize,
+    /// Keys forgotten because the tracker was full (since start).
+    pub evicted: u64,
 }
 
 #[derive(Debug)]
@@ -555,6 +559,8 @@ impl Engine {
                 active_bans: 0,
                 origin: "central",
                 error: error.clone(),
+                tracked: 0,
+                evicted: 0,
             });
         self.jails
             .iter()
@@ -577,6 +583,8 @@ impl Engine {
                     .count(),
                 origin: if j.central { "central" } else { "local" },
                 error: String::new(),
+                tracked: j.tracker.len(),
+                evicted: j.tracker.evicted(),
             })
             .chain(failed)
             .collect()

@@ -198,6 +198,10 @@ export interface JailView {
   active_bans: number;
   origin: 'local' | 'central' | '';
   error: string;
+  /** addresses with counted failures */
+  tracked: number;
+  /** forgotten because the tracker was full (since agent start) */
+  evicted: number;
 }
 
 export interface JailSettings {

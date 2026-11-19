@@ -246,6 +246,8 @@ pub async fn handle(req: Request, peer: &str, cx: Ctx<'_>) -> Result<Value, Stri
                         "active_bans": j.active_bans,
                         "origin": j.origin,
                         "error": j.error,
+                        "tracked": j.tracked,
+                        "evicted": j.evicted,
                     })
                 })
                 .collect(),

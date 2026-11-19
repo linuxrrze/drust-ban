@@ -103,6 +103,10 @@ message JailStatus {
   string origin = 11;
   // Why a central jail does not run (conflict, path not allowed, ...).
   string error = 12;
+  // Addresses with counted failures now, and how many were forgotten
+  // because the jail's tracker was full (max_tracked; since agent start).
+  uint64 tracked = 13;
+  uint64 evicted = 14;
 }
 
 message HeartbeatResponse {
