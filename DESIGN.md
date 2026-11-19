@@ -334,7 +334,7 @@ Rules:
   `[::]:7444`); there is no plaintext listener. The certificate is either
   issued by the internal CA (name `df2b-controller` plus `--name`s) or an
   operator-provided chain (`--https-cert`/`--https-key`, e.g. from a public
-  CA; reloading needs a restart for now).
+  CA; loaded again when the files change, see below).
 - **API tokens** `df2bapi1.<secret>` as bearer tokens, created on the
   controller host with `df2b-controller api-token create --name <n> --role
   viewer|operator|admin [--ttl 90d]`, listed and revoked (effective

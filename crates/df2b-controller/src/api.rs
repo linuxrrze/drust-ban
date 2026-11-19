@@ -404,6 +404,7 @@ pub fn router_with_limit(ctl: Arc<Controller>, limit: crate::ratelimit::ApiLimit
                 crate::ui::serve(uri).await
             }
         })
+        .layer(axum::middleware::from_fn(json_errors))
         .layer(axum::middleware::from_fn(move |req, next| {
             crate::ratelimit::layer(limiter.clone(), req, next)
         }))
@@ -418,6 +419,42 @@ async fn openapi() -> Response {
         include_str!("../openapi.json"),
     )
         .into_response()
+}
+
+/// API errors are always `{"error": "..."}`: axum's own rejections
+/// (malformed or unexpected JSON, wrong content type, too large) come as
+/// plain text and are rewritten here; headers like Retry-After stay.
+async fn json_errors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let api = req.uri().path().starts_with("/api/");
+    let res = next.run(req).await;
+    let is_json = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if !api || is_json || !(res.status().is_client_error() || res.status().is_server_error()) {
+        return res;
+    }
+    let (mut parts, body) = res.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    let msg = match text.trim() {
+        "" => parts
+            .status
+            .canonical_reason()
+            .unwrap_or("error")
+            .to_owned(),
+        t => t.chars().take(500).collect(),
+    };
+    parts.headers.remove(header::CONTENT_TYPE);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let mut r = (parts.status, Json(json!({ "error": msg }))).into_response();
+    for (k, v) in parts.headers.iter() {
+        r.headers_mut().entry(k).or_insert(v.clone());
+    }
+    r
 }
 
 /// Unauthenticated: for load balancers and monitoring.
@@ -551,11 +588,14 @@ async fn login(
 /// logout page (if it has one), otherwise "Sign in" would log straight in.
 async fn logout(caller: Caller, State(ctl): State<Arc<Controller>>) -> Response {
     let mut logout_url = None;
-    if let Auth::Session { secret, oidc, .. } = &caller.auth {
-        ctl.sessions.remove(secret);
-        if let (true, Some(o)) = (*oidc, &ctl.settings.oidc) {
-            logout_url = o.logout_url().await;
-        }
+    let Auth::Session { secret, oidc, .. } = &caller.auth else {
+        // an API token has no session: nothing to end (revoke the token)
+        return ApiError::bad_request("not a browser session; API tokens are revoked instead")
+            .into_response();
+    };
+    ctl.sessions.remove(secret);
+    if let (true, Some(o)) = (*oidc, &ctl.settings.oidc) {
+        logout_url = o.logout_url().await;
     }
     (
         [(header::SET_COOKIE, session::clear_cookie())],
@@ -611,10 +651,16 @@ async fn change_own_password(
     }
     let ip = Some(addr.ip());
     if !ctl.sessions.login_allowed(ip, &name) {
-        return Err(ApiError::new(
+        let mut r = ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many wrong passwords, try again in 15 minutes",
-        ));
+        )
+        .into_response();
+        r.headers_mut().insert(
+            header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("900"),
+        );
+        return Ok(r);
     }
     let _slot = LOGIN_SLOTS.acquire().await.map_err(ApiError::internal)?;
     let c = ctl.clone();
@@ -1337,16 +1383,20 @@ async fn delete_jail_policy(
     Query(q): Query<JailPolicyQuery>,
 ) -> ApiResult {
     caller.require(Role::Admin)?;
-    jail_scope(&name, q.group.as_deref())?;
+    // as for PUT: empty = all agents
+    let group = q
+        .group
+        .map(|g| g.trim().to_owned())
+        .filter(|g| !g.is_empty());
+    jail_scope(&name, group.as_deref())?;
     let exists = ctl
         .jail_overrides()
         .iter()
-        .any(|o| o.jail == name && o.group == q.group);
+        .any(|o| o.jail == name && o.group == group);
     if !exists {
         return Err(ApiError::not_found("no such jail policy"));
     }
     let c = ctl.clone();
-    let group = q.group.clone();
     blocking(move || {
         c.set_jail_override(crate::policy::JailOverride {
             jail: name.clone(),
@@ -1894,6 +1944,12 @@ async fn delete_jail_def(
     Query(q): Query<GroupQuery>,
 ) -> ApiResult {
     caller.require(Role::Admin)?;
+    let group = q
+        .group
+        .map(|g| g.trim().to_owned())
+        .filter(|g| !g.is_empty());
+    jail_scope(&name, group.as_deref())?;
+    let q = GroupQuery { group };
     let c = ctl.clone();
     tokio::task::spawn_blocking(move || {
         c.remove_jail_def(&name, q.group.as_deref())
@@ -2723,8 +2779,10 @@ async fn revoke_agent(
     Path(id): Path<String>,
 ) -> ApiResult {
     caller.require(Role::Admin)?;
-    if ctl.agent(&id).is_none() {
-        return Err(ApiError::not_found(format!("no agent {id:?}")));
+    match ctl.agent(&id) {
+        None => return Err(ApiError::not_found(format!("no agent {id:?}"))),
+        Some(a) if a.revoked => return Err(conflict(format!("{id} is already revoked"))),
+        Some(_) => {}
     }
     let c = ctl.clone();
     let agent = id.clone();
@@ -2772,6 +2830,9 @@ async fn enroll_token(
     if ttl > MAX_ENROLL_TTL || ttl.is_zero() {
         return Err(ApiError::bad_request("ttl must be between 1s and 7d"));
     }
+    if !files::valid_group(&req.group) {
+        return Err(ApiError::bad_request("invalid group name"));
+    }
     let c = ctl.clone();
     let group = req.group.clone();
     let token = tokio::task::spawn_blocking(move || {
@@ -2779,7 +2840,8 @@ async fn enroll_token(
     })
     .await
     .map_err(ApiError::internal)?
-    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // the input is checked above: what remains is the file system
+    .map_err(ApiError::internal)?;
     let expires_at = Utc::now() + chrono::Duration::from_std(ttl).map_err(ApiError::internal)?;
     let c = ctl.clone();
     let group = req.group.clone();
@@ -2835,7 +2897,8 @@ async fn decisions(
 fn parse_scope(s: &str, ctl: &Controller) -> Result<Scope, ApiError> {
     match s.split_once(':') {
         None if s == "global" => Ok(Scope::Global),
-        Some(("group", g)) if !g.is_empty() => Ok(Scope::Group(g.to_owned())),
+        Some(("group", g)) if files::valid_group(g) => Ok(Scope::Group(g.to_owned())),
+        Some(("group", _)) => Err(ApiError::bad_request("invalid group name")),
         Some(("agent", ids)) => {
             let ids: Vec<AgentId> = ids
                 .split(',')
@@ -2844,6 +2907,9 @@ fn parse_scope(s: &str, ctl: &Controller) -> Result<Scope, ApiError> {
                 .collect();
             if ids.is_empty() {
                 return Err(ApiError::bad_request("scope agent: needs at least one id"));
+            }
+            if ids.len() > 1000 {
+                return Err(ApiError::bad_request("scope agent: at most 1000 ids"));
             }
             if let Some(unknown) = ids.iter().find(|i| ctl.agent(&i.0).is_none()) {
                 return Err(ApiError::bad_request(format!(
@@ -2900,18 +2966,20 @@ async fn ban(
     }
     let scope = parse_scope(req.scope.as_deref().unwrap_or("global"), &ctl)?;
     let expires_at = match &req.duration {
-        Some(d) => {
-            let d = parse_duration(d, "duration")?;
-            Some(Utc::now() + chrono::Duration::from_std(d).map_err(ApiError::bad_request_from)?)
-        }
+        Some(d) => Some(ban_expiry(parse_duration(d, "duration")?)?),
         None => None,
     };
-    let reason = req.reason.unwrap_or_else(|| "manual".into());
+    let jail = match req.jail.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(j) if crate::policy::valid_jail(j) => Some(j.to_owned()),
+        Some(_) => return Err(ApiError::bad_request("invalid jail name")),
+    };
+    let reason = clean_text(req.reason.as_deref().unwrap_or("manual"), MAX_REASON);
     let new = NewDecision {
         kind: DecisionKind::Ban,
         target: net,
         scope,
-        jail: req.jail,
+        jail,
         expires_at,
         origin: caller.origin(),
         reason,
@@ -2948,6 +3016,34 @@ impl ApiError {
     }
 }
 
+/// Longest reason kept with a decision.
+const MAX_REASON: usize = 256;
+
+/// User-supplied text for decisions and the audit log: no control
+/// characters (terminal escapes, fake log lines), trimmed, cut to `max`
+/// characters.
+fn clean_text(s: &str, max: usize) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// When a manual ban of `d` ends: between a minute and the longest ban.
+fn ban_expiry(d: Duration) -> Result<chrono::DateTime<Utc>, ApiError> {
+    if d < crate::policy::MIN_BANTIME || d > crate::policy::MAX_BANTIME {
+        return Err(ApiError::bad_request(
+            "duration must be between 1 minute and 10 years",
+        ));
+    }
+    chrono::Duration::from_std(d)
+        .ok()
+        .and_then(|d| Utc::now().checked_add_signed(d))
+        .ok_or_else(|| ApiError::bad_request("duration out of range"))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UnbanRequest {
@@ -2965,7 +3061,7 @@ async fn unban(
 ) -> ApiResult {
     caller.require(Role::Operator)?;
     let net = target(&req.target)?;
-    let reason = req.reason.unwrap_or_else(|| "manual unban".into());
+    let reason = clean_text(req.reason.as_deref().unwrap_or("manual unban"), MAX_REASON);
     let allow_until = match req.allow_for.as_deref() {
         None => None,
         Some(t) => {
@@ -3250,6 +3346,21 @@ mod tests {
             .call("POST", "/api/v1/agents/nope/revoke", &admin, json!({}))
             .await;
         assert_eq!(st, S::NOT_FOUND);
+        // revoking twice: refused (no second audit entry)
+        env.ctl
+            .put_agent(crate::store::AgentRecord {
+                id: "web-9-abc".into(),
+                hostname: "web-9".into(),
+                group: "web".into(),
+                enrolled_at: Utc::now(),
+                serials: vec!["01".into()],
+                cert_not_after: Utc::now() + chrono::Duration::days(1),
+                resync: false,
+            })
+            .unwrap();
+        let revoke = || env.call("POST", "/api/v1/agents/web-9-abc/revoke", &admin, json!({}));
+        assert_eq!(revoke().await.0, S::OK);
+        assert_eq!(revoke().await.0, S::CONFLICT);
 
         // a client pinned to another CA refuses the server
         let other = df2b_tls::Ca::generate("other").unwrap();
@@ -5767,8 +5878,117 @@ mod tests {
         assert_eq!(v["openapi"], "3.1.0");
         assert!(v["paths"]["/api/v1/openapi.json"]["get"].is_object());
     }
-}
 
-#[cfg(test)]
-#[path = "openapi_tests.rs"]
-mod openapi_tests;
+    /// Regression: a huge duration used to overflow (panic in the
+    /// handler); 0s created an already expired ban; group names, jails and
+    /// reasons were not checked.
+    #[tokio::test]
+    async fn ban_input_validation() {
+        let env = Env::new("banvalid").await;
+        let op = env.token("olga", Role::Operator);
+        for (body, why) in [
+            (
+                json!({ "target": "192.0.2.1", "duration": "100000000years" }),
+                "overflow",
+            ),
+            (json!({ "target": "192.0.2.1", "duration": "0s" }), "zero"),
+            (
+                json!({ "target": "192.0.2.1", "duration": "11years" }),
+                "above the maximum",
+            ),
+            (
+                json!({ "target": "192.0.2.1", "scope": "group:bad name!" }),
+                "group",
+            ),
+            (json!({ "target": "192.0.2.1", "jail": "a b" }), "jail"),
+        ] {
+            let (st, v) = env.call("POST", "/api/v1/bans", &op, body).await;
+            assert_eq!(st, S::BAD_REQUEST, "{why}: {v}");
+            assert!(v["error"].is_string(), "{why}: JSON error");
+        }
+        let (st, v) = env
+            .call(
+                "POST",
+                "/api/v1/bans",
+                &op,
+                json!({ "target": "192.0.2.1", "duration": "1h", "jail": "sshd", "reason": "x\u{7}y\u{1b}[31m z" }),
+            )
+            .await;
+        assert_eq!(st, S::CREATED, "{v}");
+        assert_eq!(v["decision"]["reason"], "x y [31m z");
+        let (st, _) = env
+            .call(
+                "POST",
+                "/api/v1/unban",
+                &op,
+                json!({ "target": "192.0.2.1", "reason": "a\nb" }),
+            )
+            .await;
+        assert_eq!(st, S::OK);
+        let (_, v) = env
+            .call("GET", "/api/v1/history?target=192.0.2.1", &op, json!({}))
+            .await;
+        assert!(
+            !v.to_string().contains("\\n"),
+            "no control characters stored: {v}"
+        );
+    }
+
+    /// Regression: axum's rejections were plain text; the revoke of a
+    /// revoked agent was audited again; logout with a token claimed success.
+    #[tokio::test]
+    async fn error_format_and_idempotence() {
+        let env = Env::new("errfmt").await;
+        let admin = env.token("ada", Role::Admin);
+        // unknown field / malformed JSON / wrong content type
+        let (st, v) = env
+            .call(
+                "POST",
+                "/api/v1/bans",
+                &admin,
+                json!({ "target": "192.0.2.1", "bogus": 1 }),
+            )
+            .await;
+        assert!(st.is_client_error() && v["error"].is_string(), "{st} {v}");
+        let r = env
+            .http
+            .post(format!("{}/api/v1/bans", env.base))
+            .bearer_auth(&admin)
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_client_error());
+        assert!(r.json::<Value>().await.unwrap()["error"].is_string());
+        let r = env
+            .http
+            .post(format!("{}/api/v1/bans", env.base))
+            .bearer_auth(&admin)
+            .body("target=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::UNSUPPORTED_MEDIA_TYPE);
+        assert!(r.json::<Value>().await.unwrap()["error"].is_string());
+        // a token is no session
+        let r = env
+            .http
+            .delete(format!("{}/api/v1/session", env.base))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::BAD_REQUEST);
+        // enrollment tokens: bad group is the caller's fault
+        let (st, _) = env
+            .call(
+                "POST",
+                "/api/v1/enroll-tokens",
+                &admin,
+                json!({ "group": "a b" }),
+            )
+            .await;
+        assert_eq!(st, S::BAD_REQUEST);
+    }
+}

@@ -3336,6 +3336,9 @@
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
