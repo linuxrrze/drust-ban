@@ -29,6 +29,8 @@ use tower::ServiceExt;
 use tracing::{debug, info, warn};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A request's headers must be complete this long after it started.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 
 /// The TLS configuration new connections use; replaceable.
 #[derive(Clone)]
@@ -134,6 +136,9 @@ pub async fn serve(
     shutdown: impl Future<Output = ()>,
 ) {
     let tls: TlsConfig = tls.into();
+    let slots = Arc::new(tokio::sync::Semaphore::new(
+        df2b_tls::transport::MAX_CONNECTIONS,
+    ));
     tokio::pin!(shutdown);
     loop {
         let (tcp, peer) = tokio::select! {
@@ -147,6 +152,12 @@ pub async fn serve(
             },
             _ = &mut shutdown => return,
         };
+        // bounded, and idle connections close (slowloris)
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            debug!(%peer, "too many connections, closing");
+            continue;
+        };
+        let tcp = df2b_tls::transport::Guarded::new(tcp, slot);
         let acceptor = TlsAcceptor::from(tls.get());
         let app = app.clone();
         tokio::spawn(async move {
@@ -159,7 +170,13 @@ pub async fn serve(
                 req.extensions_mut().insert(ConnectInfo::<SocketAddr>(peer));
                 req
             });
-            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            // headers trickled in byte by byte still have to arrive in time
+            builder
+                .http1()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT);
+            if let Err(e) = builder
                 .serve_connection(TokioIo::new(tls), TowerToHyperService::new(svc))
                 .await
             {
@@ -202,5 +219,35 @@ mod tests {
         std::fs::remove_file(&key).unwrap();
         assert!(!files.reload_if_changed(&tls));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (security review): a client trickling request headers
+    /// kept its connection (and a file descriptor) forever.
+    #[tokio::test]
+    async fn incomplete_headers_time_out() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ca = Ca::generate("t").unwrap();
+        let (chain, key) = ca.issue_server(&[]).unwrap();
+        let tls = df2b_tls::transport::https_server_config(chain, key).unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(serve(l, tls, Router::new(), std::future::pending()));
+        let client = df2b_tls::transport::https_client_config(
+            df2b_tls::transport::Trust::PinnedCa(ca.fingerprint()),
+        )
+        .unwrap();
+        let mut cfg = (*client).clone();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from(df2b_tls::SERVER_NAME).unwrap();
+        let mut s = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(name, tcp)
+            .await
+            .unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let r = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+        assert!(r.is_ok(), "the server closed the connection");
     }
 }

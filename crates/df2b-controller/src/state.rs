@@ -515,6 +515,26 @@ impl Controller {
     }
 
     /// Stores a new or updated agent record (blocking).
+    /// Records a renewed certificate on the *current* record (blocking).
+    /// Writing back a record read earlier would undo a group change made
+    /// meanwhile (e.g. quarantining this very agent).
+    pub fn renewed(
+        &self,
+        id: &str,
+        serials: Vec<String>,
+        not_after: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.lock();
+        let Some(mut r) = inner.agents.get(id).cloned() else {
+            anyhow::bail!("unknown agent {id}");
+        };
+        r.serials = serials;
+        r.cert_not_after = not_after;
+        self.store.put_agent(&r)?;
+        inner.agents.insert(r.id.clone(), r);
+        Ok(())
+    }
+
     pub fn put_agent(&self, record: AgentRecord) -> anyhow::Result<()> {
         self.store.put_agent(&record)?;
         self.lock().agents.insert(record.id.clone(), record);
@@ -1509,6 +1529,22 @@ mod tests {
                 .seq,
             5
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (security review): a renewal wrote back the record read
+    /// before it, undoing a group change made meanwhile.
+    #[test]
+    fn renewal_keeps_a_group_change() {
+        let (c, dir) = ctl("renew");
+        c.put_agent(agent("web-1", "web")).unwrap();
+        c.set_group("web-1", "quarantine").unwrap();
+        c.renewed("web-1", vec!["02".into(), "01".into()], Utc::now())
+            .unwrap();
+        let a = c.agent("web-1").unwrap();
+        assert_eq!(a.record.group, "quarantine");
+        assert_eq!(a.record.serials, ["02", "01"]);
+        assert!(c.renewed("nope", vec![], Utc::now()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

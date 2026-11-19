@@ -26,6 +26,110 @@ use tracing::debug;
 use crate::{hex, pki, SERVER_NAME};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Open connections per listener at most (more are closed at once).
+pub const MAX_CONNECTIONS: usize = 10_000;
+/// A connection without any read or write for this long is closed (agents
+/// send heartbeats every 10 s, HTTP/2 pings every 30 s, the browser's
+/// event stream keep-alives).
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A server-side connection with an idle timeout that holds one of the
+/// listener's connection slots until it is dropped.
+pub struct Guarded<S> {
+    inner: S,
+    timeout: Duration,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<S> Guarded<S> {
+    pub fn new(inner: S, slot: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self::with_timeout(inner, slot, IDLE_TIMEOUT)
+    }
+
+    pub fn with_timeout(
+        inner: S,
+        slot: tokio::sync::OwnedSemaphorePermit,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            inner,
+            timeout,
+            sleep: Box::pin(tokio::time::sleep(timeout)),
+            _slot: slot,
+        }
+    }
+
+    fn touch(&mut self) {
+        self.sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.timeout);
+    }
+
+    fn idle<T>(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<T>> {
+        use std::future::Future;
+        match self.sleep.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection idle",
+            ))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Guarded<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(r) => {
+                self.touch();
+                std::task::Poll::Ready(r)
+            }
+            std::task::Poll::Pending => self.idle(cx),
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Guarded<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match std::pin::Pin::new(&mut self.inner).poll_write(cx, buf) {
+            std::task::Poll::Ready(r) => {
+                self.touch();
+                std::task::Poll::Ready(r)
+            }
+            std::task::Poll::Pending => self.idle(cx),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl tonic::transport::server::Connected for Guarded<TcpStream> {
+    type ConnectInfo = <TcpStream as tonic::transport::server::Connected>::ConnectInfo;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.inner.connect_info()
+    }
+}
 const ALPN_H2: &[u8] = b"h2";
 
 fn provider() -> Arc<CryptoProvider> {
@@ -259,9 +363,10 @@ pub async fn connect(addr: String, cfg: Arc<ClientConfig>) -> anyhow::Result<Cha
 pub fn incoming(
     listener: TcpListener,
     cfg: Arc<ServerConfig>,
-) -> ReceiverStream<Result<TlsStream<TcpStream>, io::Error>> {
+) -> ReceiverStream<Result<TlsStream<Guarded<TcpStream>>, io::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let acceptor = TlsAcceptor::from(cfg);
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             let (tcp, peer) = match listener.accept().await {
@@ -276,6 +381,11 @@ pub fn incoming(
             if tx.is_closed() {
                 break;
             }
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                debug!(%peer, "too many connections, closing");
+                continue;
+            };
+            let tcp = Guarded::new(tcp, slot);
             let acceptor = acceptor.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -290,4 +400,38 @@ pub fn incoming(
         }
     });
     ReceiverStream::new(rx)
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Regression (security review): connections without traffic were
+    /// kept forever (slowloris); every connection now holds a slot.
+    #[tokio::test]
+    async fn idle_connections_close_and_free_their_slot() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (a, mut b) = tokio::io::duplex(64);
+        let mut g = Guarded::with_timeout(
+            a,
+            slots.clone().try_acquire_owned().unwrap(),
+            Duration::from_millis(200),
+        );
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "the only slot is taken"
+        );
+        // traffic keeps it open
+        b.write_all(b"x").await.unwrap();
+        let mut buf = [0u8; 1];
+        g.read_exact(&mut buf).await.unwrap();
+        // then nothing: it times out
+        let t = tokio::time::Instant::now();
+        let e = g.read(&mut buf).await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(t.elapsed() >= Duration::from_millis(150));
+        drop(g);
+        assert!(slots.try_acquire_owned().is_ok(), "slot freed");
+    }
 }

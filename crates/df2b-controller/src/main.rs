@@ -417,6 +417,8 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     let grpc = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(20)))
+        // agents use a few streams each
+        .max_concurrent_streams(Some(64))
         .add_service(AgentServiceServer::new(grpc::Service::new(ctl.clone())))
         .serve_with_incoming_shutdown(
             df2b_tls::transport::incoming(listener, grpc_tls),

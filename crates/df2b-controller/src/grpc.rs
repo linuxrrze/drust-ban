@@ -207,9 +207,25 @@ impl AgentService for Service {
         if token.ca_fingerprint != self.ctl.ca.fingerprint() {
             return Err(invalid_token());
         }
+        // no work (CSR verification, signing) for requests without a
+        // token: only the CA fingerprint is needed to get this far
+        if !files::token_exists(&self.ctl.settings.state_dir, &token) {
+            return Err(invalid_token());
+        }
         let ctl = self.ctl.clone();
         let resp = tokio::task::spawn_blocking(move || {
-            let id = files::new_agent_id(&r.hostname);
+            let hostname: String = r
+                .hostname
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(255)
+                .collect();
+            let version: String = r.agent_version.chars().take(64).collect();
+            // 24 random bits: never overwrite an existing agent
+            let mut id = files::new_agent_id(&hostname);
+            while ctl.agent_group(&id).is_some() {
+                id = files::new_agent_id(&hostname);
+            }
             // check the CSR before using up the token
             let cert = ctl
                 .ca
@@ -221,7 +237,7 @@ impl AgentService for Service {
             let info = CertInfo::parse(&cert).map_err(internal)?;
             ctl.put_agent(AgentRecord {
                 id: id.clone(),
-                hostname: r.hostname.chars().take(255).collect(),
+                hostname: hostname.clone(),
                 group: token_file.group.clone(),
                 enrolled_at: Utc::now(),
                 serials: vec![info.serial],
@@ -229,12 +245,12 @@ impl AgentService for Service {
                 resync: false,
             })
             .map_err(internal)?;
-            info!(agent = %id, group = %token_file.group, ?peer, version = %r.agent_version, "agent enrolled");
+            info!(agent = %id, group = %token_file.group, ?peer, version = ?version, "agent enrolled");
             ctl.audit(
                 &format!("agent:{id}"),
                 peer.map(|p| p.to_string()),
                 "agent.enroll",
-                serde_json::json!({ "group": token_file.group, "hostname": r.hostname }),
+                serde_json::json!({ "group": token_file.group, "hostname": hostname }),
             )
             .map_err(internal)?;
             Ok::<_, Status>(v1::EnrollResponse {
@@ -253,7 +269,7 @@ impl AgentService for Service {
         &self,
         req: Request<v1::RenewRequest>,
     ) -> Result<Response<v1::RenewResponse>, Status> {
-        let (mut record, used) = self.auth(&req)?;
+        let (record, used) = self.auth(&req)?;
         let csr = req.into_inner().csr_der;
         let ctl = self.ctl.clone();
         let resp = tokio::task::spawn_blocking(move || {
@@ -264,10 +280,9 @@ impl AgentService for Service {
             let info = CertInfo::parse(&cert).map_err(internal)?;
             // new certificate + the one used for this call (in case the
             // response is lost); anything older is no longer accepted
-            record.serials = vec![info.serial, used.serial];
-            record.cert_not_after = info.not_after;
             let id = record.id.clone();
-            ctl.put_agent(record).map_err(internal)?;
+            ctl.renewed(&id, vec![info.serial, used.serial], info.not_after)
+                .map_err(internal)?;
             info!(agent = %id, not_after = %info.not_after, "agent certificate renewed");
             Ok::<_, Status>(v1::RenewResponse {
                 certificate_der: cert.to_vec(),

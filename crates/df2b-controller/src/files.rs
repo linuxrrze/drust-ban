@@ -124,6 +124,14 @@ pub fn create_token(dir: &Path, group: &str, ttl: Duration) -> anyhow::Result<En
 
 /// Consumes a token: succeeds at most once per token (atomic rename).
 /// Returns `None` for unknown, used or expired tokens.
+/// Whether an unused token file exists (cheap; checked before any work
+/// for an enrollment - only redeeming it is authoritative).
+pub fn token_exists(dir: &Path, token: &EnrollToken) -> bool {
+    token_dir(dir)
+        .join(format!("{}.json", token.secret_hash()))
+        .is_file()
+}
+
 pub fn redeem_token(dir: &Path, token: &EnrollToken) -> anyhow::Result<Option<TokenFile>> {
     let tdir = token_dir(dir);
     let path = tdir.join(format!("{}.json", token.secret_hash()));
