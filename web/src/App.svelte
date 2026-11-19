@@ -94,7 +94,7 @@
       {#if page === ''}
         <Dashboard />
       {:else if page === 'bans'}
-        <Bans />
+        {#key route.parts[1]}<Bans filter={route.parts[1] ?? ''} />{/key}
       {:else if page === 'agents'}
         <Agents selected={route.parts[1] ?? null} />
       {:else if page === 'ip'}

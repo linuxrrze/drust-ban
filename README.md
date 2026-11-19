@@ -113,6 +113,13 @@ logout URL, so logging out or disabling a user at the provider ends their
 controller sessions at once (providers without it: front-channel logout
 URL `…/api/v1/oidc/frontchannel-logout`, with "session required").
 
+ASN and country of banned addresses (Overview, Bans, address page,
+`df2bctl lookup`): start the controller with `--geoip` and MaxMind DB
+files, e.g. `--geoip /var/lib/GeoIP/GeoLite2-ASN.mmdb --geoip
+/var/lib/GeoIP/GeoLite2-Country.mmdb` (kept current by `geoipupdate`;
+reloaded when they change). DB-IP Lite and ipinfo Lite `.mmdb` files work
+too. No database is included.
+
 UI development with hot reload against a running controller:
 `DF2B_CONTROLLER=https://127.0.0.1:7444 npm --prefix web run dev`.
 

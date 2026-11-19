@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ApiError, get } from '../lib/api';
-  import { dateTime, origin, relative, remaining, scope, target } from '../lib/format';
+  import { dateTime, geoLong, origin, relative, remaining, scope, target } from '../lib/format';
   import { onChange } from '../lib/live.svelte';
   import { go, href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
@@ -66,6 +66,12 @@
   <div class="card summary">
     <div>
       <div class="mono big">{target(data.target)}</div>
+      {#if data.geo}
+        <div class="muted geo">
+          {geoLong(data.geo)}
+          {#if data.geo.asn != null}<a class="small" href={href('bans', `as:${data.geo.asn}`)}>bans from this network</a>{/if}
+        </div>
+      {/if}
       <div class="row">
         {#if data.active.length}
           <span class="pill bad">banned</span>
@@ -206,6 +212,7 @@
   .card { margin-bottom: 16px; }
   .summary { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .big { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+  .geo { margin: -2px 0 8px; display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
   .spacer { flex: 1; }
   .timeline { list-style: none; margin: 0; padding: 0 0 0 18px; border-left: 2px solid var(--border); display: grid; gap: 14px; }
   .timeline li { position: relative; }

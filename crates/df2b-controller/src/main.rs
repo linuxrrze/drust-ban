@@ -14,6 +14,7 @@ mod api;
 mod central;
 mod correlation;
 mod files;
+mod geo;
 mod grpc;
 mod https;
 mod oidc;
@@ -104,6 +105,12 @@ struct ServeArgs {
     /// DESIGN.md §9).
     #[arg(long, env = "DF2B_OIDC_CONFIG")]
     oidc_config: Option<PathBuf>,
+
+    /// MaxMind DB file with ASN and/or country data (repeatable): GeoLite2
+    /// ASN, Country or City, DB-IP Lite, ipinfo Lite. Reloaded when it
+    /// changes. Shown in the UI; never used for decisions.
+    #[arg(long = "geoip", env = "DF2B_GEOIP", value_delimiter = ',')]
+    geoip: Vec<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -346,18 +353,22 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     };
     let ca = files::load_or_create_ca(&dir)?;
     let store = store::Store::open(&dir)?;
-    let ctl = Arc::new(Controller::open(
-        Settings {
-            state_dir: dir.clone(),
-            cert_lifetime: a.agent_cert_lifetime,
-            propagate: a.propagate.unwrap_or(Propagate::Global),
-            allowlist: Allowlist::new(a.allowlist),
-            oidc: oidc.clone(),
-            https_internal_ca: a.https_cert.is_none(),
-        },
-        ca,
-        store,
-    )?);
+    let geo = geo::Geo::open(&a.geoip)?;
+    let ctl = Arc::new(
+        Controller::open(
+            Settings {
+                state_dir: dir.clone(),
+                cert_lifetime: a.agent_cert_lifetime,
+                propagate: a.propagate.unwrap_or(Propagate::Global),
+                allowlist: Allowlist::new(a.allowlist),
+                oidc: oidc.clone(),
+                https_internal_ca: a.https_cert.is_none(),
+            },
+            ca,
+            store,
+        )?
+        .with_geo(geo),
+    );
     if let Some(p) = a.propagate {
         if ctl.propagate() != p {
             info!(propagate = ?p, "--propagate overrides the stored setting");
@@ -425,6 +436,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
                 let (c, dir) = (ctl.clone(), dir.clone());
                 let _ = tokio::task::spawn_blocking(move || {
                     c.prune();
+                    c.geo.reload_changed();
                     files::prune_tokens(&dir);
                 })
                 .await;

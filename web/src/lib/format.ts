@@ -52,3 +52,30 @@ export function target(t: string): string {
 export function number(n: number): string {
   return n.toLocaleString();
 }
+
+/** "AS64500 · DE" (short) for lists; empty without data */
+export function geoShort(g: import('./types').GeoInfo | null | undefined): string {
+  if (!g) return '';
+  return [g.asn != null ? `AS${g.asn}` : '', g.country ?? ''].filter(Boolean).join(' · ');
+}
+
+/** "AS64500 Example Hosting · Germany (DE)" */
+export function geoLong(g: import('./types').GeoInfo | null | undefined): string {
+  if (!g) return '';
+  const as = g.asn != null ? `AS${g.asn}${g.as_org ? ' ' + g.as_org : ''}` : (g.as_org ?? '');
+  const c = g.country ? (g.country_name ? `${g.country_name} (${g.country})` : g.country) : '';
+  return [as, c].filter(Boolean).join(' · ');
+}
+
+/** Whether a ban-list search term (lower case) matches this address's
+ * ASN/country: "as:64500" / "as64500", "country:de", or text in the AS
+ * name or country name. */
+export function geoMatches(g: import('./types').GeoInfo | null | undefined, q: string): boolean {
+  if (!g) return false;
+  const m = /^as:?\s*(\d+)$/.exec(q);
+  if (m) return g.asn === Number(m[1]);
+  if (q.startsWith('country:')) return (g.country ?? '').toLowerCase() === q.slice(8).trim();
+  return (
+    (g.as_org ?? '').toLowerCase().includes(q) || (g.country_name ?? '').toLowerCase().includes(q)
+  );
+}

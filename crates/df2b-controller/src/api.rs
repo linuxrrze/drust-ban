@@ -13,6 +13,7 @@
 //!
 //! TODO: OpenAPI (utoipa).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2128,6 +2129,7 @@ async fn stats(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult 
         .into_iter()
         .map(|(h, c)| json!({ "hour": h, "count": c }))
         .collect();
+    let (top_asns, top_countries) = top_geo(&ctl.geo, &active, 8);
     Ok(Json(json!({
         "bans_per_hour": hourly,
         "active": {
@@ -2139,7 +2141,73 @@ async fn stats(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult 
         "top_jails": top(active.iter().map(|d| d.jail.clone().unwrap_or_else(|| "(manual)".into())), 8),
         "top_prefixes": top(active.iter().map(|d| coarse(&d.target).to_string()), 8),
         "top_origins": top(active.iter().map(|d| df2b_proto::origin_string(&d.origin)), 8),
+        "geoip": ctl.geo.enabled(),
+        "top_asns": top_asns,
+        "top_countries": top_countries,
     })))
+}
+
+/// Active bans by AS and by country (empty without GeoIP databases).
+fn top_geo(
+    geo: &crate::geo::Geo,
+    active: &[df2b_core::Decision],
+    n: usize,
+) -> (Vec<Value>, Vec<Value>) {
+    if !geo.enabled() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut asns: HashMap<u32, (Option<String>, u64)> = HashMap::new();
+    let mut countries: HashMap<String, (Option<String>, u64)> = HashMap::new();
+    for d in active
+        .iter()
+        .filter(|d| matches!(d.kind, DecisionKind::Ban))
+    {
+        let Some(g) = geo.lookup_net(&d.target) else {
+            continue;
+        };
+        if let Some(a) = g.asn {
+            let e = asns.entry(a).or_insert((g.as_org, 0));
+            e.1 += 1;
+        }
+        if let Some(c) = g.country {
+            let e = countries.entry(c).or_insert((g.country_name, 0));
+            e.1 += 1;
+        }
+    }
+    let mut asns: Vec<_> = asns.into_iter().collect();
+    asns.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(&b.0)));
+    let mut countries: Vec<_> = countries.into_iter().collect();
+    countries.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(&b.0)));
+    (
+        asns.into_iter()
+            .take(n)
+            .map(|(asn, (org, count))| json!({ "asn": asn, "org": org, "count": count }))
+            .collect(),
+        countries
+            .into_iter()
+            .take(n)
+            .map(|(c, (name, count))| json!({ "country": c, "name": name, "count": count }))
+            .collect(),
+    )
+}
+
+/// ASN/country per distinct target (for lists; empty without databases).
+fn geo_map<'a>(
+    geo: &crate::geo::Geo,
+    targets: impl Iterator<Item = &'a IpNet>,
+) -> HashMap<String, crate::geo::GeoInfo> {
+    let mut out = HashMap::new();
+    if !geo.enabled() {
+        return out;
+    }
+    for t in targets {
+        if let std::collections::hash_map::Entry::Vacant(e) = out.entry(t.to_string()) {
+            if let Some(g) = geo.lookup_net(t) {
+                e.insert(g);
+            }
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -2166,6 +2234,7 @@ async fn history(
     let history = blocking(move || c.history(net, limit)).await?;
     Ok(Json(json!({
         "target": net,
+        "geo": ctl.geo.lookup_net(&net),
         "allowlisted": ctl.allowlisted(&net),
         // earlier correlation bans of this exact target (escalation)
         "correlation_offenses": ctl.correlation_offenses(&net),
@@ -2219,6 +2288,7 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         "allowlist": ctl.allowlist().iter().map(|e| e.net).collect::<Vec<_>>(),
         "allowlist_version": ctl.allowlist_version(),
         "sessions": ctl.sessions.count(),
+        "geoip": ctl.geo.databases(),
     })))
 }
 
@@ -2394,7 +2464,9 @@ async fn decisions(
         .filter(|d| t.map_or(true, |t| d.target.contains(&t) || t.contains(&d.target)))
         .filter(|d| q.jail.as_ref().map_or(true, |j| d.jail.as_ref() == Some(j)))
         .collect();
-    Ok(Json(json!({ "decisions": list })))
+    // ASN/country by target, when GeoIP databases are configured
+    let geo = geo_map(&ctl.geo, list.iter().map(|d| &d.target));
+    Ok(Json(json!({ "decisions": list, "geo": geo })))
 }
 
 /// "global", "group:<name>" or "agent:<id>[,<id>...]"
@@ -2640,6 +2712,10 @@ mod tests {
 
     impl Env {
         async fn new(tag: &str) -> Self {
+            Self::with_geo(tag, crate::geo::Geo::default()).await
+        }
+
+        async fn with_geo(tag: &str, geo: crate::geo::Geo) -> Self {
             let dir = std::env::temp_dir().join(format!("df2b-api-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let ca = files::load_or_create_ca(&dir).unwrap();
@@ -2652,7 +2728,11 @@ mod tests {
                 oidc: None,
                 https_internal_ca: true,
             };
-            let ctl = Arc::new(Controller::open(settings, ca, Store::open(&dir).unwrap()).unwrap());
+            let ctl = Arc::new(
+                Controller::open(settings, ca, Store::open(&dir).unwrap())
+                    .unwrap()
+                    .with_geo(geo),
+            );
             let (chain, key) = ctl.ca.issue_server(&[]).unwrap();
             let tls = https_server_config(chain, key).unwrap();
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4743,6 +4823,96 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), S::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn geoip_in_responses() {
+        use crate::geo::testdb::{asn, build, country};
+        let dbdir = std::env::temp_dir().join(format!("df2b-api-geodb-{}", std::process::id()));
+        std::fs::create_dir_all(&dbdir).unwrap();
+        let (a, c) = (dbdir.join("asn.mmdb"), dbdir.join("country.mmdb"));
+        std::fs::write(
+            &a,
+            build(
+                "GeoLite2-ASN",
+                vec![
+                    ("203.0.113.0/24", asn(64500, "Example Hosting")),
+                    ("198.51.100.0/24", asn(64501, "Example ISP")),
+                ],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &c,
+            build(
+                "GeoLite2-Country",
+                vec![
+                    ("203.0.113.0/24", country("DE", "Germany")),
+                    ("198.51.100.0/24", country("DE", "Germany")),
+                ],
+            ),
+        )
+        .unwrap();
+        let env = Env::with_geo("geo", crate::geo::Geo::open(&[a, c]).unwrap()).await;
+        let op = env.token("olga", Role::Operator);
+        for t in ["203.0.113.9", "203.0.113.10", "198.51.100.1", "192.0.2.1"] {
+            let (st, v) = env
+                .call("POST", "/api/v1/bans", &op, json!({ "target": t }))
+                .await;
+            assert_eq!(st, S::CREATED, "{v}");
+        }
+        let (_, v) = env.call("GET", "/api/v1/decisions", &op, json!({})).await;
+        assert_eq!(v["geo"]["203.0.113.9/32"]["asn"], 64500);
+        assert_eq!(v["geo"]["203.0.113.9/32"]["country"], "DE");
+        assert_eq!(v["geo"]["198.51.100.1/32"]["as_org"], "Example ISP");
+        assert!(v["geo"]["192.0.2.1/32"].is_null(), "unknown: left out");
+
+        let (_, v) = env.call("GET", "/api/v1/stats", &op, json!({})).await;
+        assert_eq!(v["geoip"], true);
+        assert_eq!(
+            v["top_asns"],
+            json!([
+                { "asn": 64500, "org": "Example Hosting", "count": 2 },
+                { "asn": 64501, "org": "Example ISP", "count": 1 },
+            ])
+        );
+        assert_eq!(
+            v["top_countries"],
+            json!([{ "country": "DE", "name": "Germany", "count": 3 }])
+        );
+
+        let (_, v) = env
+            .call(
+                "GET",
+                "/api/v1/history?target=203.0.113.0/24",
+                &op,
+                json!({}),
+            )
+            .await;
+        assert_eq!(v["geo"]["as_org"], "Example Hosting");
+        let (_, v) = env.call("GET", "/api/v1/status", &op, json!({})).await;
+        assert_eq!(v["geoip"][0]["database_type"], "GeoLite2-ASN");
+        assert_eq!(v["geoip"][1]["database_type"], "GeoLite2-Country");
+
+        // without databases: nothing, and no errors
+        let plain = Env::new("nogeo").await;
+        let op = plain.token("olga", Role::Operator);
+        plain
+            .call(
+                "POST",
+                "/api/v1/bans",
+                &op,
+                json!({ "target": "203.0.113.9" }),
+            )
+            .await;
+        let (_, v) = plain.call("GET", "/api/v1/stats", &op, json!({})).await;
+        assert_eq!(
+            (v["geoip"].as_bool(), v["top_asns"].as_array().map(Vec::len)),
+            (Some(false), Some(0))
+        );
+        let (_, v) = plain.call("GET", "/api/v1/decisions", &op, json!({})).await;
+        assert_eq!(v["geo"], json!({}));
+        let _ = std::fs::remove_dir_all(&dbdir);
     }
 
     #[tokio::test]

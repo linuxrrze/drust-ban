@@ -69,11 +69,24 @@ export interface Status {
   allowlist: string[];
   allowlist_version: string;
   sessions: number;
+  /** configured GeoIP databases */
+  geoip: { path: string; database_type: string; build: string | null; error?: string }[];
+}
+
+/** ASN/country of an address (GeoIP databases on the controller) */
+export interface GeoInfo {
+  asn?: number;
+  as_org?: string;
+  country?: string;
+  country_name?: string;
 }
 
 export interface Count {
   key: string;
   count: number;
+  /** shown instead of the key */
+  label?: string;
+  title?: string;
 }
 
 export interface Stats {
@@ -82,10 +95,14 @@ export interface Stats {
   top_jails: Count[];
   top_prefixes: Count[];
   top_origins: Count[];
+  geoip: boolean;
+  top_asns: { asn: number; org: string | null; count: number }[];
+  top_countries: { country: string; name: string | null; count: number }[];
 }
 
 export interface History {
   target: string;
+  geo: GeoInfo | null;
   allowlisted: boolean;
   allow_entries: { net: string; expires_at: string | null }[];
   correlation_offenses: number;

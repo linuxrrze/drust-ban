@@ -1,18 +1,23 @@
 <script lang="ts">
   import { get } from '../lib/api';
-  import { dateTime, origin, relative, remaining, scope, target } from '../lib/format';
+  import { dateTime, geoLong, geoMatches, geoShort, origin, relative, remaining, scope, target } from '../lib/format';
   import { onChange } from '../lib/live.svelte';
   import { href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
-  import type { Decision } from '../lib/types';
+  import type { Decision, GeoInfo } from '../lib/types';
   import BanDialog from '../components/BanDialog.svelte';
   import UnbanDialog from '../components/UnbanDialog.svelte';
 
+  // a search preset from the URL (#/bans/as:64500, from the overview)
+  let { filter = '' }: { filter?: string } = $props();
+
   let decisions = $state<Decision[]>([]);
+  let geo = $state<Record<string, GeoInfo>>({});
   let loaded = $state(false);
   let error = $state('');
   let now = $state(Date.now());
-  let query = $state('');
+  // svelte-ignore state_referenced_locally
+  let query = $state(filter);
   let jail = $state('');
   let family = $state('');
   let sort = $state<'new' | 'expires' | 'target'>('new');
@@ -24,7 +29,9 @@
 
   async function load() {
     try {
-      decisions = (await get<{ decisions: Decision[] }>('/decisions')).decisions;
+      const r = await get<{ decisions: Decision[]; geo?: Record<string, GeoInfo> }>('/decisions');
+      decisions = r.decisions;
+      geo = r.geo ?? {};
       error = '';
       now = Date.now();
       // forget selections that are gone
@@ -59,7 +66,9 @@
           (d.jail ?? 'manual').toLowerCase().includes(q) ||
           origin(d.origin).toLowerCase().includes(q) ||
           d.reason.toLowerCase().includes(q) ||
-          scope(d.scope).toLowerCase().includes(q)),
+          scope(d.scope).toLowerCase().includes(q) ||
+          geoShort(geo[d.target]).toLowerCase().includes(q) ||
+          geoMatches(geo[d.target], q)),
     );
     const exp = (d: Decision) => (d.expires_at ? Date.parse(d.expires_at) : Infinity);
     if (sort === 'new') out.sort((a, b) => b.seq - a.seq);
@@ -68,6 +77,7 @@
     return out;
   });
   const page = $derived(filtered.slice(0, limit));
+  const hasGeo = $derived(Object.keys(geo).length > 0);
   const allSelected = $derived(page.length > 0 && page.every((d) => selected.has(d.id)));
 
   function toggle(id: string) {
@@ -103,7 +113,7 @@
 
 <div class="card">
   <div class="filters row">
-    <input type="search" class="grow" placeholder="Search address, jail, origin, reason" bind:value={query} aria-label="Search bans" />
+    <input type="search" class="grow" placeholder={hasGeo ? 'Search address, jail, origin, reason, AS (as:64500), country (country:de)' : 'Search address, jail, origin, reason'} bind:value={query} aria-label="Search bans" />
     <select bind:value={jail} aria-label="Jail">
       <option value="">all jails</option>
       {#each jails as j (j)}<option value={j}>{j || 'manual'}</option>{/each}
@@ -132,7 +142,7 @@
             {#if can('operator')}
               <th class="check"><input type="checkbox" checked={allSelected} onchange={toggleAll} aria-label="Select all shown" /></th>
             {/if}
-            <th>Target</th><th>Jail</th><th>Scope</th><th>Origin</th><th>Reason</th><th>Banned</th><th>Expires</th>
+            <th>Target</th>{#if hasGeo}<th>Network</th>{/if}<th>Jail</th><th>Scope</th><th>Origin</th><th>Reason</th><th>Banned</th><th>Expires</th>
             {#if can('operator')}<th></th>{/if}
           </tr>
         </thead>
@@ -143,6 +153,7 @@
                 <td class="check"><input type="checkbox" checked={selected.has(d.id)} onchange={() => toggle(d.id)} aria-label="Select {d.target}" /></td>
               {/if}
               <td class="mono"><a href={href('ip', d.target)}>{target(d.target)}</a></td>
+              {#if hasGeo}<td class="muted nowrap" title={geoLong(geo[d.target])}>{geoShort(geo[d.target])}</td>{/if}
               <td>{d.jail ?? 'manual'}</td>
               <td>{scope(d.scope)}</td>
               <td class="muted">{origin(d.origin)}</td>
@@ -173,6 +184,7 @@
   .filters { margin-bottom: 12px; }
   .grow { flex: 1 1 240px; }
   .check { width: 1%; }
+  .nowrap { white-space: nowrap; }
   .reason { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .more { padding: 12px 0 0; color: var(--text-2); }
 </style>

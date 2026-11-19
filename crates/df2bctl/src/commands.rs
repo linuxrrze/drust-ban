@@ -71,20 +71,69 @@ fn origin(v: &Value) -> String {
     }
 }
 
-fn print_decisions(list: &[Value]) {
+/// "AS64500 · DE" from a GeoIP record ("" without one).
+fn geo_short(g: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(a) = g["asn"].as_u64() {
+        parts.push(format!("AS{a}"));
+    }
+    if let Some(c) = g["country"].as_str() {
+        parts.push(c.to_owned());
+    }
+    parts.join(" · ")
+}
+
+/// "AS64500 Example Hosting · Germany (DE)"
+fn geo_long(g: &Value) -> String {
+    let mut parts = Vec::new();
+    match (g["asn"].as_u64(), g["as_org"].as_str()) {
+        (Some(a), Some(o)) => parts.push(format!("AS{a} {o}")),
+        (Some(a), None) => parts.push(format!("AS{a}")),
+        (None, Some(o)) => parts.push(o.to_owned()),
+        (None, None) => {}
+    }
+    match (g["country"].as_str(), g["country_name"].as_str()) {
+        (Some(c), Some(n)) => parts.push(format!("{n} ({c})")),
+        (Some(c), None) => parts.push(c.to_owned()),
+        _ => {}
+    }
+    parts.join(" · ")
+}
+
+/// `geo`: target → GeoIP record (a NETWORK column when not empty).
+fn print_decisions(list: &[Value], geo: &Value) {
     if list.is_empty() {
         println!("no active bans");
         return;
     }
+    let with_geo = geo.as_object().is_some_and(|m| !m.is_empty());
+    let net = |d: &Value| {
+        if with_geo {
+            format!("{:<14} ", geo_short(&geo[s(d, &["target"])]))
+        } else {
+            String::new()
+        }
+    };
     println!(
-        "{:>6}  {:<22} {:<10} {:<14} {:<26} {:<12} REASON",
-        "SEQ", "TARGET", "JAIL", "SCOPE", "ORIGIN", "EXPIRES"
+        "{:>6}  {:<22} {}{:<10} {:<14} {:<26} {:<12} REASON",
+        "SEQ",
+        "TARGET",
+        if with_geo {
+            format!("{:<14} ", "NETWORK")
+        } else {
+            String::new()
+        },
+        "JAIL",
+        "SCOPE",
+        "ORIGIN",
+        "EXPIRES"
     );
     for d in list {
         println!(
-            "{:>6}  {:<22} {:<10} {:<14} {:<26} {:<12} {}",
+            "{:>6}  {:<22} {}{:<10} {:<14} {:<26} {:<12} {}",
             d["seq"].to_string(),
             s(d, &["target"]),
+            net(d),
             d["jail"].as_str().unwrap_or("-"),
             scope(&d["scope"]),
             origin(&d["origin"]),
@@ -122,6 +171,56 @@ pub async fn status(c: &Client, json: bool) -> anyhow::Result<()> {
     println!("active bans  {}", v["active_decisions"]);
     println!("decision log seq {}", v["last_seq"]);
     println!("propagate    {}", s(&v, &["propagate"]));
+    for g in v["geoip"].as_array().into_iter().flatten() {
+        println!(
+            "geoip        {} ({}, built {}){}",
+            s(g, &["database_type"]),
+            s(g, &["path"]),
+            g["build"]
+                .as_str()
+                .map_or("?", |b| b.get(..10).unwrap_or(b)),
+            g["error"]
+                .as_str()
+                .map_or(String::new(), |e| format!(" - reload failed: {e}"))
+        );
+    }
+    Ok(())
+}
+
+/// Everything known about an address or prefix (the UI's address page).
+pub async fn lookup(c: &Client, target: IpNet, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .get_query("/api/v1/history", &[("target", target.to_string())])
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("{}", s(&v, &["target"]));
+    let g = geo_long(&v["geo"]);
+    if !g.is_empty() {
+        println!("network      {g}");
+    }
+    if v["allowlisted"].as_bool() == Some(true) {
+        println!("allowlisted  yes");
+    }
+    if let Some(n) = v["correlation_offenses"].as_u64().filter(|n| *n > 0) {
+        println!(
+            "correlation  {n} ban(s) within {}",
+            s(&v, &["offense_memory"])
+        );
+    }
+    let obs = v["observations"].as_array().map_or(0, Vec::len);
+    if obs > 0 {
+        println!("observed     {obs} recent report(s) from agents");
+    }
+    for l in v["samples"].as_array().into_iter().flatten().take(5) {
+        println!("sample       {}  {}", s(l, &["agent"]), s(l, &["line"]));
+    }
+    println!();
+    print_decisions(
+        v["active"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+        &Value::Null,
+    );
     Ok(())
 }
 
@@ -271,7 +370,10 @@ pub async fn bans_list(
     if json {
         return json_out(&v);
     }
-    print_decisions(v["decisions"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+    print_decisions(
+        v["decisions"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+        &v["geo"],
+    );
     Ok(())
 }
 
@@ -296,7 +398,7 @@ pub async fn ban(c: &Client, a: BanArgs, json: bool) -> anyhow::Result<()> {
         return json_out(&v);
     }
     match v["decision"].as_object() {
-        Some(_) => print_decisions(std::slice::from_ref(&v["decision"])),
+        Some(_) => print_decisions(std::slice::from_ref(&v["decision"]), &Value::Null),
         None => println!("{}", s(&v, &["message"])),
     }
     Ok(())

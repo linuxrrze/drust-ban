@@ -184,6 +184,8 @@ pub struct Controller {
     /// Correlation rules (stored) and what agents observed (memory).
     rules: Mutex<Arc<Vec<crate::correlation::Rule>>>,
     pub correlator: Mutex<crate::correlation::Correlator>,
+    /// ASN/country databases (optional; display only)
+    pub geo: crate::geo::Geo,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -368,7 +370,13 @@ impl Controller {
             central_tx,
             rules,
             correlator: Mutex::new(correlator),
+            geo: Default::default(),
         })
+    }
+
+    pub fn with_geo(mut self, geo: crate::geo::Geo) -> Self {
+        self.geo = geo;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {

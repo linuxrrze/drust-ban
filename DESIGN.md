@@ -425,9 +425,10 @@ agent over a Unix socket with `--local` (also works in standalone mode).
 
 Implemented: `status`, `whoami`, `agents …`, `bans list`, `ban`, `unban`,
 `audit`, `filter test`. An unban revokes every active ban overlapping the
-target (e.g. the /64 containing an IPv6 address) in the scope it was made;
-`--allow-for`, `ip`, `allowlist`, `jails`, `config` and `--local` are not
-implemented yet.
+target (e.g. the /64 containing an IPv6 address) in the scope it was made.
+Added later (see §9): `unban --allow-for`, `lookup` (the address page),
+`allowlist`, `jails`, `filters`, `correlation`, `propagate`. Not
+implemented yet: `config` and `--local`.
 
 ```
 df2bctl status
@@ -437,7 +438,7 @@ df2bctl ban 203.0.113.7 --for 24h --scope global --reason "manual"
 df2bctl unban 203.0.113.7 [--reason …] [--allow-for 1h]
 df2bctl audit [--limit 50]
 df2bctl whoami
-df2bctl ip 203.0.113.7            # observations per host, decision history
+df2bctl lookup 203.0.113.7        # network (ASN/country), bans, observations, samples
 df2bctl allowlist add|rm|list
 df2bctl jails list
 df2bctl filter test filters/sshd.toml /var/log/auth.log   # like fail2ban-regex
@@ -762,7 +763,33 @@ df2bctl config check | reload
     append), so it survives controller restarts; the reason says "offense n" and the address page shows the count.
     When several rules fire for the same address in one report, only the
     longest ban is recorded.
-- Not yet: ASN/GeoIP; redaction rules for sample lines.
+- **ASN/GeoIP** (`--geoip <file.mmdb>`, repeatable or comma-separated in
+  `DF2B_GEOIP`; module `geo.rs`, crate `maxminddb`): MaxMind DB files —
+  GeoLite2/GeoIP2 ASN, Country or City, DB-IP Lite, or ipinfo Lite (ASN
+  and country in one file, its own field names; both layouts are read).
+  Lookups merge the files in order (the first file with an AS, resp. a
+  country, wins; ASN and organization, code and name go together; a
+  prefix is looked up by its first address) and only read those fields
+  (`decode_path`), so ranking thousands of bans stays cheap. Files are
+  read into memory; housekeeping (every minute) reloads one whose mtime
+  changed (e.g. `geoipupdate`), a broken update keeps the previous data
+  and shows "reload failed". No file is downloaded or shipped (licenses):
+  the operator provides them. Display only — never used for decisions.
+  - API: `geo` in `GET /api/v1/history`; `geo` (target → record, unknown
+    left out) in `GET /api/v1/decisions`; `geoip`, `top_asns`,
+    `top_countries` in `GET /api/v1/stats` (active bans); the loaded
+    files in `GET /api/v1/status`.
+  - UI: address page line ("AS64500 Example Hosting · Germany (DE)", link
+    to that network's bans); Bans "Network" column and search (`as:64500`,
+    `country:de`, AS or country name), preset by `#/bans/<term>`; Overview
+    "Top autonomous systems" and "Top countries" (linking to the filtered
+    list) and the files with their build date in the footer.
+  - CLI: `df2bctl lookup <addr>` (network, bans, correlation, samples),
+    NETWORK column in `bans list`, files in `status`.
+  - Tests build small MaxMind DB files (a minimal writer in
+    `geo::testdb`) and read them with the real reader.
+- Not yet: ASN-based rules or allowlist entries; redaction rules for
+  sample lines.
 
 Pages:
 

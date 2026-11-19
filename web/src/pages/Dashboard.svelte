@@ -95,6 +95,23 @@
     <TopList title="Banned by" items={stats.top_origins} />
   </div>
 
+  {#if stats.geoip}
+    <!-- a list stays hidden when its kind of database is missing -->
+    {@const none = !stats.top_asns.length && !stats.top_countries.length}
+    <div class="two geo">
+      {#if none || stats.top_asns.length}<TopList
+        title="Top autonomous systems"
+        items={stats.top_asns.map((a) => ({ key: `as:${a.asn}`, label: `AS${a.asn}${a.org ? ' ' + a.org : ''}`, title: a.org ?? undefined, count: a.count }))}
+        link={(k) => href('bans', k)}
+      />{/if}
+      {#if none || stats.top_countries.length}<TopList
+        title="Top countries"
+        items={stats.top_countries.map((c) => ({ key: `country:${c.country.toLowerCase()}`, label: c.name ? `${c.name} (${c.country})` : c.country, count: c.count }))}
+        link={(k) => href('bans', k)}
+      />{/if}
+    </div>
+  {/if}
+
   <div class="two">
     <div class="card">
       <h2>Latest bans</h2>
@@ -145,6 +162,11 @@
   <p class="faint small foot">
     Controller {status.version} · local bans propagate: {status.propagate} · decision log #{status.last_seq}
     {#if status.allowlist.length}· never banned: <span class="mono">{status.allowlist.join(', ')}</span>{/if}
+    {#each status.geoip as g (g.path)}
+      {' · '}<span title={g.path}>{g.database_type}{g.build ? ` of ${g.build.slice(0, 10)}` : ''}</span>{#if g.error}{' '}<span
+          class="pill warn"
+          title={g.error}>reload failed</span>{/if}
+    {/each}
   </p>
 {:else if !error}
   <div class="empty">Loading…</div>
@@ -160,6 +182,7 @@
   .tile .pill { justify-self: start; }
   .chart-card { margin-bottom: 16px; }
   .three { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 16px; margin-bottom: 16px; }
+  .geo { margin-bottom: 16px; }
   .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); gap: 16px; }
   .foot { margin-top: 16px; }
 </style>

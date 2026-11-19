@@ -29,6 +29,7 @@ humantime-serde = "1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2", "service"] }
 libloading = "0.8"
+maxminddb = "0.33"
 ipnet = { version = "2", features = ["serde"] }
 memchr = "2"
 openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "timing-resistant-secret-traits"] }

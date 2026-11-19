@@ -64,6 +64,12 @@ enum Output {
 enum Command {
     /// Overall status (controller, agents, ban counts).
     Status,
+    /// Everything known about an address or prefix: network (ASN,
+    /// country), bans, correlation, sample log lines.
+    Lookup {
+        #[arg(value_parser = parse_target)]
+        target: IpNet,
+    },
     /// Show the API token's name and role.
     Whoami,
     /// Show the audit log (admin).
@@ -419,6 +425,7 @@ async fn run() -> anyhow::Result<()> {
     };
     match cli.command {
         Command::Status => commands::status(&client()?, json).await,
+        Command::Lookup { target } => commands::lookup(&client()?, target, json).await,
         Command::Whoami => commands::whoami(&client()?, json).await,
         Command::Audit { limit } => commands::audit(&client()?, limit, json).await,
         Command::Agents(cmd) => {
