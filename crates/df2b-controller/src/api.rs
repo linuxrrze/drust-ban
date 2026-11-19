@@ -302,7 +302,26 @@ async fn blocking<T: Send + 'static>(
 // ------------------------------------------------------------------- routes
 
 /// The REST API plus the web UI (everything outside `/api/`).
+/// The API with the default request rate limit.
+#[cfg(test)]
 pub fn router(ctl: Arc<Controller>) -> Router {
+    router_with_limit(ctl, crate::ratelimit::ApiLimit::default())
+}
+
+pub fn router_with_limit(ctl: Arc<Controller>, limit: crate::ratelimit::ApiLimit) -> Router {
+    let limiter = crate::ratelimit::Limiter::new(limit);
+    {
+        // idle clients' buckets are dropped; ends with the router
+        let weak = Arc::downgrade(&limiter);
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                t.tick().await;
+                let Some(l) = weak.upgrade() else { return };
+                l.prune(std::time::Instant::now());
+            }
+        });
+    }
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/session", post(login).delete(logout))
@@ -383,6 +402,9 @@ pub fn router(ctl: Arc<Controller>) -> Router {
                 crate::ui::serve(uri).await
             }
         })
+        .layer(axum::middleware::from_fn(move |req, next| {
+            crate::ratelimit::layer(limiter.clone(), req, next)
+        }))
         .layer(axum::middleware::map_response(crate::ui::security_headers))
         .with_state(ctl)
 }
@@ -2906,6 +2928,10 @@ mod tests {
         }
 
         async fn with_geo(tag: &str, geo: crate::geo::Geo) -> Self {
+            Self::build(tag, geo, crate::ratelimit::ApiLimit::default()).await
+        }
+
+        async fn build(tag: &str, geo: crate::geo::Geo, limit: crate::ratelimit::ApiLimit) -> Self {
             let dir = std::env::temp_dir().join(format!("df2b-api-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let ca = files::load_or_create_ca(&dir).unwrap();
@@ -2930,7 +2956,7 @@ mod tests {
             tokio::spawn(crate::https::serve(
                 l,
                 tls,
-                router(ctl.clone()),
+                router_with_limit(ctl.clone(), limit),
                 std::future::pending(),
             ));
             let http = client(Trust::PinnedCa(fp));
@@ -5399,5 +5425,46 @@ mod tests {
             .unwrap()
             .starts_with("127.0.0.1:"));
         let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn api_rate_limit() {
+        let env = Env::build(
+            "ratelimit",
+            crate::geo::Geo::default(),
+            crate::ratelimit::ApiLimit { rate: 1, burst: 2 },
+        )
+        .await;
+        let tok = env.token("vic", Role::Viewer);
+        for _ in 0..2 {
+            assert_eq!(
+                env.call("GET", "/api/v1/whoami", &tok, Value::Null).await.0,
+                S::OK
+            );
+        }
+        let r = env
+            .http
+            .get(format!("{}/api/v1/whoami", env.base))
+            .bearer_auth(&tok)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::TOO_MANY_REQUESTS);
+        assert_eq!(r.headers()[header::RETRY_AFTER], "1");
+        // invalid tokens count too (no unlimited guessing)
+        assert_eq!(
+            env.call("GET", "/api/v1/status", "nope", Value::Null)
+                .await
+                .0,
+            S::TOO_MANY_REQUESTS
+        );
+        // monitoring is exempt
+        let h = env
+            .http
+            .get(format!("{}/api/v1/health", env.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(h.status(), S::OK);
     }
 }

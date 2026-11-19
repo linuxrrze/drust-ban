@@ -19,6 +19,7 @@ mod grpc;
 mod https;
 mod oidc;
 mod policy;
+mod ratelimit;
 mod session;
 mod state;
 mod store;
@@ -111,6 +112,16 @@ struct ServeArgs {
     /// changes. Shown in the UI; never used for decisions.
     #[arg(long = "geoip", env = "DF2B_GEOIP", value_delimiter = ',')]
     geoip: Vec<PathBuf>,
+
+    /// REST API requests per second per client (IPv6: per /64), sustained;
+    /// 0 = no limit (e.g. behind a reverse proxy, where every client has
+    /// the proxy's address).
+    #[arg(long, env = "DF2B_API_RATE", default_value_t = 20)]
+    api_rate: u32,
+
+    /// REST API requests per client at once.
+    #[arg(long, env = "DF2B_API_BURST", default_value_t = 200)]
+    api_burst: u32,
 }
 
 #[derive(Debug, Subcommand)]
@@ -418,7 +429,13 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     let rest = https::serve(
         https_listener,
         https_tls,
-        api::router(ctl.clone()),
+        api::router_with_limit(
+            ctl.clone(),
+            ratelimit::ApiLimit {
+                rate: a.api_rate,
+                burst: a.api_burst,
+            },
+        ),
         shutdown(),
     );
 

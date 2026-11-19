@@ -343,7 +343,14 @@ Rules:
   the name `df2b-controller`, so any address works), by a CA file, or by
   Mozilla's roots. Settings: flags, `DF2B_*` environment, or
   `~/.config/df2b/df2bctl.toml` (warns if readable by others).
-- Not yet: OpenAPI, rate limiting beyond logins, certificate hot reload.
+- **Request rate limit** (all of `/api/` except `/api/v1/health`): a token
+  bucket per client (IPv6: per /64), `--api-rate` 20/s sustained and
+  `--api-burst` 200 at once by default; over it 429 with `Retry-After`.
+  Requests with invalid tokens count too. 0 turns it off (behind a reverse
+  proxy every client has the proxy's address). Idle buckets are dropped;
+  beyond 50 000 clients the rest share one bucket. Failed logins keep
+  their own stricter limit.
+- Not yet: OpenAPI, certificate hot reload.
 
 ### 4.5 Abuse safeguards
 
