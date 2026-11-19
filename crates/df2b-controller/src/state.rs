@@ -28,6 +28,11 @@ use crate::store::{AgentRecord, AllowEntry, AuditEntry, Store};
 
 /// A resuming subscriber further behind than this gets a snapshot instead.
 const MAX_BACKLOG: u64 = 10_000;
+/// Setting: highest sequence number removed by log compaction.
+const LOG_COMPACTED: &str = "log_compacted";
+/// Compaction keeps at least this much history: offense counts for
+/// escalation are rebuilt from the log (OFFENSE_MEMORY).
+pub const MIN_LOG_RETENTION: Duration = Duration::from_secs(31 * 86400);
 /// How long the hourly ban counts are kept (dashboard).
 const HOURLY_KEEP: i64 = 7 * 24;
 
@@ -127,6 +132,9 @@ pub enum AuthError {
 #[derive(Default)]
 struct Inner {
     last_seq: u64,
+    /// Highest sequence number deleted by log compaction: resuming from
+    /// before it needs a snapshot (the backlog has gaps).
+    compacted: u64,
     /// Active ban decisions by id.
     active: HashMap<Uuid, Decision>,
     agents: HashMap<String, AgentRecord>,
@@ -366,6 +374,10 @@ impl Controller {
             apply(&mut inner.active, &d, now);
             inner.count(&d);
         })?;
+        inner.compacted = store.setting::<u64>(LOG_COMPACTED)?.unwrap_or(0);
+        // the newest decisions may have been compacted too: numbers are
+        // never reused
+        inner.last_seq = inner.last_seq.max(inner.compacted);
         let allow_entries = store.allow_entries()?;
         let asn_allow = store.allow_asns()?;
         for a in store.agents()? {
@@ -580,8 +592,11 @@ impl Controller {
             // was read
             let current = inner.agents.get(&agent.id).cloned();
             let agent = current.as_ref().unwrap_or(agent);
-            let need_snapshot =
-                from_seq == 0 || from_seq > last || last - from_seq > MAX_BACKLOG || agent.resync;
+            let need_snapshot = from_seq == 0
+                || from_seq > last
+                || last - from_seq > MAX_BACKLOG
+                || from_seq < inner.compacted
+                || agent.resync;
             if agent.resync {
                 // cleared under the lock, so a concurrent group change is
                 // never lost
@@ -677,6 +692,30 @@ impl Controller {
         if let Err(e) = self.prune_allowlist() {
             tracing::warn!(error = %format!("{e:#}"), "pruning the allowlist failed");
         }
+    }
+
+    /// Deletes decisions older than `retention` from the log, except bans
+    /// that are still active (also permanent ones). Blocking. Returns how
+    /// many were deleted.
+    pub fn compact_log(&self, retention: Duration) -> anyhow::Result<usize> {
+        let retention = retention.max(MIN_LOG_RETENTION);
+        self.compact_before(Utc::now() - chrono::Duration::from_std(retention)?)
+    }
+
+    fn compact_before(&self, before: DateTime<Utc>) -> anyhow::Result<usize> {
+        let active: std::collections::HashSet<Uuid> = self.lock().active.keys().copied().collect();
+        let (n, max) = self
+            .store
+            .compact_decisions(before, |d| active.contains(&d.id))?;
+        if n > 0 {
+            let mut inner = self.lock();
+            if max > inner.compacted {
+                self.store.put_setting(LOG_COMPACTED, &max)?;
+                inner.compacted = max;
+            }
+            tracing::info!(deleted = n, through_seq = max, "decision log compacted");
+        }
+        Ok(n)
     }
 
     /// Writes the correlation observations accepted since the last call
@@ -1457,6 +1496,80 @@ mod tests {
                 .seq,
             5
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_compaction() {
+        let (c, dir) = ctl("compact");
+        let web = agent("web-1", "web");
+        let out = c
+            .append(vec![
+                ban("203.0.113.7/32", Scope::Global, Some(1)),
+                ban("198.51.100.0/24", Scope::Global, None), // permanent
+                ban("192.0.2.1/32", Scope::Global, Some(1)),
+            ])
+            .unwrap();
+        // the first one lifted: ban + unban are history now
+        c.append(vec![NewDecision {
+            kind: DecisionKind::Unban { revokes: out[0].id },
+            ..ban("203.0.113.7/32", Scope::Global, None)
+        }])
+        .unwrap();
+        // retention is never below the offense memory
+        assert_eq!(c.compact_log(Duration::from_secs(1)).unwrap(), 0);
+        let n = c
+            .compact_before(Utc::now() + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(n, 2, "lifted ban and its unban; active bans kept");
+        assert_eq!(c.active_decisions().len(), 2);
+        // resuming from before the gap: snapshot; after it: backlog
+        assert!(matches!(
+            c.subscribe(1, &web).unwrap().0,
+            Initial::Snapshot { .. }
+        ));
+        assert!(matches!(
+            c.subscribe(4, &web).unwrap().0,
+            Initial::Backlog { .. }
+        ));
+        drop(c);
+
+        // compact everything: numbers are not reused after a restart
+        let reopen = || {
+            Controller::open(
+                Settings {
+                    state_dir: dir.clone(),
+                    cert_lifetime: Duration::from_secs(1),
+                    propagate: Propagate::Global,
+                    allowlist: Allowlist::default(),
+                    oidc: None,
+                    https_internal_ca: true,
+                },
+                Ca::generate("t").unwrap(),
+                Store::open(&dir).unwrap(),
+            )
+            .unwrap()
+        };
+        let c = reopen();
+        assert_eq!(c.active_decisions().len(), 2, "kept bans survive a restart");
+        let unban_all: Vec<NewDecision> = c
+            .active_decisions()
+            .iter()
+            .map(|d| NewDecision {
+                kind: DecisionKind::Unban { revokes: d.id },
+                ..ban(&d.target.to_string(), Scope::Global, None)
+            })
+            .collect();
+        c.append(unban_all).unwrap();
+        c.compact_before(Utc::now() + chrono::Duration::seconds(1))
+            .unwrap();
+        drop(c);
+        let c = reopen();
+        assert!(c.active_decisions().is_empty());
+        let next = c
+            .append(vec![ban("192.0.2.9/32", Scope::Global, Some(1))])
+            .unwrap();
+        assert_eq!(next[0].seq, 7, "continues after the compacted ones");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

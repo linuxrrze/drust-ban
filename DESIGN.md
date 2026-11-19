@@ -216,6 +216,13 @@ struct Decision {
   applying decisions is idempotent.
 - If the gap is too large (log compacted), the controller sends a snapshot of
   active decisions, then continues streaming.
+- **Log compaction** (daily, first a minute after start): decisions older
+  than `--log-retention` (default 90d, at least 31d so the 30-day offense
+  counts rebuilt from the log stay right; `never` keeps everything) are
+  deleted, except bans still active (permanent ones included). The highest
+  deleted sequence number is stored: agents resuming from before it get a
+  snapshot, and numbers are never reused after a restart. Older address
+  history is gone with it.
 - Expiry uses absolute `expires_at`. Agents report clock skew in heartbeats
   (shown in the UI) and clamp expiries if skew is large.
 

@@ -495,6 +495,43 @@ impl Store {
         Ok(n)
     }
 
+    /// Deletes decisions created before `before` unless `keep` says
+    /// otherwise, in transactions of at most 10 000. Returns how many were
+    /// deleted and the highest deleted sequence number.
+    pub fn compact_decisions(
+        &self,
+        before: DateTime<Utc>,
+        keep: impl Fn(&Decision) -> bool,
+    ) -> anyhow::Result<(usize, u64)> {
+        let mut doomed = Vec::new();
+        {
+            let tx = self.db.begin_read()?;
+            for item in tx.open_table(DECISIONS)?.iter()? {
+                let (k, v) = item?;
+                let d: Decision = serde_json::from_slice(v.value())?;
+                if d.created_at >= before {
+                    // the log is in creation order (seq); later ones are newer
+                    break;
+                }
+                if !keep(&d) {
+                    doomed.push(k.value());
+                }
+            }
+        }
+        let max = doomed.last().copied().unwrap_or(0);
+        for chunk in doomed.chunks(10_000) {
+            let tx = self.db.begin_write()?;
+            {
+                let mut t = tx.open_table(DECISIONS)?;
+                for seq in chunk {
+                    t.remove(*seq)?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok((doomed.len(), max))
+    }
+
     /// Calls `f` for every decision in order (startup replay).
     pub fn for_each(&self, mut f: impl FnMut(Decision)) -> anyhow::Result<()> {
         let tx = self.db.begin_read()?;

@@ -37,7 +37,7 @@ use clap::{Parser, Subcommand};
 use df2b_core::Allowlist;
 use df2b_proto::v1::agent_service_server::AgentServiceServer;
 use ipnet::IpNet;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::files::Role;
@@ -116,6 +116,12 @@ struct ServeArgs {
     /// the proxy's address).
     #[arg(long, env = "DF2B_API_RATE", default_value_t = 20)]
     api_rate: u32,
+
+    /// How long ended decisions stay in the decision log (address history,
+    /// agents resuming without a snapshot), e.g. 90d; at least 31d.
+    /// Active bans always stay. "never": keep everything.
+    #[arg(long, env = "DF2B_LOG_RETENTION", default_value = "90d", value_parser = parse_retention)]
+    log_retention: Option<Duration>,
 
     /// REST API requests per client at once.
     #[arg(long, env = "DF2B_API_BURST", default_value_t = 200)]
@@ -337,6 +343,17 @@ fn user(dir: &std::path::Path, cmd: UserCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_retention(s: &str) -> Result<Option<Duration>, String> {
+    if s == "never" {
+        return Ok(None);
+    }
+    let d = humantime::parse_duration(s).map_err(|e| e.to_string())?;
+    if d < state::MIN_LOG_RETENTION {
+        return Err("at least 31d (offense counts are rebuilt from the log)".into());
+    }
+    Ok(Some(d))
+}
+
 async fn serve(args: Args) -> anyhow::Result<()> {
     let a = args.serve;
     let dir = args.state_dir;
@@ -432,10 +449,23 @@ async fn serve(args: Args) -> anyhow::Result<()> {
 
     let housekeeping = {
         let ctl = ctl.clone();
+        let retention = a.log_retention;
         async move {
             let mut t = tokio::time::interval(Duration::from_secs(60));
+            // first after a minute, then daily
+            let mut next_compaction = tokio::time::Instant::now() + Duration::from_secs(60);
             loop {
                 t.tick().await;
+                if let Some(r) =
+                    retention.filter(|_| tokio::time::Instant::now() >= next_compaction)
+                {
+                    next_compaction = tokio::time::Instant::now() + Duration::from_secs(86400);
+                    let c = ctl.clone();
+                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || c.compact_log(r)).await
+                    {
+                        error!(error = %format!("{e:#}"), "compacting the decision log failed");
+                    }
+                }
                 if let Some(f) = &mut cert_files {
                     f.reload_if_changed(&https_tls);
                 }
