@@ -376,6 +376,15 @@ table inet df2b {
   crashes.
 - **Batched updates**: one transaction per batch, not one process per ban;
   100k+ entries are fine.
+- **Overlapping prefixes**: the sets are interval sets, which refuse an
+  element overlapping another (e.g. a local /32 inside a controller /24)
+  and would fail the whole batch. Batches are normalized (equal prefixes
+  merged, longest timeout wins; prefixes inside a wider one dropped); if a
+  batch still fails, the sets are listed and it is resolved against them
+  (entries an element already covers skipped, narrower elements replaced
+  by the wider new one) in one transaction. The reconcile loop counts a
+  prefix inside a claimed wider element as present, and re-adds a narrower
+  ban once the wider one is gone.
 - **Reconcile loop** (every 5 min): the agent lists both sets
   (`nft -j list set`) and compares them with the bans it knows (jail bans,
   manual bans, controller bans; longest expiry per prefix): missing

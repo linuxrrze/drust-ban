@@ -6,8 +6,13 @@
 //! Set contents are listed with `nft -j list set` for the agent's
 //! reconcile loop.
 //!
-//! TODO: talk netlink directly (rustables), merge overlapping intervals
-//! before adding.
+//! The sets are interval sets, where overlapping elements fail a
+//! transaction: batches are normalized first (prefixes inside wider ones
+//! dropped), and if a batch still fails, the set is listed and the batch
+//! resolved against it (covered entries skipped, narrower elements
+//! replaced by a wider new one, in one transaction).
+//!
+//! TODO: talk netlink directly (rustables).
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -157,10 +162,29 @@ impl FirewallBackend for Nftables {
     }
 
     fn ban(&self, entries: &[BanEntry]) -> anyhow::Result<()> {
+        let entries = crate::normalize(entries);
         if entries.is_empty() {
             return Ok(());
         }
-        self.run(&self.ban_script(entries))
+        let Err(first) = self.run(&self.ban_script(&entries)) else {
+            return Ok(());
+        };
+        // probably overlapping elements already in the set
+        let existing = match self.list() {
+            Ok(Some(e)) => e,
+            _ => return Err(first),
+        };
+        let (delete, add) = crate::resolve(&existing, &entries);
+        if add.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            replaced = delete.len(),
+            add = add.len(),
+            "ban batch resolved against the sets"
+        );
+        self.run(&(self.unban_script(&delete) + &self.ban_script(&add)))
+            .with_context(|| format!("after the first attempt failed: {first:#}"))
     }
 
     fn list(&self) -> anyhow::Result<Option<Vec<IpNet>>> {
@@ -343,5 +367,41 @@ mod tests {
         assert_eq!(parse_set(v6).unwrap()[0].to_string(), "2001:db8::/64");
         assert!(parse_set("not json").is_err());
         assert!(parse_set(r#"{"nftables": [{"set": {"elem": ["nonsense"]}}]}"#).is_err());
+    }
+
+    #[test]
+    fn ban_resolves_overlaps_after_a_failed_batch() {
+        let dir = std::env::temp_dir().join(format!("df2b-nft-overlap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = r#"{"nftables": [{"set": {"elem": [{"elem": {"val": "198.51.100.5", "timeout": 60}}, {"prefix": {"addr": "192.0.2.0", "len": 24}}]}}]}"#;
+        let nft = fake_nft(
+            "overlap",
+            &format!(
+                "d={d}\nif [ \"$1\" = -j ]; then echo '{json}'; exit 0; fi\n\
+                 n=$(ls $d | grep -c call)\ncat > $d/call$n\n\
+                 if [ $n = 0 ]; then echo 'Error: interval overlaps with an existing one' >&2; exit 1; fi",
+                d = dir.display()
+            ),
+        );
+        let b = Nftables::new("df2b", &nft);
+        b.ban(&[
+            BanEntry {
+                net: "192.0.2.7/32".parse().unwrap(),
+                timeout: Some(Duration::from_secs(60)),
+            },
+            BanEntry {
+                net: "198.51.100.0/24".parse().unwrap(),
+                timeout: Some(Duration::from_secs(600)),
+            },
+        ])
+        .unwrap();
+        let second = std::fs::read_to_string(dir.join("call1")).unwrap();
+        assert_eq!(
+            second,
+            "delete element inet df2b ban_v4 { 198.51.100.5/32 }\n\
+             add element inet df2b ban_v4 { 198.51.100.0/24 timeout 600s }\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

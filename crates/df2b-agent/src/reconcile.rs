@@ -48,11 +48,26 @@ pub struct Plan {
 }
 
 pub fn plan(expected: &Expected, actual: &[IpNet], now: DateTime<Utc>) -> Plan {
-    let have: HashSet<IpNet> = actual.iter().copied().collect();
+    let mut remove: Vec<IpNet> = actual
+        .iter()
+        .filter(|n| !expected.0.contains_key(n))
+        .copied()
+        .collect();
+    // what stays; present: the prefix itself or a wider element containing
+    // it (an interval set refuses the narrower one inside it anyway)
+    let have: HashSet<IpNet> = actual
+        .iter()
+        .filter(|n| expected.0.contains_key(n))
+        .copied()
+        .collect();
+    let covered = |net: &IpNet| {
+        (0..=net.prefix_len())
+            .any(|len| IpNet::new(net.addr(), len).is_ok_and(|n| have.contains(&n.trunc())))
+    };
     let mut add: Vec<BanEntry> = expected
         .0
         .iter()
-        .filter(|(net, _)| !have.contains(net))
+        .filter(|(net, _)| !covered(net))
         .filter_map(|(net, until)| match until {
             None => Some(BanEntry {
                 net: *net,
@@ -65,12 +80,9 @@ pub fn plan(expected: &Expected, actual: &[IpNet], now: DateTime<Utc>) -> Plan {
             Some(_) => None,
         })
         .collect();
-    let mut remove: Vec<IpNet> = have
-        .into_iter()
-        .filter(|n| !expected.0.contains_key(n))
-        .collect();
     add.sort_by_key(|e| e.net);
     remove.sort();
+    remove.dedup();
     Plan { add, remove }
 }
 
@@ -151,6 +163,18 @@ mod tests {
             "longest expiry wins, permanent beats any; ending soon is skipped"
         );
         assert_eq!(p.remove, [net("203.0.113.9/32")]);
+        // inside a wider element: present
+        let mut inside = Expected::default();
+        inside.add(net("198.51.100.7/32"), None);
+        let wider = [net("198.51.100.0/24")];
+        let p = plan(&inside, &wider, now);
+        assert_eq!(p.remove, wider, "nobody claims the /24");
+        assert_eq!(p.add.len(), 1, "so the /32 inside it is added right away");
+        inside.add(wider[0], None);
+        assert!(
+            plan(&inside, &wider, now).add.is_empty(),
+            "covered by a claimed /24"
+        );
         assert_eq!(
             plan(
                 &e,
