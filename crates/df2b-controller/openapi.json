@@ -3863,6 +3863,52 @@
                         "$ref": "#/components/schemas/DbInfo"
                       },
                       "description": "Loaded GeoIP databases."
+                    },
+                    "actions": {
+                      "type": "array",
+                      "description": "External actions (--actions) with their delivery counters; empty without.",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "name",
+                          "kind",
+                          "delivered",
+                          "failed",
+                          "dropped"
+                        ],
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": [
+                              "webhook",
+                              "exec"
+                            ]
+                          },
+                          "delivered": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "failed": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "dropped": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "queue full"
+                          },
+                          "last_error": {
+                            "type": "string"
+                          },
+                          "last_error_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
                     }
                   },
                   "required": [
@@ -3875,7 +3921,8 @@
                     "allowlist_version",
                     "redaction_version",
                     "sessions",
-                    "geoip"
+                    "geoip",
+                    "actions"
                   ]
                 }
               }
