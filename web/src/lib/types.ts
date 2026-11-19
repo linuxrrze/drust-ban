@@ -88,6 +88,7 @@ export interface History {
   target: string;
   allowlisted: boolean;
   allow_entries: { net: string; expires_at: string | null }[];
+  observations: { jail: string; key: string; agent: string; at: string; failures: number; banned: boolean }[];
   active: Decision[];
   history: Decision[];
 }
@@ -216,4 +217,28 @@ export interface CentralFilter {
   updated_by: string;
   updated_at: string;
   used_by: string[];
+}
+
+export interface CorrelationRule {
+  name: string;
+  kind: 'threshold' | 'quorum';
+  jail: string | null;
+  group: string | null;
+  min_agents: number;
+  min_failures: number;
+  window: string;
+  bantime: string;
+  enabled: boolean;
+  monitor: boolean;
+  updated_by: string;
+  updated_at: string;
+}
+
+export interface CorrelationHit {
+  rule: string;
+  jail: string;
+  target: string;
+  failures: number;
+  agents: string[];
+  at: string;
 }

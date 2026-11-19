@@ -21,6 +21,7 @@ const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 const ALLOWLIST: TableDefinition<&str, &[u8]> = TableDefinition::new("allowlist");
 const JAIL_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_policies");
 const FILTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("filters");
+const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("correlation_rules");
 const JAIL_DEFS: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_defs");
 /// Runtime settings changed through the API (e.g. "propagate").
 const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
@@ -91,6 +92,7 @@ impl Store {
         tx.open_table(SETTINGS)?;
         tx.open_table(FILTERS)?;
         tx.open_table(JAIL_DEFS)?;
+        tx.open_table(RULES)?;
         tx.commit()?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -221,6 +223,30 @@ impl Store {
             c.defs.push(serde_json::from_slice(item?.1.value())?);
         }
         Ok(c)
+    }
+
+    pub fn rules(&self) -> anyhow::Result<Vec<crate::correlation::Rule>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for item in tx.open_table(RULES)?.iter()? {
+            out.push(serde_json::from_slice(item?.1.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn put_rule(&self, r: &crate::correlation::Rule) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(RULES)?
+            .insert(r.name.as_str(), serde_json::to_vec(r)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_rule(&self, name: &str) -> anyhow::Result<bool> {
+        let tx = self.db.begin_write()?;
+        let found = tx.open_table(RULES)?.remove(name)?.is_some();
+        tx.commit()?;
+        Ok(found)
     }
 
     pub fn put_filter(&self, f: &crate::central::CentralFilter) -> anyhow::Result<()> {

@@ -76,6 +76,7 @@ cargo run -p df2bctl -- allowlist list
 cargo run -p df2bctl -- jails list                # jails on the agents, central settings
 cargo run -p df2bctl -- jails set sshd --maxretry 3 --bantime 2h [--group web]   # admin
 cargo run -p df2bctl -- propagate group           # admin: local bans apply to the host's group
+cargo run -p df2bctl -- correlation set distributed --kind threshold --min-failures 20 --min-agents 4 --window 1h --bantime 12h --monitor
 cargo run -p df2bctl -- filter push app-auth app-auth.toml                     # admin
 cargo run -p df2bctl -- jails define app --filter app-auth --file /var/log/app/auth.log --group web
 cargo run -p df2bctl -- sessions list            # web UI sessions (admin)

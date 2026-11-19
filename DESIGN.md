@@ -156,6 +156,10 @@ of 15 hosts never trips a local threshold, but is obvious centrally.
 | `global_threshold` | > X failures across ≥ Y distinct agents within a window → ban. |
 | `quorum`           | ≥ N agents must agree before a global ban (anti-poisoning).    |
 
+Implemented as runtime ban propagation (`global`/`group`/`off`) plus
+correlation rules of kind `threshold` and `quorum`; see §9 "Observations
+and correlation".
+
 ### 4.3 Decision log
 
 Every ban and unban is an append-only **decision** with a monotonic sequence
@@ -700,9 +704,39 @@ df2bctl config check | reload
   so an agent with only central jails keeps running. Lines read are only
   matched to extract addresses; nothing is sent back. Source names starting
   with `central:` are reserved in the agent configuration.
+- **Observations and correlation** (§4.1, §4.2; Policies page "Correlation
+  rules", `GET|PUT|DELETE /api/v1/correlation[/<name>]`, `df2bctl
+  correlation list|set|rm`):
+  - Agents with a controller count every failure that passes their
+    allowlists (also below their own threshold; not for addresses they
+    already ban) per jail and key and send the counts every 5 s (at most
+    50 000 keys per interval). When the report queue is full, failure
+    counts are dropped before ban reports. No log lines are sent.
+  - The controller rate-limits each agent (20 000 observations per minute;
+    `retry_after_ms` tells it to slow down), ignores malformed, too broad
+    and allowlisted keys, and places each observation by the agent's
+    `last_seen` corrected by the clock skew from its heartbeats (clamped
+    to now; older than 24 h dropped), so reports queued while an agent was
+    offline do not look like a fresh burst. Observations are kept in
+    memory for the longest rule window (at least an hour), for at most
+    200 000 addresses; a restart starts them afresh.
+  - Rules (stored in redb `correlation_rules`): `threshold` — at least N
+    failures from at least M different agents within a window (local ban
+    reports are votes, not failures); `quorum` — at least M (≥ 2) agents
+    banned the address locally within the window. A rule applies to one
+    jail or all, and to all agents (ban global) or one group (only its
+    agents count; ban in that group). It fires once per address until its
+    ban ends, skips addresses already banned there, and bans for its
+    `bantime` with origin `correlation:<rule>` and a reason naming the
+    agents. *Monitor* mode only records what it would have banned (last
+    200, shown on the Policies page); new rules start in monitor mode in
+    the UI. Anti-poisoning setup: propagation "Only locally" plus a quorum
+    rule — one compromised agent then cannot ban anything elsewhere.
+  - The address page shows the recent observations per host.
 - Not yet:
   observation timelines and sample log lines (needs observation reporting),
-  ASN/GeoIP, correlation policies.
+  ASN/GeoIP, escalation of correlation bans for repeat offenders,
+  observations kept across controller restarts, sample log lines.
 
 Pages:
 

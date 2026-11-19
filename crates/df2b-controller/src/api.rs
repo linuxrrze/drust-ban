@@ -311,6 +311,11 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/api-tokens", get(list_tokens).post(create_token))
         .route("/api/v1/policies", get(policies))
+        .route("/api/v1/correlation", get(list_rules))
+        .route(
+            "/api/v1/correlation/:name",
+            axum::routing::put(set_rule).delete(delete_rule),
+        )
         .route("/api/v1/filters", get(list_filters))
         .route("/api/v1/filters/test", post(test_filter))
         .route(
@@ -1206,6 +1211,107 @@ async fn delete_jail_policy(
     Ok(Json(json!({ "removed": true })))
 }
 
+// ------------------------------------------------------------ correlation
+
+async fn list_rules(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    let c = ctl.correlator.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(Json(json!({
+        "rules": *ctl.rules(),
+        "monitor_hits": c.hits(),
+        "tracked_addresses": c.tracked(),
+        "propagate": ctl.propagate(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleBody {
+    kind: crate::correlation::RuleKind,
+    jail: Option<String>,
+    group: Option<String>,
+    min_agents: u32,
+    #[serde(default)]
+    min_failures: u32,
+    window: String,
+    bantime: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    monitor: bool,
+}
+
+/// Admin: creates or replaces a correlation rule.
+async fn set_rule(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Json(req): Json<RuleBody>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let trim = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    let group = trim(req.group);
+    if group.as_deref().is_some_and(|g| !files::valid_group(g)) {
+        return Err(ApiError::bad_request("invalid group name"));
+    }
+    let rule = crate::correlation::Rule {
+        name: name.clone(),
+        kind: req.kind,
+        jail: trim(req.jail),
+        group,
+        min_agents: req.min_agents,
+        min_failures: req.min_failures,
+        window: parse_duration(&req.window, "window")?,
+        bantime: parse_duration(&req.bantime, "bantime")?,
+        enabled: req.enabled,
+        monitor: req.monitor,
+        updated_by: caller.name.clone(),
+        updated_at: Utc::now(),
+    };
+    rule.validate().map_err(ApiError::bad_request)?;
+    let c = ctl.clone();
+    let audit_rule = serde_json::to_value(&rule).map_err(ApiError::internal)?;
+    let replaced = blocking(move || {
+        let prev = c.set_rule(rule)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "correlation.set",
+            json!({ "rule": name, "definition": audit_rule, "replaced": prev.is_some() }),
+        )?;
+        Ok(prev.is_some())
+    })
+    .await?;
+    Ok(Json(json!({ "replaced": replaced })))
+}
+
+async fn delete_rule(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    let n = name.clone();
+    let found = blocking(move || {
+        let found = c.remove_rule(&n)?;
+        if found {
+            c.audit(
+                &caller.name,
+                caller.addr(),
+                "correlation.remove",
+                json!({ "rule": n }),
+            )?;
+        }
+        Ok(found)
+    })
+    .await?;
+    if !found {
+        return Err(ApiError::not_found(format!("no rule {name:?}")));
+    }
+    Ok(Json(json!({ "removed": name })))
+}
+
 // ----------------------------------------------------------- central jails
 
 async fn list_filters(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
@@ -2051,6 +2157,18 @@ async fn history(
     Ok(Json(json!({
         "target": net,
         "allowlisted": ctl.allowlisted(&net),
+        // what agents reported recently (memory; since the controller started)
+        "observations": ctl
+            .correlator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recent(&net)
+            .into_iter()
+            .map(|(jail, key, s)| json!({
+                "jail": jail, "key": key, "agent": s.agent, "at": s.at,
+                "failures": s.failures, "banned": s.banned,
+            }))
+            .collect::<Vec<_>>(),
         "allow_entries": ctl
             .allowlist()
             .into_iter()
@@ -4402,6 +4520,151 @@ mod tests {
                 "filter.set"
             ]
         );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn correlation_rule_management() {
+        let env = Env::new("corr").await;
+        let viewer = env.token("vic", Role::Viewer);
+        let admin = env.token("ada", Role::Admin);
+        let put = |tok: &str, path: &str, body: Value| {
+            let (env, tok, url) = (&env, tok.to_owned(), format!("{}{path}", env.base));
+            async move {
+                let r = env
+                    .http
+                    .put(url)
+                    .bearer_auth(tok)
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                (r.status(), r.json::<Value>().await.unwrap_or(Value::Null))
+            }
+        };
+        let good = json!({ "kind": "threshold", "jail": "sshd", "min_agents": 3, "min_failures": 10, "window": "10m", "bantime": "1h" });
+        assert_eq!(
+            put(&viewer, "/api/v1/correlation/slow", good.clone())
+                .await
+                .0,
+            S::FORBIDDEN
+        );
+        for (what, patch) in [
+            (
+                "quorum of one",
+                json!({ "kind": "quorum", "min_agents": 1 }),
+            ),
+            ("no failures", json!({ "min_failures": 0 })),
+            ("window", json!({ "window": "3d" })),
+            ("bantime", json!({ "bantime": "1s" })),
+            ("kind", json!({ "kind": "magic" })),
+            ("group", json!({ "group": "a b" })),
+        ] {
+            let mut body = good.clone();
+            for (k, v) in patch.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let st = put(&admin, "/api/v1/correlation/slow", body).await.0;
+            assert!(
+                st == S::BAD_REQUEST || st == S::UNPROCESSABLE_ENTITY,
+                "{what}: {st}"
+            );
+        }
+        assert_eq!(
+            put(&admin, "/api/v1/correlation/bad%20name", good.clone())
+                .await
+                .0,
+            S::BAD_REQUEST
+        );
+        let (st, v) = put(&admin, "/api/v1/correlation/slow", good.clone()).await;
+        assert_eq!((st, v["replaced"].as_bool()), (S::OK, Some(false)));
+        let mut q = json!({ "kind": "quorum", "min_agents": 2, "window": "30m", "bantime": "6h", "monitor": true, "group": "web" });
+        assert_eq!(
+            put(&admin, "/api/v1/correlation/agree", q.clone()).await.0,
+            S::OK
+        );
+        q["monitor"] = json!(false);
+        assert_eq!(
+            put(&admin, "/api/v1/correlation/agree", q).await.1["replaced"],
+            true
+        );
+
+        let (st, v) = env
+            .call("GET", "/api/v1/correlation", &viewer, json!({}))
+            .await;
+        assert_eq!(st, S::OK);
+        let rules = v["rules"].as_array().unwrap();
+        assert_eq!(
+            rules
+                .iter()
+                .map(|r| r["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["agree", "slow"]
+        );
+        assert_eq!(
+            (
+                rules[0]["window"].as_str(),
+                rules[0]["monitor"].as_bool(),
+                rules[0]["group"].as_str()
+            ),
+            (Some("30m"), Some(false), Some("web"))
+        );
+        assert_eq!(rules[1]["jail"], "sshd");
+
+        // observations show on the address page
+        env.ctl.correlator.lock().unwrap().record(
+            "sshd",
+            "203.0.113.4/32".parse().unwrap(),
+            crate::correlation::Seen {
+                agent: "web-1".into(),
+                group: "web".into(),
+                at: Utc::now(),
+                failures: 3,
+                banned: false,
+            },
+        );
+        let (_, v) = env
+            .call(
+                "GET",
+                "/api/v1/history?target=203.0.113.0/24",
+                &viewer,
+                json!({}),
+            )
+            .await;
+        assert_eq!(
+            (
+                v["observations"][0]["agent"].as_str(),
+                v["observations"][0]["failures"].as_u64()
+            ),
+            (Some("web-1"), Some(3))
+        );
+
+        let del = |n: &str| {
+            let (env, admin, url) = (
+                &env,
+                admin.clone(),
+                format!("{}/api/v1/correlation/{n}", env.base),
+            );
+            async move {
+                env.http
+                    .delete(url)
+                    .bearer_auth(admin)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(del("slow").await, S::OK);
+        assert_eq!(del("slow").await, S::NOT_FOUND);
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let n = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"].as_str().unwrap().starts_with("correlation."))
+            .count();
+        assert_eq!(n, 4);
         let _ = std::fs::remove_dir_all(&env.dir);
     }
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ApiError, get } from '../lib/api';
-  import { dateTime, origin, remaining, scope, target } from '../lib/format';
+  import { dateTime, origin, relative, remaining, scope, target } from '../lib/format';
   import { onChange } from '../lib/live.svelte';
   import { go, href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
@@ -121,6 +121,29 @@
     </div>
   {/if}
 
+  {#if data.observations.length}
+    <div class="card">
+      <h2>Recent failures across hosts</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>When</th><th>Agent</th><th>Jail</th><th>Address</th><th class="num">Failures</th></tr></thead>
+          <tbody>
+            {#each data.observations.slice(0, 50) as o, i (i)}
+              <tr>
+                <td class="muted" title={dateTime(o.at)}>{relative(o.at)}</td>
+                <td>{o.agent}</td>
+                <td>{o.jail}</td>
+                <td class="mono">{target(o.key)}</td>
+                <td class="num">{#if o.banned}<span class="pill bad">local ban</span>{:else}{o.failures}{/if}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+      <p class="faint small note">Kept in the controller's memory for the longest rule window (at least an hour).</p>
+    </div>
+  {/if}
+
   <div class="card">
     <h2>History</h2>
     {#if data.history.length === 0}
@@ -149,10 +172,7 @@
       </ol>
       {#if data.history.length >= 200}<div class="faint small">Showing the newest 200 decisions.</div>{/if}
     {/if}
-    <p class="faint small note">
-      Log lines and per-host observations are not collected centrally yet; the history shows
-      decisions only.
-    </p>
+    <p class="faint small note">Sample log lines are not collected centrally (privacy).</p>
   </div>
 
   <BanDialog bind:open={banOpen} initialTarget={addr} ondone={load} />

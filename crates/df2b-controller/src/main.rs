@@ -11,6 +11,7 @@
 
 mod api;
 mod central;
+mod correlation;
 mod files;
 mod grpc;
 mod https;

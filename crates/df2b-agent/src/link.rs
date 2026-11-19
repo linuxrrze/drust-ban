@@ -619,7 +619,16 @@ impl Task {
 
     fn push(&mut self, o: v1::Observation) {
         if self.pending.len() >= MAX_PENDING {
-            self.pending.pop_front();
+            // failure counts go first: ban reports drive propagation and
+            // quorum rules
+            match self.pending.iter().position(|p| !p.locally_banned) {
+                Some(i) => {
+                    self.pending.remove(i);
+                }
+                None => {
+                    self.pending.pop_front();
+                }
+            }
             self.dropped += 1;
             if self.dropped.is_power_of_two() {
                 warn!(

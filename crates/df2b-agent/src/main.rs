@@ -187,6 +187,12 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     let mut remote = RemoteBans::default();
+    // failures for the controller's correlation rules (DESIGN.md §4.1)
+    if link.is_some() {
+        engine.collect_observations();
+    }
+    let mut observe = tokio::time::interval(OBSERVATION_INTERVAL);
+    observe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -307,6 +313,27 @@ async fn main() -> anyhow::Result<()> {
                 }
                 apply_remote(&backend, changes);
             }
+            _ = observe.tick() => {
+                if let Some(l) = &link {
+                    let mut full = 0usize;
+                    for (jail, key, o) in engine.take_observations() {
+                        let obs = v1::Observation {
+                            key: key.to_string(),
+                            jail,
+                            count: o.failures,
+                            first_seen_unix_ms: o.first.timestamp_millis(),
+                            last_seen_unix_ms: o.last.timestamp_millis(),
+                            ..Default::default()
+                        };
+                        if l.reports.try_send(obs).is_err() {
+                            full += 1;
+                        }
+                    }
+                    if full > 0 {
+                        warn!(dropped = full, "controller report queue full, dropping failure counts");
+                    }
+                }
+            }
             _ = flush.tick() => {
                 stats.active_bans.store(
                     (engine.active_bans(Utc::now()) + remote.len()) as u64,
@@ -403,6 +430,9 @@ fn jail_status(j: engine::JailStatus) -> v1::JailStatus {
         error: j.error,
     }
 }
+
+/// How often failure counts are sent to the controller.
+const OBSERVATION_INTERVAL: Duration = Duration::from_secs(5);
 
 async fn next_event(link: &mut Option<Link>) -> Option<FromController> {
     match link {

@@ -756,3 +756,100 @@ pub async fn filter_rm(c: &Client, name: &str, json: bool) -> anyhow::Result<()>
     println!("filter {name} deleted");
     Ok(())
 }
+
+pub async fn correlation_list(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/correlation").await?;
+    if json {
+        return json_out(&v);
+    }
+    let rules = v["rules"].as_array().cloned().unwrap_or_default();
+    if rules.is_empty() {
+        println!("no correlation rules");
+    }
+    for r in &rules {
+        let cond = if r["kind"] == "quorum" {
+            format!("banned locally by >= {} agents", r["min_agents"])
+        } else {
+            format!(
+                ">= {} failures from >= {} agents",
+                r["min_failures"], r["min_agents"]
+            )
+        };
+        let mode = if r["enabled"] == false {
+            "off"
+        } else if r["monitor"] == true {
+            "monitor"
+        } else {
+            "active"
+        };
+        println!(
+            "{:<20} {:<8} {cond} within {} -> ban {}  (jail {}, agents {})",
+            s(r, &["name"]),
+            mode,
+            s(r, &["window"]),
+            s(r, &["bantime"]),
+            r["jail"].as_str().unwrap_or("all"),
+            r["group"]
+                .as_str()
+                .map_or("all".to_owned(), |g| format!("group {g}")),
+        );
+    }
+    let hits = v["monitor_hits"].as_array().cloned().unwrap_or_default();
+    if !hits.is_empty() {
+        println!("\nwould have banned (monitor mode):");
+        for h in hits.iter().take(20) {
+            println!(
+                "  {:<24} {:<20} {} agents  {}",
+                s(h, &["target"]),
+                s(h, &["rule"]),
+                h["agents"].as_array().map_or(0, Vec::len),
+                ago(&h["at"])
+            );
+        }
+    }
+    println!(
+        "\naddresses followed: {}; ban propagation: {}",
+        v["tracked_addresses"],
+        s(&v, &["propagate"])
+    );
+    Ok(())
+}
+
+pub async fn correlation_set(
+    c: &Client,
+    name: &str,
+    body: Value,
+    json: bool,
+) -> anyhow::Result<()> {
+    let v = c
+        .put(&format!("/api/v1/correlation/{name}"), body.clone())
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    let mode = if body["monitor"] == true {
+        " (monitor mode: only records)"
+    } else {
+        ""
+    };
+    println!(
+        "rule {name} {}{mode}",
+        if v["replaced"] == true {
+            "replaced"
+        } else {
+            "created"
+        }
+    );
+    Ok(())
+}
+
+pub async fn correlation_rm(c: &Client, name: &str, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .delete(&format!("/api/v1/correlation/{name}"), &[])
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("rule {name} deleted");
+    Ok(())
+}

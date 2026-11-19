@@ -78,6 +78,74 @@ fn event(e: Event) -> v1::DecisionEvent {
     v1::DecisionEvent { event: Some(e) }
 }
 
+impl Service {
+    /// Feeds observations into the correlator and returns the rules that
+    /// fired, and how many observations were over the agent's rate.
+    fn correlate(
+        &self,
+        record: &crate::store::AgentRecord,
+        batch: &[v1::Observation],
+        now: chrono::DateTime<Utc>,
+    ) -> (Vec<crate::correlation::Trigger>, u32) {
+        use crate::correlation::{Seen, MAX_WINDOW};
+        let rules = self.ctl.rules();
+        // agent timestamps in controller time (skew from heartbeats)
+        let skew = chrono::Duration::milliseconds(self.ctl.clock_skew_ms(&record.id));
+        let oldest = now - chrono::Duration::from_std(MAX_WINDOW).unwrap_or_default();
+        let mut parsed = Vec::new();
+        for o in batch {
+            let banned = o.locally_banned;
+            if !banned && o.count == 0 {
+                continue;
+            }
+            let Ok(net) = o.key.parse::<IpNet>().map(|n| n.trunc()) else {
+                continue;
+            };
+            if too_broad(&net) || self.ctl.allowlisted(&net) {
+                continue;
+            }
+            let at = from_unix_ms(o.last_seen_unix_ms).map_or(now, |t| (t + skew).min(now));
+            if at < oldest {
+                continue;
+            }
+            parsed.push((
+                o.jail.clone(),
+                net,
+                at,
+                if banned { 0 } else { o.count },
+                banned,
+            ));
+        }
+        let mut c = self
+            .ctl
+            .correlator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut triggers = Vec::new();
+        let mut dropped = 0;
+        for (jail, net, at, failures, banned) in parsed {
+            if !c.admit(&record.id, now) {
+                dropped += 1;
+                continue;
+            }
+            let seen = Seen {
+                agent: record.id.clone(),
+                group: record.group.clone(),
+                at,
+                failures,
+                banned,
+            };
+            if c.record(&jail, net, seen) {
+                triggers.extend(c.evaluate(&rules, &jail, net, &record.group, now));
+            }
+        }
+        if dropped > 0 {
+            warn!(agent = %record.id, dropped, "observation rate limit reached");
+        }
+        (triggers, dropped)
+    }
+}
+
 #[tonic::async_trait]
 impl AgentService for Service {
     async fn enroll(
@@ -225,7 +293,57 @@ impl AgentService for Service {
             Propagate::Off => None,
         };
         let mut new = Vec::new();
-        // TODO: aggregate non-ban observations for correlation (§4.2)
+        let (triggers, dropped) = self.correlate(&record, &batch, now);
+        if !triggers.is_empty() {
+            let active = self.ctl.active_decisions();
+            for t in triggers {
+                let scope = self
+                    .ctl
+                    .rules()
+                    .iter()
+                    .find(|r| r.name == t.rule)
+                    .and_then(|r| r.group.clone())
+                    .map_or(Scope::Global, Scope::Group);
+                let what = if t.failures > 0 {
+                    format!("{} failures from {} agents", t.failures, t.agents.len())
+                } else {
+                    format!("banned locally by {} agents", t.agents.len())
+                };
+                if t.monitor {
+                    info!(rule = %t.rule, target = %t.target, jail = %t.jail, agents = ?t.agents, "correlation (monitor): would ban, {what}");
+                    continue;
+                }
+                // already banned there (by anyone): nothing to add
+                let covered = active.iter().any(|d| {
+                    matches!(d.kind, DecisionKind::Ban)
+                        && d.target.contains(&t.target)
+                        && (d.scope == Scope::Global || d.scope == scope)
+                });
+                if covered {
+                    continue;
+                }
+                let bantime = self
+                    .ctl
+                    .rules()
+                    .iter()
+                    .find(|r| r.name == t.rule)
+                    .map(|r| r.bantime)
+                    .unwrap_or(Duration::from_secs(3600));
+                new.push(NewDecision {
+                    kind: DecisionKind::Ban,
+                    target: t.target,
+                    scope,
+                    jail: Some(t.jail.clone()),
+                    expires_at: chrono::Duration::from_std(bantime).ok().map(|d| now + d),
+                    origin: Origin::Correlation(t.rule.clone()),
+                    reason: format!(
+                        "correlation rule {}: {what} ({})",
+                        t.rule,
+                        t.agents.join(", ")
+                    ),
+                });
+            }
+        }
         for o in batch.iter().filter(|o| o.locally_banned) {
             let Some(scope) = scope.clone() else { break };
             let Ok(net) = o.key.parse::<IpNet>().map(|n| n.trunc()) else {
@@ -266,8 +384,9 @@ impl AgentService for Service {
             }
         }
         Ok(Response::new(v1::ReportAck {
-            accepted,
-            retry_after_ms: 0,
+            accepted: accepted.saturating_sub(dropped),
+            // over the per-agent rate: slow down
+            retry_after_ms: if dropped > 0 { 60_000 } else { 0 },
         }))
     }
 
@@ -959,6 +1078,125 @@ mod tests {
             panic!("update expected")
         };
         assert!(c.jails.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn correlation_rules() {
+        use crate::correlation::{Rule, RuleKind};
+        let dir = std::env::temp_dir().join(format!("df2b-ctl-grpc-corr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (addr, ctl) = start(&dir).await;
+        let mut a = enrolled(&addr, &ctl, &dir, "host-1").await;
+        let mut b = enrolled(&addr, &ctl, &dir, "host-2").await;
+        let rule =
+            |name: &str, kind: RuleKind, min_agents: u32, min_failures: u32, monitor: bool| Rule {
+                name: name.into(),
+                kind,
+                jail: Some("sshd".into()),
+                group: None,
+                min_agents,
+                min_failures,
+                window: Duration::from_secs(600),
+                bantime: Duration::from_secs(7200),
+                enabled: true,
+                monitor,
+                updated_by: "ada".into(),
+                updated_at: Utc::now(),
+            };
+        let fails = |key: &str, n: u32, ago_secs: i64| v1::Observation {
+            key: key.into(),
+            jail: "sshd".into(),
+            count: n,
+            last_seen_unix_ms: (Utc::now() - chrono::Duration::seconds(ago_secs))
+                .timestamp_millis(),
+            ..Default::default()
+        };
+        let report = |obs: Vec<v1::Observation>| v1::ObservationBatch { observations: obs };
+
+        // threshold: 4 failures from 2 agents
+        ctl.set_rule(rule("distributed", RuleKind::Threshold, 2, 4, false))
+            .unwrap();
+        a.report(report(vec![fails("203.0.113.9/32", 2, 0)]))
+            .await
+            .unwrap();
+        // b's failures from an hour ago (queued while offline) do not count
+        b.report(report(vec![fails("203.0.113.9/32", 2, 3600)]))
+            .await
+            .unwrap();
+        assert_eq!(ctl.last_seq(), 0);
+        b.report(report(vec![fails("203.0.113.9/32", 2, 1)]))
+            .await
+            .unwrap();
+        let d = ctl.active_decisions();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].origin, Origin::Correlation("distributed".into()));
+        assert_eq!(
+            (d[0].target.to_string(), d[0].scope.clone()),
+            ("203.0.113.9/32".into(), Scope::Global)
+        );
+        assert!(
+            d[0].reason.contains("4 failures from 2 agents"),
+            "{}",
+            d[0].reason
+        );
+        let left = d[0].expires_at.unwrap() - Utc::now();
+        assert!(left > chrono::Duration::minutes(119), "rule bantime");
+        // more failures: no second decision
+        a.report(report(vec![fails("203.0.113.9/32", 5, 0)]))
+            .await
+            .unwrap();
+        assert_eq!(ctl.last_seq(), 1);
+        // allowlisted addresses are never correlated
+        a.report(report(vec![fails("10.1.1.1/32", 50, 0)]))
+            .await
+            .unwrap();
+        b.report(report(vec![fails("10.1.1.1/32", 50, 0)]))
+            .await
+            .unwrap();
+        assert_eq!(ctl.last_seq(), 1);
+
+        // quorum with propagation off: one local ban is not enough, two are
+        ctl.set_propagate(crate::state::Propagate::Off).unwrap();
+        ctl.set_rule(rule("two-agree", RuleKind::Quorum, 2, 0, false))
+            .unwrap();
+        a.report(report(vec![obs("198.51.100.20/32", true)]))
+            .await
+            .unwrap();
+        assert_eq!(ctl.last_seq(), 1, "a single agent cannot ban");
+        b.report(report(vec![obs("198.51.100.20/32", true)]))
+            .await
+            .unwrap();
+        assert_eq!(ctl.last_seq(), 2);
+        assert!(ctl
+            .active_decisions()
+            .iter()
+            .any(|d| d.origin == Origin::Correlation("two-agree".into())));
+
+        // monitor mode: recorded, not banned
+        ctl.remove_rule("distributed").unwrap();
+        ctl.set_rule(rule("try-it", RuleKind::Threshold, 1, 3, true))
+            .unwrap();
+        a.report(report(vec![fails("192.0.2.200/32", 3, 0)]))
+            .await
+            .unwrap();
+        assert_eq!(ctl.last_seq(), 2);
+        let hits = ctl.correlator.lock().unwrap().hits();
+        assert_eq!(
+            (
+                hits.len(),
+                hits[0].rule.as_str(),
+                hits[0].target.to_string()
+            ),
+            (1, "try-it", "192.0.2.200/32".into())
+        );
+        // the address page sees the observations
+        let recent = ctl
+            .correlator
+            .lock()
+            .unwrap()
+            .recent(&"203.0.113.0/24".parse().unwrap());
+        assert!(recent.len() >= 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

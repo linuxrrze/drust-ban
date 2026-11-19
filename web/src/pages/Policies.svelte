@@ -4,7 +4,9 @@
   import { href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
   import { notify } from '../lib/toast.svelte';
-  import type { CentralFilter, JailDefinition, JailInfo, JailOverride, JailView, Policies, Propagate } from '../lib/types';
+  import RuleDialog from '../components/RuleDialog.svelte';
+  import { relative } from '../lib/format';
+  import type { CorrelationHit, CorrelationRule, CentralFilter, JailDefinition, JailInfo, JailOverride, JailView, Policies, Propagate } from '../lib/types';
   import Dialog from '../components/Dialog.svelte';
   import FilterDialog from '../components/FilterDialog.svelte';
   import JailDefDialog from '../components/JailDefDialog.svelte';
@@ -17,6 +19,11 @@
   let dialogOpen = $state(false);
   let editing = $state<JailInfo | null>(null);
   let defs = $state<JailDefinition[]>([]);
+  let rules = $state<CorrelationRule[]>([]);
+  let hits = $state<CorrelationHit[]>([]);
+  let tracked = $state(0);
+  let ruleOpen = $state(false);
+  let editingRule = $state<CorrelationRule | null>(null);
   let filters = $state<CentralFilter[]>([]);
   let defOpen = $state(false);
   let editingDef = $state<JailDefinition | null>(null);
@@ -28,16 +35,20 @@
   const modes: { id: Propagate; title: string; text: string }[] = [
     { id: 'global', title: 'Everywhere', text: 'A ban on one host is applied on all agents.' },
     { id: 'group', title: 'Within the group', text: "A ban on one host is applied on the agents of that host's group." },
-    { id: 'off', title: 'Only locally', text: 'Each agent bans for itself; the controller only distributes manual bans.' },
+    { id: 'off', title: 'Only locally', text: 'Each agent bans for itself; the controller distributes manual bans and those of correlation rules (e.g. a quorum).' },
   ];
 
   async function load() {
     try {
-      const [p, d, f] = await Promise.all([
+      const [p, d, f, c] = await Promise.all([
         get<Policies>('/policies'),
         get<{ definitions: JailDefinition[] }>('/jail-definitions'),
         get<{ filters: CentralFilter[] }>('/filters'),
+        get<{ rules: CorrelationRule[]; monitor_hits: CorrelationHit[]; tracked_addresses: number }>('/correlation'),
       ]);
+      rules = c.rules;
+      hits = c.monitor_hits;
+      tracked = c.tracked_addresses;
       data = p;
       defs = d.definitions;
       filters = f.filters;
@@ -89,6 +100,19 @@
     } catch (e) {
       notify(e instanceof ApiError ? e.message : String(e), 'error');
     }
+  }
+
+  function describe(r: CorrelationRule): string {
+    const who = `${r.min_agents} agent${r.min_agents === 1 ? '' : 's'}`;
+    const cond = r.kind === 'threshold' ? `≥ ${r.min_failures} failures from ≥ ${who}` : `banned locally by ≥ ${who}`;
+    return `${cond} within ${r.window} → ban ${r.bantime}`;
+  }
+
+  function removeRule(r: CorrelationRule) {
+    ask(`Delete rule ${r.name}?`, 'Bans it made stay until they expire.', async () => {
+      await api('DELETE', `/correlation/${encodeURIComponent(r.name)}`);
+      notify(`Rule ${r.name} deleted`);
+    });
   }
 
   function removeDef(d: JailDefinition) {
@@ -237,6 +261,66 @@
 {#if data}
   <div class="card section">
     <div class="row head">
+      <h2>Correlation rules</h2>
+      <span class="spacer"></span>
+      {#if can('admin')}<button onclick={() => { editingRule = null; ruleOpen = true; }}>New rule…</button>{/if}
+    </div>
+    <p class="muted">
+      The controller bans on what several agents saw together: attacks spread thinly over many hosts,
+      or a quorum of hosts that banned an address. Agents report their failures every few seconds;
+      {tracked.toLocaleString()} {tracked === 1 ? 'address is' : 'addresses are'} being followed.
+    </p>
+    {#if rules.length === 0}
+      <div class="empty">No correlation rules.</div>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Rule</th><th>Condition</th><th>Jail</th><th>Agents</th><th>Mode</th>{#if can('admin')}<th></th>{/if}</tr></thead>
+          <tbody>
+            {#each rules as r (r.name)}
+              <tr>
+                <td><strong>{r.name}</strong></td>
+                <td>{describe(r)}</td>
+                <td>{r.jail ?? 'all'}</td>
+                <td>{r.group ? `group ${r.group}` : 'all'}</td>
+                <td>
+                  {#if !r.enabled}<span class="pill plain">off</span>
+                  {:else if r.monitor}<span class="pill warn">monitor</span>
+                  {:else}<span class="pill good">active</span>{/if}
+                </td>
+                {#if can('admin')}
+                  <td class="nowrap">
+                    <button class="link" onclick={() => { editingRule = r; ruleOpen = true; }}>Edit…</button>
+                    · <button class="link danger-link" onclick={() => removeRule(r)}>Delete</button>
+                  </td>
+                {/if}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+    {#if hits.length}
+      <h2 class="sub">Would have banned (monitor mode)</h2>
+      <div class="table-wrap">
+        <table>
+          <tbody>
+            {#each hits.slice(0, 20) as h (h.rule + h.target + h.at)}
+              <tr>
+                <td class="mono"><a href={href('ip', h.target)}>{h.target}</a></td>
+                <td>{h.rule}</td>
+                <td class="muted small">{h.failures ? `${h.failures} failures, ` : ''}{h.agents.length} agents ({h.agents.join(', ')})</td>
+                <td class="faint small">{relative(h.at)}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </div>
+
+  <div class="card section">
+    <div class="row head">
       <h2>Jail definitions</h2>
       <span class="spacer"></span>
       {#if can('admin')}<button onclick={() => { editingDef = null; defOpen = true; }}>Define a jail…</button>{/if}
@@ -312,6 +396,7 @@
 <JailDialog bind:open={dialogOpen} jail={editing} groups={data?.groups ?? []} ondone={load} />
 <JailDefDialog bind:open={defOpen} def={editingDef} groups={data?.groups ?? []} filters={filters.map((f) => f.name)} ondone={load} />
 <FilterDialog bind:open={filterOpen} filter={editingFilter} ondone={load} />
+<RuleDialog bind:open={ruleOpen} rule={editingRule} jails={data?.jails.map((j) => j.name) ?? []} groups={data?.groups ?? []} ondone={load} />
 <Dialog bind:open={confirmOpen} title={confirm?.title ?? ''} onsubmit={runConfirm}>
   <p class="muted confirm-text">{confirm?.text}</p>
   <div class="actions">
@@ -337,5 +422,6 @@
   .sources { max-width: 280px; overflow-wrap: anywhere; }
   .nowrap { white-space: nowrap; }
   .danger-link { color: var(--bad); }
+  .sub { margin-top: 8px; }
   p.confirm-text { margin: 0; }
 </style>

@@ -109,6 +109,17 @@ impl JailParams {
     }
 }
 
+/// Failures of one key in one jail during a report interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Observed {
+    pub failures: u32,
+    pub first: DateTime<Utc>,
+    pub last: DateTime<Utc>,
+}
+
+/// Keys per report interval (memory bound).
+const MAX_OBSERVED: usize = 50_000;
+
 /// Status of a jail for heartbeats.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JailStatus {
@@ -156,6 +167,9 @@ pub struct Engine {
     filter_dir: std::path::PathBuf,
     /// Central jails that do not run: (jail, filter, reason).
     central_errors: Vec<(String, String, String)>,
+    /// Failures per (jail, key) since the last `take_observations`, for
+    /// the controller's correlation (only with a controller).
+    observations: Option<HashMap<(String, IpKey), Observed>>,
     /// From the agent's configuration.
     allowlist: Allowlist,
     /// The controller's allowlist (replaced on every update).
@@ -193,6 +207,7 @@ impl Engine {
             jails,
             filter_dir: cfg.agent.filter_dir.clone(),
             central_errors: Vec::new(),
+            observations: None,
             allowlist: Allowlist::new(cfg.agent.allowlist.iter().copied()),
             central: Allowlist::default(),
             prefix: PrefixPolicy {
@@ -261,6 +276,23 @@ impl Engine {
             if allowed(&self.allowlist, &self.central, &m.ip, &key.net()) {
                 debug!(ip = %m.ip, jail = %jail.name, "allowlisted, ignoring");
                 continue;
+            }
+            if let Some(obs) = self.observations.as_mut() {
+                let k = (jail.name.clone(), key);
+                if let Some(o) = obs.get_mut(&k) {
+                    o.failures = o.failures.saturating_add(1);
+                    o.first = o.first.min(ts);
+                    o.last = o.last.max(ts);
+                } else if obs.len() < MAX_OBSERVED {
+                    obs.insert(
+                        k,
+                        Observed {
+                            failures: 1,
+                            first: ts,
+                            last: ts,
+                        },
+                    );
+                }
             }
             if !jail.tracker.record(key, ts, now) {
                 continue;
@@ -338,6 +370,19 @@ impl Engine {
             j.factor = p.factor;
             j.max_bantime = p.max_bantime;
             j.overridden = changed;
+        }
+    }
+
+    /// Starts counting failures for the controller.
+    pub fn collect_observations(&mut self) {
+        self.observations.get_or_insert_with(HashMap::new);
+    }
+
+    /// Failures counted since the last call.
+    pub fn take_observations(&mut self) -> Vec<(String, IpKey, Observed)> {
+        match self.observations.as_mut() {
+            Some(o) => o.drain().map(|((j, k), v)| (j, k, v)).collect(),
+            None => Vec::new(),
         }
     }
 
@@ -887,6 +932,34 @@ mod tests {
         e.set_central_jails(&[], &filters, vec![]);
         let names: Vec<_> = e.jail_status(now).into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["sshd"]);
+    }
+
+    #[test]
+    fn observations_for_the_controller() {
+        let mut e = engine(); // sshd: maxretry 2
+        let now = Utc::now();
+        e.process(&line("auth", "203.0.113.1"), now);
+        assert!(e.take_observations().is_empty(), "off without a controller");
+        e.collect_observations();
+        e.process(&line("auth", "203.0.113.1"), now); // second failure: ban
+        e.process(&line("auth", "203.0.113.1"), now); // banned: not counted
+        e.process(&line("auth", "198.51.100.2"), now);
+        e.process(&line("auth", "10.0.0.1"), now); // allowlisted
+        e.process(&line("nginx", "198.51.100.2"), now); // no jail for it
+        let mut obs: Vec<_> = e
+            .take_observations()
+            .into_iter()
+            .map(|(j, k, o)| (j, k.to_string(), o.failures))
+            .collect();
+        obs.sort();
+        assert_eq!(
+            obs,
+            [
+                ("sshd".to_string(), "198.51.100.2/32".to_string(), 1),
+                ("sshd".to_string(), "203.0.113.1/32".to_string(), 1),
+            ]
+        );
+        assert!(e.take_observations().is_empty(), "drained");
     }
 
     #[test]

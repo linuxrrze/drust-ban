@@ -118,6 +118,9 @@ enum Command {
     /// Show jails.
     #[command(subcommand)]
     Jails(JailsCmd),
+    /// Correlation rules (DESIGN.md §4.2).
+    #[command(subcommand)]
+    Correlation(CorrelationCmd),
     /// Show or set (admin) where agents' local bans apply: global, group or
     /// off.
     Propagate {
@@ -282,6 +285,53 @@ enum JailsCmd {
         #[arg(long)]
         group: Option<String>,
     },
+}
+
+/// Correlation rules: bans from what several agents observed (admin).
+#[derive(Debug, Subcommand)]
+enum CorrelationCmd {
+    /// Rules, monitor-mode hits and tracked addresses.
+    List,
+    /// Create or replace a rule. New rules are best tried with --monitor.
+    Set {
+        name: String,
+        #[arg(long, value_enum)]
+        kind: RuleKindArg,
+        /// Failures in total (threshold rules).
+        #[arg(long)]
+        min_failures: Option<u32>,
+        /// Different agents.
+        #[arg(long)]
+        min_agents: u32,
+        /// e.g. 10m (1m..24h)
+        #[arg(long)]
+        window: String,
+        /// e.g. 1h
+        #[arg(long)]
+        bantime: String,
+        /// Only this jail (default: all).
+        #[arg(long)]
+        jail: Option<String>,
+        /// Only this group's agents count, and the ban applies there.
+        #[arg(long)]
+        group: Option<String>,
+        /// Only record what would be banned.
+        #[arg(long)]
+        monitor: bool,
+        #[arg(long)]
+        disabled: bool,
+    },
+    Rm {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RuleKindArg {
+    /// at least N failures from at least M agents within the window
+    Threshold,
+    /// at least M agents banned the address locally within the window
+    Quorum,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -487,6 +537,33 @@ async fn run() -> anyhow::Result<()> {
                 }
                 FilterCmd::Rm { name } => commands::filter_rm(&c, &name, json).await,
                 FilterCmd::Test { .. } => unreachable!("handled before connecting"),
+            }
+        }
+        Command::Correlation(cmd) => {
+            let c = client()?;
+            match cmd {
+                CorrelationCmd::List => commands::correlation_list(&c, json).await,
+                CorrelationCmd::Set {
+                    name,
+                    kind,
+                    min_failures,
+                    min_agents,
+                    window,
+                    bantime,
+                    jail,
+                    group,
+                    monitor,
+                    disabled,
+                } => {
+                    let body = serde_json::json!({
+                        "kind": format!("{kind:?}").to_lowercase(),
+                        "min_failures": min_failures.unwrap_or(0), "min_agents": min_agents,
+                        "window": window, "bantime": bantime, "jail": jail, "group": group,
+                        "monitor": monitor, "enabled": !disabled,
+                    });
+                    commands::correlation_set(&c, &name, body, json).await
+                }
+                CorrelationCmd::Rm { name } => commands::correlation_rm(&c, &name, json).await,
             }
         }
         Command::Propagate { mode } => {

@@ -159,6 +159,9 @@ pub struct Controller {
     /// Central filters and jail definitions; streams send each agent its
     /// group's part.
     central_tx: tokio::sync::watch::Sender<Arc<crate::central::CentralConfig>>,
+    /// Correlation rules (stored) and what agents observed (memory).
+    rules: Mutex<Arc<Vec<crate::correlation::Rule>>>,
+    pub correlator: Mutex<crate::correlation::Correlator>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -289,6 +292,7 @@ impl Controller {
         );
         let jail_tx = tokio::sync::watch::channel(Arc::new(store.jail_overrides()?)).0;
         let central_tx = tokio::sync::watch::channel(Arc::new(store.central_config()?)).0;
+        let rules = Mutex::new(Arc::new(store.rules()?));
         // a stored change wins over the default; an explicit flag is
         // applied by main.rs with set_propagate
         let propagate = store
@@ -322,6 +326,8 @@ impl Controller {
             propagate: Mutex::new(propagate),
             jail_write: Mutex::new(()),
             central_tx,
+            rules,
+            correlator: Mutex::new(Default::default()),
         })
     }
 
@@ -513,6 +519,11 @@ impl Controller {
         inner.hourly.retain(|h, _| *h >= oldest);
         drop(inner);
         self.sessions.prune();
+        let keep = crate::correlation::keep_for(&self.rules());
+        self.correlator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prune(now, keep);
         if let Err(e) = self.prune_allowlist() {
             tracing::warn!(error = %format!("{e:#}"), "pruning the allowlist failed");
         }
@@ -712,6 +723,42 @@ impl Controller {
         // only what is stored reaches the agents
         self.jail_tx.send_replace(Arc::new(v));
         Ok(prev)
+    }
+
+    pub fn rules(&self) -> Arc<Vec<crate::correlation::Rule>> {
+        self.rules.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Stores a rule (replacing one with the same name). Blocking.
+    pub fn set_rule(
+        &self,
+        r: crate::correlation::Rule,
+    ) -> anyhow::Result<Option<crate::correlation::Rule>> {
+        let mut rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
+        self.store.put_rule(&r)?;
+        let mut v = (**rules).clone();
+        let prev = v.iter().position(|x| x.name == r.name).map(|i| v.remove(i));
+        v.push(r);
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        *rules = Arc::new(v);
+        Ok(prev)
+    }
+
+    /// False if there is no such rule. Blocking.
+    pub fn remove_rule(&self, name: &str) -> anyhow::Result<bool> {
+        let mut rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.store.delete_rule(name)? {
+            return Ok(false);
+        }
+        let mut v = (**rules).clone();
+        v.retain(|x| x.name != name);
+        *rules = Arc::new(v);
+        Ok(true)
+    }
+
+    /// controller time - agent time, from the last heartbeat.
+    pub fn clock_skew_ms(&self, agent: &str) -> i64 {
+        self.lock().status.get(agent).map_or(0, |s| s.clock_skew_ms)
     }
 
     pub fn central(&self) -> Arc<crate::central::CentralConfig> {
