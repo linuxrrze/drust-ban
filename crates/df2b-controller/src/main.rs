@@ -36,8 +36,6 @@ use chrono::SecondsFormat;
 use clap::{Parser, Subcommand};
 use df2b_core::Allowlist;
 use df2b_proto::v1::agent_service_server::AgentServiceServer;
-use df2b_tls::pki::key_from_pem;
-use df2b_tls::CertificateDer;
 use ipnet::IpNet;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -339,17 +337,6 @@ fn user(dir: &std::path::Path, cmd: UserCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_pem_chain(path: &std::path::Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    use df2b_tls::pki::certs_from_pem;
-    let pem =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let certs = certs_from_pem(&pem)?;
-    if certs.is_empty() {
-        bail!("{}: no certificates", path.display());
-    }
-    Ok(certs)
-}
-
 async fn serve(args: Args) -> anyhow::Result<()> {
     let a = args.serve;
     let dir = args.state_dir;
@@ -409,15 +396,15 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         );
 
     // REST API: operator certificate or the internal one
-    let https_tls = match (&a.https_cert, &a.https_key) {
-        (Some(cert), Some(key)) => {
-            let chain = read_pem_chain(cert)?;
-            let key_pem = std::fs::read_to_string(key)
-                .with_context(|| format!("reading {}", key.display()))?;
-            df2b_tls::transport::https_server_config(chain, key_from_pem(&key_pem)?)?
-        }
-        _ => df2b_tls::transport::https_server_config(chain, key)?,
+    // (an operator certificate is loaded again when its files change)
+    let mut cert_files = match (&a.https_cert, &a.https_key) {
+        (Some(cert), Some(key)) => Some(https::CertFiles::new(cert.clone(), key.clone())),
+        _ => None,
     };
+    let https_tls = https::TlsConfig::from(match &mut cert_files {
+        Some(f) => f.load()?,
+        None => df2b_tls::transport::https_server_config(chain, key)?,
+    });
     let https_listener = tokio::net::TcpListener::bind(a.https_listen)
         .await
         .with_context(|| format!("binding {}", a.https_listen))?;
@@ -428,7 +415,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     );
     let rest = https::serve(
         https_listener,
-        https_tls,
+        https_tls.clone(),
         api::router_with_limit(
             ctl.clone(),
             ratelimit::ApiLimit {
@@ -449,6 +436,9 @@ async fn serve(args: Args) -> anyhow::Result<()> {
             let mut t = tokio::time::interval(Duration::from_secs(60));
             loop {
                 t.tick().await;
+                if let Some(f) = &mut cert_files {
+                    f.reload_if_changed(&https_tls);
+                }
                 // may write (expired allowlist entries): off the runtime
                 let (c, dir) = (ctl.clone(), dir.clone());
                 let _ = tokio::task::spawn_blocking(move || {

@@ -350,7 +350,12 @@ Rules:
   proxy every client has the proxy's address). Idle buckets are dropped;
   beyond 50 000 clients the rest share one bucket. Failed logins keep
   their own stricter limit.
-- Not yet: OpenAPI, certificate hot reload.
+- **Certificate reload**: an operator certificate (`--https-cert`,
+  `--https-key`) is checked once a minute (content hashes) and loaded again
+  when it changed, e.g. after a renewal; new connections use it. A pair
+  that does not fit (key not matching, caught half written) is logged and
+  the current certificate kept until the next check.
+- Not yet: OpenAPI.
 
 ### 4.5 Abuse safeguards
 
