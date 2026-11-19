@@ -16,7 +16,7 @@ pub mod file;
 pub mod journald;
 pub mod watch;
 
-pub use file::{FileSource, FileTailer};
+pub use file::{Ended, FileSource, FileTailer};
 #[cfg(feature = "journald")]
 pub use journald::JournaldSource;
 
@@ -55,6 +55,10 @@ pub struct SourceBatch {
     pub position: Option<Position>,
     /// Bytes not read yet after this batch (files: how far behind).
     pub backlog: Option<u64>,
+    /// A file the source stopped following because it is gone (a glob
+    /// match deleted or rotated away): its saved position can be dropped.
+    /// Sent with no lines.
+    pub gone: Option<PathBuf>,
 }
 
 /// The last error of each source that stopped reading (or one of whose

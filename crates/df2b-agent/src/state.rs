@@ -112,6 +112,44 @@ pub fn journald_position_key(source: &str) -> String {
     format!("journald:{source}")
 }
 
+/// A configured source, for [`stale_positions`].
+pub enum KnownSource<'a> {
+    Journald(&'a str),
+    /// Name and configured paths (literal or glob).
+    Files(&'a str, &'a [PathBuf]),
+}
+
+/// Saved positions nobody will resume from: of sources no longer
+/// configured, and of files that are gone unless configured by their
+/// literal path (a file rotated away while the agent was down is found
+/// through that position). Glob matches that are gone are not followed
+/// again; a new file at that path is read from its start anyway.
+pub fn stale_positions(
+    positions: &HashMap<String, Position>,
+    sources: &[KnownSource<'_>],
+) -> Vec<String> {
+    positions
+        .iter()
+        .filter(|(key, pos)| match pos {
+            Position::JournalCursor(_) => !sources.iter().any(
+                |s| matches!(s, KnownSource::Journald(n) if journald_position_key(n) == **key),
+            ),
+            Position::File { path, .. } => {
+                let Some(paths) = sources.iter().find_map(|s| match s {
+                    KnownSource::Files(n, paths) if file_position_key(n, path) == **key => {
+                        Some(*paths)
+                    }
+                    _ => None,
+                }) else {
+                    return true; // source gone
+                };
+                !paths.iter().any(|p| p == path) && !path.exists()
+            }
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 fn offender_key(jail: &str, key: &IpKey) -> String {
     format!("{jail}|{key}")
 }
@@ -119,7 +157,8 @@ fn offender_key(jail: &str, key: &IpKey) -> String {
 /// Changes not yet committed.
 #[derive(Debug, Default)]
 pub struct Pending {
-    positions: HashMap<String, Position>,
+    /// `None` = delete
+    positions: HashMap<String, Option<Position>>,
     /// `None` = delete
     offenders: HashMap<String, Option<OffenderRecord>>,
 }
@@ -127,7 +166,12 @@ pub struct Pending {
 impl Pending {
     pub fn set_position(&mut self, source: &str, position: Position) {
         self.positions
-            .insert(position_key(source, &position), position);
+            .insert(position_key(source, &position), Some(position));
+    }
+
+    /// Drops a saved position (by its key).
+    pub fn forget_position(&mut self, key: String) {
+        self.positions.insert(key, None);
     }
 
     pub fn set_offender(&mut self, record: OffenderRecord) {
@@ -328,7 +372,14 @@ impl State {
         {
             let mut positions = tx.open_table(POSITIONS)?;
             for (k, p) in &pending.positions {
-                positions.insert(k.as_str(), serde_json::to_vec(p)?.as_slice())?;
+                match p {
+                    Some(p) => {
+                        positions.insert(k.as_str(), serde_json::to_vec(p)?.as_slice())?;
+                    }
+                    None => {
+                        positions.remove(k.as_str())?;
+                    }
+                }
             }
             let mut offenders = tx.open_table(OFFENDERS)?;
             for (k, r) in &pending.offenders {
@@ -400,6 +451,8 @@ mod tests {
             let mut p = Pending::default();
             p.set_position("sshd", Position::JournalCursor("s=abc;i=2".into()));
             p.forget_offender("sshd", &record("2001:db8::1", 1).key);
+            p.set_position("gone", Position::JournalCursor("x".into()));
+            p.forget_position(journald_position_key("gone"));
             s.flush(p).unwrap();
         }
         let s = State::open(&dir).unwrap();
@@ -414,6 +467,57 @@ mod tests {
         ));
         assert_eq!(l.offenders.len(), 1);
         assert_eq!(l.offenders[0].offenses, 2);
+        assert_eq!(l.positions.len(), 2, "forgotten position not written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_positions_are_found() {
+        let dir = tmp("stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("app-1.log");
+        std::fs::write(&live, "").unwrap();
+        let file = |p: &Path| Position::File {
+            path: p.to_owned(),
+            dev: 1,
+            ino: 2,
+            offset: 3,
+        };
+        let literal = PathBuf::from("/var/log/auth.log"); // missing, but configured
+        let gone = dir.join("app-0.log");
+        let mut positions = HashMap::new();
+        for (src, p) in [
+            ("auth", &literal),
+            ("apps", &live),
+            ("apps", &gone),
+            ("old", &live),
+        ] {
+            positions.insert(file_position_key(src, p), file(p));
+        }
+        positions.insert(
+            journald_position_key("sshd"),
+            Position::JournalCursor("c".into()),
+        );
+        positions.insert(
+            journald_position_key("removed"),
+            Position::JournalCursor("c".into()),
+        );
+        let auth = [literal.clone()];
+        let apps = [dir.join("app-*.log")];
+        let known = [
+            KnownSource::Journald("sshd"),
+            KnownSource::Files("auth", &auth),
+            KnownSource::Files("apps", &apps),
+        ];
+        let mut stale = stale_positions(&positions, &known);
+        stale.sort();
+        let mut want = vec![
+            file_position_key("apps", &gone),
+            file_position_key("old", &live),
+            journald_position_key("removed"),
+        ];
+        want.sort();
+        assert_eq!(stale, want);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

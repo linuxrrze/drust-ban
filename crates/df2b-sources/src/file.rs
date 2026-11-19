@@ -60,6 +60,15 @@ pub fn check_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Why a tailer stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// The receiver is gone (shutting down).
+    Closed,
+    /// The file is gone and read to its end ([`FileTailer::exit_when_gone`]).
+    Gone,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileTailer {
     source: Arc<str>,
@@ -172,6 +181,7 @@ impl FileTailer {
             lines,
             position,
             backlog: Some(backlog),
+            gone: None,
         })
         .await
         .is_ok()
@@ -294,7 +304,7 @@ impl FileTailer {
 
     /// Runs until the receiver is dropped (or, with [`Self::exit_when_gone`],
     /// the file is gone).
-    pub async fn run(self, tx: mpsc::Sender<SourceBatch>) -> anyhow::Result<()> {
+    pub async fn run(self, tx: mpsc::Sender<SourceBatch>) -> anyhow::Result<Ended> {
         info!(source = %self.source, path = %self.path.display(), "tailing file");
         let mut open: Option<Open> = None;
         let mut first = true;
@@ -313,7 +323,7 @@ impl FileTailer {
 
         loop {
             if tx.is_closed() {
-                return Ok(());
+                return Ok(Ended::Closed);
             }
             let Some(cur) = open.as_mut() else {
                 match self.open_next(first).await {
@@ -321,7 +331,7 @@ impl FileTailer {
                         first = false;
                         open = Some(o);
                     }
-                    None if self.exit_when_gone => return Ok(()),
+                    None if self.exit_when_gone => return Ok(Ended::Gone),
                     None => self.idle(&mut watches, None, None).await,
                 }
                 continue;
@@ -355,7 +365,7 @@ impl FileTailer {
                             .send(&tx, &mut batch, cur.id, base + start as u64, unread)
                             .await
                     {
-                        return Ok(()); // receiver gone: shutting down
+                        return Ok(Ended::Closed); // receiver gone: shutting down
                     }
                 }
                 if !batch.is_empty()
@@ -363,7 +373,7 @@ impl FileTailer {
                         .send(&tx, &mut batch, cur.id, base + start as u64, unread)
                         .await
                 {
-                    return Ok(());
+                    return Ok(Ended::Closed);
                 }
                 pending.drain(..start);
                 if pending.len() > MAX_LINE {
@@ -382,7 +392,7 @@ impl FileTailer {
                     batch.push(self.line(&pending));
                     pending.clear();
                     if !self.send(&tx, &mut batch, cur.id, cur.offset, 0).await {
-                        return Ok(());
+                        return Ok(Ended::Closed);
                     }
                 }
                 open = None;
@@ -532,10 +542,25 @@ impl FileSource {
             let (path, source, tx) = (t.path.clone(), self.source.clone(), tx.clone());
             let errors = self.errors.clone();
             tasks.spawn(async move {
-                if let Err(e) = t.run(tx).await {
-                    error!(%source, path = %path.display(), error = %e, "file source failed");
-                    if let Some(errors) = errors {
-                        errors.set(&source, format!("{}: {e:#}", path.display()));
+                match t.run(tx.clone()).await {
+                    Ok(Ended::Gone) => {
+                        // its saved position is of no use any more
+                        let _ = tx
+                            .send(SourceBatch {
+                                source: source.clone(),
+                                lines: Vec::new(),
+                                position: None,
+                                backlog: None,
+                                gone: Some(path.clone()),
+                            })
+                            .await;
+                    }
+                    Ok(Ended::Closed) => {}
+                    Err(e) => {
+                        error!(%source, path = %path.display(), error = %e, "file source failed");
+                        if let Some(errors) = errors {
+                            errors.set(&source, format!("{}: {e:#}", path.display()));
+                        }
                     }
                 }
                 path
@@ -895,9 +920,13 @@ mod tests {
         assert_eq!(batch.lines[0].line, "b1");
         assert!(matches!(&batch.position, Some(Position::File { path, .. }) if path == &b));
 
-        // removed, then created again: a new tailer reads it
+        // removed: its position is given up; created again: a new tailer
+        // reads it
         std::fs::remove_file(&b).unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let gone = recv_batch(&mut rx).await;
+        assert!(gone.lines.is_empty() && gone.position.is_none());
+        assert_eq!(gone.gone.as_deref(), Some(b.as_path()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
         std::fs::write(&b, "b2\n").unwrap();
         assert_eq!(next_line(&mut rx, &mut buf).await, "b2");
 

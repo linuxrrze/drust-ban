@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = State::open(&cfg.agent.state_dir)?;
-    let loaded = state.load()?;
+    let mut loaded = state.load()?;
     // jails defined on the controller, as last received: set up before the
     // offender records are restored, so their bans come back too
     let mut central_jails = loaded.central_jails.clone().unwrap_or_default();
@@ -107,8 +107,37 @@ async fn main() -> anyhow::Result<()> {
         let (accepted, rejected) = central::split(&cfg.agent, &central_jails);
         engine.set_central_jails(&accepted, &central_jails.filters, rejected)
     };
-    let mut restored = engine.restore(loaded.offenders, Utc::now());
     let mut pending = Pending::default();
+    // positions of sources and files nobody will resume from
+    {
+        let central_cfgs: Vec<SourceConfig> = central_jails
+            .jails
+            .iter()
+            .filter_map(|j| j.source_configs().ok())
+            .flatten()
+            .collect();
+        let known: Vec<state::KnownSource> = cfg
+            .source
+            .iter()
+            .chain(&central_cfgs)
+            .map(|s| match &s.kind {
+                SourceKind::File { paths, .. } => state::KnownSource::Files(&s.name, paths),
+                SourceKind::Journald { .. } => state::KnownSource::Journald(&s.name),
+            })
+            .collect();
+        let stale = state::stale_positions(&loaded.positions, &known);
+        if !stale.is_empty() {
+            info!(
+                count = stale.len(),
+                "dropping saved positions of sources and files that are gone"
+            );
+        }
+        for key in stale {
+            loaded.positions.remove(&key);
+            pending.forget_position(key);
+        }
+    }
+    let mut restored = engine.restore(std::mem::take(&mut loaded.offenders), Utc::now());
     // the controller's jail settings as last received
     let mut jail_policies = loaded.jail_policies.clone().unwrap_or_default();
     engine.apply_jail_overrides(&jail_policies.jails);
@@ -304,6 +333,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if let Some(position) = batch.position {
                     pending.set_position(&batch.source, position);
+                }
+                if let Some(path) = &batch.gone {
+                    info!(source = %batch.source, path = %path.display(), "file gone, dropping its position");
+                    pending.forget_position(state::file_position_key(&batch.source, path));
                 }
                 if !entries.is_empty() {
                     // one firewall transaction per batch

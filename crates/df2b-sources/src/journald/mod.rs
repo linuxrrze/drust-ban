@@ -247,6 +247,7 @@ impl JournaldSource {
             lines,
             position,
             backlog: None,
+            gone: None,
         })
         .is_ok()
     }

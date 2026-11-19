@@ -190,6 +190,7 @@ mod tests {
             lines: vec![line; n],
             position: None,
             backlog,
+            gone: None,
         }
     }
 

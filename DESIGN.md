@@ -381,7 +381,11 @@ cloud firewall APIs, webhooks (chat, SIEM).
     offset)` per file. Every log line is read and processed once, also across
     restarts. A file replaced while the agent was down (same path, new inode)
     is read from the start; the remainder of the rotated-away file is not
-    drained yet.
+    drained yet. Positions nobody will resume from are dropped: a glob
+    match once it is gone and read to its end, and at startup those of
+    sources no longer configured (locally or centrally) and of files that
+    are gone, unless configured by their literal path (a rotation while
+    the agent was down is resumed through it).
   - **offender records** – offense count and ban expiry per (jail, key). On
     startup, still-active bans are re-applied to the firewall with their
     remaining time (the nftables table is recreated empty), and escalation
