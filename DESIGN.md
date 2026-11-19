@@ -292,8 +292,7 @@ Rules:
   (offense history is kept for escalation).
 - **Revocation** also via `df2bctl agents revoke <id>` (REST, admin).
 - Reports queued while disconnected (max 10 000) are kept in `agent.redb`
-  across restarts (§6). Not yet: per-source stats in heartbeats; the
-  agent ignores `retry_after_ms`.
+  across restarts (§6). Not yet: per-source stats in heartbeats.
 
 #### Implementation (REST API)
 
@@ -786,8 +785,12 @@ df2bctl config check | reload
       agents apply the current rules, the agent page each agent's state.
       The controller keeps redacting on arrival: for agents that refuse
       the rules, older agents, and lines sent before a change arrived.
-  - The controller rate-limits each agent (20 000 observations per minute;
-    `retry_after_ms` tells it to slow down), ignores malformed, too broad
+  - The controller rate-limits each agent (20 000 observations per minute).
+    At the first observation over the rate it stops processing the report
+    and answers `consumed` (how many from the start it handled) and
+    `retry_after_ms` (until the next minute); the agent keeps the rest
+    queued (and persisted) and pauses reports until then (at most 5 min).
+    Ban reports in the deferred part make no decision yet. It ignores malformed, too broad
     and allowlisted keys, and places each observation by the agent's
     `last_seen` corrected by the clock skew from its heartbeats (clamped
     to now; older than 24 h dropped), so reports queued while an agent was

@@ -226,6 +226,12 @@ pub struct Correlator {
 }
 
 impl Correlator {
+    /// Milliseconds until `admit` accepts again after the agent hit its
+    /// rate: the start of the next minute.
+    pub fn retry_after_ms(now: DateTime<Utc>) -> u32 {
+        60_000 - now.timestamp_millis().rem_euclid(60_000) as u32
+    }
+
     /// Rate limit per agent; false: drop this observation.
     pub fn admit(&mut self, agent: &str, now: DateTime<Utc>) -> bool {
         let minute = now.timestamp().div_euclid(60);
@@ -750,6 +756,9 @@ pub(crate) mod tests {
         }
         assert!(!c.admit("a", now));
         assert!(c.admit("b", now));
+        let next = now + TimeDelta::milliseconds(Correlator::retry_after_ms(now).into());
+        assert_eq!(next.timestamp_millis() % 60_000, 0);
+        assert!(next > now && c.admit("a", next));
         assert_eq!(keep_for(&[]), MIN_KEEP);
     }
 

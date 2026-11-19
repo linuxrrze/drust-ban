@@ -182,6 +182,21 @@ pub fn parse_allowlist(a: v1::AllowlistUpdate) -> Option<FromController> {
     }))
 }
 
+/// Longest pause a controller can ask for.
+const MAX_HOLD: Duration = Duration::from_secs(300);
+
+/// For a rate-limited report: how many observations of the batch the
+/// controller processed (the rest is sent again) and how long to pause.
+fn rate_limited(len: usize, ack: &v1::ReportAck) -> Option<(usize, Duration)> {
+    if ack.retry_after_ms == 0 {
+        return None;
+    }
+    // older controllers drop what is over the rate and do not say what
+    let consumed = ack.consumed.map_or(len, |c| (c as usize).min(len));
+    let wait = Duration::from_millis(ack.retry_after_ms.into()).min(MAX_HOLD);
+    Some((consumed, wait))
+}
+
 pub struct Link {
     pub reports: mpsc::Sender<v1::Observation>,
     pub events: mpsc::Receiver<FromController>,
@@ -215,6 +230,7 @@ pub fn spawn(cfg: LinkConfig, stats: Arc<LinkStats>) -> Link {
             reports: report_rx,
             events: event_tx,
             outbox,
+            hold_until: None,
             last_seq: 0,
         };
         task.run().await;
@@ -426,6 +442,8 @@ struct Task {
     reports: mpsc::Receiver<v1::Observation>,
     events: mpsc::Sender<FromController>,
     outbox: Outbox,
+    /// The controller asked to pause reports until then.
+    hold_until: Option<tokio::time::Instant>,
     last_seq: u64,
 }
 
@@ -663,17 +681,38 @@ impl Task {
     }
 
     async fn flush(&mut self, client: &mut AgentServiceClient<Channel>) -> anyhow::Result<()> {
+        if let Some(t) = self.hold_until {
+            if tokio::time::Instant::now() < t {
+                return Ok(());
+            }
+            self.hold_until = None;
+        }
         while !self.outbox.is_empty() {
             let batch = self.outbox.take(REPORT_BATCH);
             let observations = batch.iter().map(|e| e.obs.clone()).collect();
-            match client.report(v1::ObservationBatch { observations }).await {
-                Ok(_) => self.outbox.sent(batch),
+            let ack = match client.report(v1::ObservationBatch { observations }).await {
+                Ok(r) => r.into_inner(),
                 Err(e) => {
                     // keep them for the next connection
                     self.outbox.unsent(batch);
                     return Err(e.into());
                 }
-            }
+            };
+            let Some((consumed, wait)) = rate_limited(batch.len(), &ack) else {
+                self.outbox.sent(batch);
+                continue;
+            };
+            let mut batch = batch;
+            let rest = batch.split_off(consumed);
+            self.outbox.sent(batch);
+            self.outbox.unsent(rest);
+            self.hold_until = Some(tokio::time::Instant::now() + wait);
+            warn!(
+                retry_in = ?wait,
+                queued = self.outbox.len(),
+                "controller rate limit reached, pausing reports"
+            );
+            break;
         }
         Ok(())
     }
@@ -850,5 +889,28 @@ mod tests {
         assert_eq!(names, ["sshd", "nginx"], "implausible entries dropped");
         assert_eq!(p.jails[0].bantime, Some(Duration::from_secs(7200)));
         assert_eq!(p.jails[0].findtime, None);
+    }
+
+    #[test]
+    fn rate_limit_ack() {
+        let ack = |retry, consumed| v1::ReportAck {
+            accepted: 0,
+            retry_after_ms: retry,
+            consumed,
+        };
+        assert_eq!(rate_limited(10, &ack(0, None)), None);
+        assert_eq!(
+            rate_limited(10, &ack(1500, Some(4))),
+            Some((4, Duration::from_millis(1500)))
+        );
+        // older controller: nothing to send again; implausible values capped
+        assert_eq!(
+            rate_limited(10, &ack(60_000, None)),
+            Some((10, Duration::from_secs(60)))
+        );
+        assert_eq!(
+            rate_limited(10, &ack(u32::MAX, Some(99))),
+            Some((10, MAX_HOLD))
+        );
     }
 }

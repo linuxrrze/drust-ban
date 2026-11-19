@@ -128,8 +128,12 @@ message ObservationBatch {
 
 message ReportAck {
   uint32 accepted = 1;
-  // Non-zero if the agent is being rate limited.
+  // Non-zero if the agent is being rate limited: send nothing before then.
   uint32 retry_after_ms = 2;
+  // With retry_after_ms: observations from the start of the batch the
+  // controller processed; the rest was not looked at and should be sent
+  // again later. Unset (older controllers): the whole batch was handled.
+  optional uint32 consumed = 3;
 }
 
 // ----------------------------------------------------------------- decisions

@@ -95,13 +95,15 @@ fn redaction_event(snap: &crate::state::RedactionSnapshot) -> v1::DecisionEvent 
 
 impl Service {
     /// Feeds observations into the correlator and returns the rules that
-    /// fired, and how many observations were over the agent's rate.
+    /// fired, and how many observations from the start of the batch were
+    /// processed: at the first one over the agent's rate it stops (the
+    /// agent sends the rest again later).
     fn correlate(
         &self,
         record: &crate::store::AgentRecord,
         batch: &[v1::Observation],
         now: chrono::DateTime<Utc>,
-    ) -> (Vec<crate::correlation::Trigger>, u32) {
+    ) -> (Vec<crate::correlation::Trigger>, usize) {
         use crate::correlation::{Seen, MAX_WINDOW};
         let rules = self.ctl.rules();
         // agent timestamps in controller time (skew from heartbeats)
@@ -109,7 +111,7 @@ impl Service {
         let oldest = now - chrono::Duration::from_std(MAX_WINDOW).unwrap_or_default();
         let redactor = self.ctl.redactor();
         let mut parsed = Vec::new();
-        for o in batch {
+        for (i, o) in batch.iter().enumerate() {
             let banned = o.locally_banned;
             if !banned && o.count == 0 {
                 continue;
@@ -125,6 +127,7 @@ impl Service {
                 continue;
             }
             parsed.push((
+                i,
                 o.jail.clone(),
                 net,
                 at,
@@ -142,11 +145,11 @@ impl Service {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut triggers = Vec::new();
-        let mut dropped = 0;
-        for (jail, net, at, failures, banned, sample) in parsed {
+        let mut consumed = batch.len();
+        for (i, jail, net, at, failures, banned, sample) in parsed {
             if !c.admit(&record.id, now) {
-                dropped += 1;
-                continue;
+                consumed = i;
+                break;
             }
             let seen = Seen {
                 agent: record.id.clone(),
@@ -160,10 +163,10 @@ impl Service {
                 triggers.extend(c.evaluate(&rules, &jail, net, &record.group, now));
             }
         }
-        if dropped > 0 {
-            warn!(agent = %record.id, dropped, "observation rate limit reached");
+        if consumed < batch.len() {
+            warn!(agent = %record.id, deferred = batch.len() - consumed, "observation rate limit reached");
         }
-        (triggers, dropped)
+        (triggers, consumed)
     }
 }
 
@@ -315,7 +318,10 @@ impl AgentService for Service {
             Propagate::Off => None,
         };
         let mut new = Vec::new();
-        let (triggers, dropped) = self.correlate(&record, &batch, now);
+        let (triggers, consumed) = self.correlate(&record, &batch, now);
+        let limited = consumed < batch.len();
+        // the rest is sent again after `retry_after_ms`
+        let batch = &batch[..consumed];
         if !triggers.is_empty() {
             let active = self.ctl.active_decisions();
             for t in triggers {
@@ -413,7 +419,6 @@ impl AgentService for Service {
                 reason: format!("local ban on {}: {} failures", record.id, o.count),
             });
         }
-        let accepted = batch.len() as u32;
         if !new.is_empty() {
             let ctl = self.ctl.clone();
             let appended = tokio::task::spawn_blocking(move || ctl.append(new))
@@ -425,9 +430,14 @@ impl AgentService for Service {
             }
         }
         Ok(Response::new(v1::ReportAck {
-            accepted: accepted.saturating_sub(dropped),
+            accepted: consumed as u32,
             // over the per-agent rate: slow down
-            retry_after_ms: if dropped > 0 { 60_000 } else { 0 },
+            retry_after_ms: if limited {
+                crate::correlation::Correlator::retry_after_ms(now)
+            } else {
+                0
+            },
+            consumed: limited.then_some(consumed as u32),
         }))
     }
 
@@ -1401,6 +1411,68 @@ mod tests {
             .unwrap()
             .recent(&"203.0.113.0/24".parse().unwrap());
         assert!(recent.len() >= 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_defers_the_rest_of_a_report() {
+        use crate::correlation::MAX_PER_AGENT_MINUTE;
+        let dir = std::env::temp_dir().join(format!("df2b-ctl-grpc-rate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (addr, ctl) = start(&dir).await;
+        let mut a = enrolled(&addr, &ctl, &dir, "host-1").await;
+        let obs = |key: String, banned: bool| v1::Observation {
+            key,
+            jail: "sshd".into(),
+            count: 1,
+            last_seen_unix_ms: Utc::now().timestamp_millis(),
+            locally_banned: banned,
+            local_ban_expires_unix_ms: (Utc::now() + chrono::Duration::hours(1)).timestamp_millis(),
+            ..Default::default()
+        };
+        // the rate is per minute: stay within one
+        let sec = Utc::now().timestamp().rem_euclid(60);
+        if sec >= 45 {
+            tokio::time::sleep(Duration::from_secs((61 - sec) as u64)).await;
+        }
+        let minute = Utc::now().timestamp().div_euclid(60);
+        let mut n = 0;
+        while n < MAX_PER_AGENT_MINUTE as usize {
+            let k = (MAX_PER_AGENT_MINUTE as usize - n).min(MAX_REPORT);
+            let batch = (n..n + k)
+                .map(|i| obs(format!("198.18.{}.{}/32", i / 256, i % 256), false))
+                .collect();
+            let ack = a
+                .report(v1::ObservationBatch {
+                    observations: batch,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                (ack.accepted, ack.retry_after_ms, ack.consumed),
+                (k as u32, 0, None)
+            );
+            n += k;
+        }
+        let ack = a
+            .report(v1::ObservationBatch {
+                observations: vec![
+                    obs("203.0.113.1/32".into(), false),
+                    obs("203.0.113.2/32".into(), true),
+                ],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        if Utc::now().timestamp().div_euclid(60) != minute {
+            eprintln!("minute changed during the test; skipping the checks");
+            return;
+        }
+        assert_eq!(ack.consumed, Some(0));
+        assert!(ack.retry_after_ms > 0 && ack.retry_after_ms <= 60_000);
+        // the deferred ban report made no decision (it comes again)
+        assert!(ctl.active_decisions().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
