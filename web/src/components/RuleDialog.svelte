@@ -22,6 +22,7 @@
   let bantime = $state('1h');
   let factor = $state('1');
   let maxBantime = $state('');
+  let asns = $state('');
   let mode = $state<'enforce' | 'monitor' | 'off'>('monitor');
   let error = $state('');
   let busy = $state(false);
@@ -39,6 +40,7 @@
       bantime = rule?.bantime ?? '1h';
       factor = String(rule?.bantime_factor ?? 1);
       maxBantime = rule?.max_bantime ?? '';
+      asns = (rule?.asns ?? []).map((a) => `AS${a}`).join(' ');
       // new rules start in monitor mode: see what they would do first
       mode = !rule ? 'monitor' : !rule.enabled ? 'off' : rule.monitor ? 'monitor' : 'enforce';
     }
@@ -60,6 +62,7 @@
         max_bantime: maxBantime.trim() || null,
         enabled: mode !== 'off',
         monitor: mode === 'monitor',
+        asns: asns.split(/[\s,]+/).filter(Boolean),
       });
       notify(`Rule ${name.trim()} saved`);
       open = false;
@@ -128,6 +131,10 @@
       </select>
     </label>
   </div>
+  <label class="field">
+    Only autonomous systems <input class="mono" bind:value={asns} placeholder="all; e.g. AS64500 AS64501" />
+    <span class="hint">The rule applies only to addresses in these AS (the controller's GeoIP data), e.g. stricter limits for hosting networks.</span>
+  </label>
   {#if kind === 'quorum'}
     <p class="faint small">
       To protect against a compromised agent, set ban propagation to "Only locally": then single

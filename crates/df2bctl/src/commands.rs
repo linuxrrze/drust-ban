@@ -530,9 +530,36 @@ pub async fn allowlist_list(c: &Client, json: bool) -> anyhow::Result<()> {
         return json_out(&v);
     }
     let list = v["entries"].as_array().cloned().unwrap_or_default();
-    if list.is_empty() {
+    let asns = v["asns"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() && asns.is_empty() {
         println!("the allowlist is empty");
         return Ok(());
+    }
+    if !asns.is_empty() {
+        println!(
+            "{:<10} {:<24} {:>8} {:<14} {:>5}  COMMENT",
+            "AS", "ORGANIZATION", "NETWORKS", "ADDED BY", "BANS"
+        );
+        for a in &asns {
+            println!(
+                "{:<10} {:<24} {:>8} {:<14} {:>5}  {}",
+                format!("AS{}", a["asn"]),
+                a["as_org"]
+                    .as_str()
+                    .unwrap_or("-")
+                    .chars()
+                    .take(24)
+                    .collect::<String>(),
+                a["networks"].to_string(),
+                s(a, &["created_by"]),
+                a["active_bans"].to_string(),
+                a["comment"].as_str().unwrap_or(""),
+            );
+        }
+        if list.is_empty() {
+            return Ok(());
+        }
+        println!();
     }
     println!(
         "{:<24} {:<14} {:<10} {:<12} {:>5}  COMMENT",
@@ -564,7 +591,7 @@ pub async fn allowlist_list(c: &Client, json: bool) -> anyhow::Result<()> {
 
 pub async fn allowlist_add(
     c: &Client,
-    net: IpNet,
+    net: String,
     comment: Option<String>,
     unban: bool,
     ttl: Option<Duration>,
@@ -577,11 +604,25 @@ pub async fn allowlist_add(
     let v = c
         .post(
             "/api/v1/allowlist",
-            json!({ "net": net.to_string(), "comment": comment.unwrap_or_default(), "unban": unban, "ttl": ttl }),
+            if net.starts_with("AS") {
+                json!({ "net": net, "comment": comment.unwrap_or_default(), "unban": unban })
+            } else {
+                json!({ "net": net, "comment": comment.unwrap_or_default(), "unban": unban, "ttl": ttl })
+            },
         )
         .await?;
     if json {
         return json_out(&v);
+    }
+    if v["asn"].is_number() {
+        println!(
+            "AS{} allowlisted ({} networks in the GeoIP data); {} active ban(s) lifted",
+            v["asn"], v["networks"], v["unbanned"]
+        );
+        if v["networks"] == 0 {
+            println!("warning: no networks known for it: the controller needs a GeoIP ASN database (--geoip)");
+        }
+        return Ok(());
     }
     println!(
         "{} allowlisted; {} active ban(s) lifted",
@@ -591,10 +632,8 @@ pub async fn allowlist_add(
     Ok(())
 }
 
-pub async fn allowlist_rm(c: &Client, net: IpNet, json: bool) -> anyhow::Result<()> {
-    let v = c
-        .delete("/api/v1/allowlist", &[("net", net.to_string())])
-        .await?;
+pub async fn allowlist_rm(c: &Client, net: String, json: bool) -> anyhow::Result<()> {
+    let v = c.delete("/api/v1/allowlist", &[("net", net)]).await?;
     if json {
         return json_out(&v);
     }
@@ -905,6 +944,10 @@ pub async fn correlation_list(c: &Client, json: bool) -> anyhow::Result<()> {
                 .as_str()
                 .map_or("all".to_owned(), |g| format!("group {g}")),
         );
+        if let Some(a) = r["asns"].as_array().filter(|a| !a.is_empty()) {
+            let list: Vec<String> = a.iter().map(|n| format!("AS{n}")).collect();
+            println!("{:<20} only {}", "", list.join(", "));
+        }
     }
     let hits = v["monitor_hits"].as_array().cloned().unwrap_or_default();
     if !hits.is_empty() {

@@ -183,6 +183,17 @@ export interface AllowEntry {
   active_bans: number;
 }
 
+/** An allowlisted autonomous system (networks from the GeoIP data). */
+export interface AllowAsn {
+  asn: number;
+  as_org: string | null;
+  networks: number;
+  comment: string;
+  created_by: string;
+  created_at: string;
+  active_bans: number;
+}
+
 export type Propagate = 'global' | 'group' | 'off';
 
 export interface JailView {
@@ -274,6 +285,8 @@ export interface CorrelationRule {
   max_bantime?: string;
   enabled: boolean;
   monitor: boolean;
+  /** only addresses in these autonomous systems */
+  asns?: number[];
   updated_by: string;
   updated_at: string;
 }

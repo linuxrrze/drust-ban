@@ -118,8 +118,10 @@ impl Geo {
         self.dbs.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Reloads files that changed on disk (housekeeping; blocking).
-    pub fn reload_changed(&self) {
+    /// Reloads files that changed on disk (housekeeping; blocking). True
+    /// if one was replaced.
+    pub fn reload_changed(&self) -> bool {
+        let mut replaced = false;
         let changed: Vec<(usize, PathBuf, Option<SystemTime>)> = self
             .read()
             .iter()
@@ -144,6 +146,7 @@ impl Geo {
                     );
                     d.reader = r;
                     d.error = None;
+                    replaced = true;
                 }
                 Err(e) => {
                     let e = format!("{e:#}");
@@ -152,6 +155,7 @@ impl Geo {
                 }
             }
         }
+        replaced
     }
 
     pub fn databases(&self) -> Vec<DbInfo> {
@@ -176,6 +180,41 @@ impl Geo {
         (!out.is_empty()).then_some(out)
     }
 
+    /// The networks of these autonomous systems in all loaded files (with
+    /// several files: all of them). Blocking: walks every database.
+    pub fn networks_of(&self, asns: &[u32]) -> std::collections::HashMap<u32, Vec<IpNet>> {
+        let mut out: std::collections::HashMap<u32, Vec<IpNet>> =
+            asns.iter().map(|a| (*a, Vec::new())).collect();
+        if asns.is_empty() {
+            return out;
+        }
+        for d in self.read().iter() {
+            let Ok(iter) = d.reader.networks(maxminddb::WithinOptions::default()) else {
+                continue;
+            };
+            for res in iter.flatten() {
+                let Some(asn) = info_of(&res).asn else {
+                    continue;
+                };
+                let Some(list) = out.get_mut(&asn) else {
+                    continue;
+                };
+                if let Some(net) = res
+                    .network()
+                    .ok()
+                    .and_then(|n| n.to_string().parse::<IpNet>().ok())
+                {
+                    list.push(net.trunc());
+                }
+            }
+        }
+        for list in out.values_mut() {
+            list.sort();
+            list.dedup();
+        }
+        out
+    }
+
     /// A prefix is looked up by its first address.
     pub fn lookup_net(&self, net: &IpNet) -> Option<GeoInfo> {
         self.lookup(net.network())
@@ -191,6 +230,10 @@ fn lookup_one(r: &Reader<Vec<u8>>, ip: IpAddr) -> GeoInfo {
     let Ok(res) = r.lookup(ip) else {
         return GeoInfo::default();
     };
+    info_of(&res)
+}
+
+fn info_of(res: &maxminddb::LookupResult<'_, Vec<u8>>) -> GeoInfo {
     if !res.has_data() {
         return GeoInfo::default();
     }
@@ -202,9 +245,9 @@ fn lookup_one(r: &Reader<Vec<u8>>, ip: IpAddr) -> GeoInfo {
         let path: Vec<PathElement<'_>> = path.iter().map(|k| PathElement::Key(k)).collect();
         res.decode_path(&path).ok().flatten()
     }
-    let s = |path: &[&str]| get::<String>(&res, path).filter(|v| !v.is_empty());
+    let s = |path: &[&str]| get::<String>(res, path).filter(|v| !v.is_empty());
     // MaxMind/DB-IP: autonomous_system_number; ipinfo: asn = "AS13335"
-    let asn = get::<u32>(&res, &["autonomous_system_number"]).or_else(|| {
+    let asn = get::<u32>(res, &["autonomous_system_number"]).or_else(|| {
         s(&["asn"]).and_then(|a| {
             a.strip_prefix("AS")
                 .or(Some(a.as_str()))
@@ -510,5 +553,31 @@ mod tests {
         let f = std::fs::File::options().write(true).open(p).unwrap();
         f.set_modified(SystemTime::now() + std::time::Duration::from_secs(secs))
             .unwrap();
+    }
+
+    #[test]
+    fn networks_of_an_asn() {
+        let dir = std::env::temp_dir().join(format!("df2b-geo-nets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = write(
+            &dir,
+            "asn.mmdb",
+            build(
+                "GeoLite2-ASN",
+                vec![
+                    ("203.0.113.0/25", asn(64500, "Example Hosting")),
+                    ("198.51.100.0/24", asn(64500, "Example Hosting")),
+                    ("203.0.113.128/25", asn(64501, "Other")),
+                    ("2001:db8::/32", asn(64500, "Example Hosting")),
+                ],
+            ),
+        );
+        let g = Geo::open(&[db]).unwrap();
+        let n = g.networks_of(&[64500, 64999]);
+        let got: Vec<String> = n[&64500].iter().map(|n| n.to_string()).collect();
+        assert_eq!(got, ["198.51.100.0/24", "203.0.113.0/25", "2001:db8::/32"]);
+        assert!(n[&64999].is_empty());
+        assert!(Geo::default().networks_of(&[64500])[&64500].is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

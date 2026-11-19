@@ -884,6 +884,23 @@ async fn list_allow(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiRe
             v
         })
         .collect();
+    let asns: Vec<Value> = ctl
+        .allowlist_asns()
+        .into_iter()
+        .map(|(a, nets)| {
+            let trie = df2b_core::Allowlist::new(nets.iter().copied());
+            let overlapping = active.iter().filter(|d| trie.overlaps(&d.target)).count();
+            let org = nets
+                .first()
+                .and_then(|n| ctl.geo.lookup_net(n))
+                .and_then(|g| g.as_org);
+            json!({
+                "asn": a.asn, "as_org": org, "networks": nets.len(),
+                "comment": a.comment, "created_by": a.created_by, "created_at": a.created_at,
+                "active_bans": overlapping,
+            })
+        })
+        .collect();
     let current = ctl.allowlist_version();
     let live: Vec<_> = ctl
         .agents()
@@ -892,6 +909,7 @@ async fn list_allow(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiRe
         .collect();
     Ok(Json(json!({
         "entries": entries,
+        "asns": asns,
         "version": current,
         "agents": {
             "connected": live.len(),
@@ -907,7 +925,7 @@ fn default_unban() -> bool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewAllow {
-    /// address or prefix
+    /// address or prefix, or an autonomous system ("AS64500")
     net: String,
     #[serde(default)]
     comment: String,
@@ -946,19 +964,99 @@ fn expiry(ttl: &str, max: Duration) -> Result<chrono::DateTime<Utc>, ApiError> {
 fn allow_error(e: crate::state::AllowError) -> ApiError {
     use crate::state::AllowError as E;
     match e {
-        E::Exists(_) | E::Covered(..) | E::Fixed(_) => conflict(e.to_string()),
-        E::Missing(_) => ApiError::not_found(e.to_string()),
+        E::Exists(_) | E::Covered(..) | E::Fixed(_) | E::AsnExists(_) => conflict(e.to_string()),
+        E::Missing(_) | E::AsnMissing(_) => ApiError::not_found(e.to_string()),
         E::Store(e) => ApiError::internal(e),
     }
 }
 
-/// Admin: adds a network; by default also unbans what it overlaps.
+/// "AS64500" / "as64500" → 64500 (not AS0).
+fn parse_asn(s: &str) -> Option<u32> {
+    let n = s.trim();
+    let digits = n.strip_prefix("AS").or_else(|| n.strip_prefix("as"))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|a| *a != 0)
+}
+
+fn clean_comment(c: &str) -> String {
+    c.chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// Admin: an autonomous system; its networks come from the GeoIP data.
+async fn add_allow_asn(
+    caller: Caller,
+    ctl: Arc<Controller>,
+    asn: u32,
+    req: NewAllow,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    if req.ttl.is_some() {
+        return Err(ApiError::bad_request(
+            "autonomous systems can only be allowlisted permanently",
+        ));
+    }
+    let entry = crate::store::AsnAllow {
+        asn,
+        comment: clean_comment(&req.comment),
+        created_by: caller.name.clone(),
+        created_at: Utc::now(),
+    };
+    let unban = req.unban;
+    let c = ctl.clone();
+    let (networks, unbanned) = tokio::task::spawn_blocking(move || {
+        let nets = c.add_allow_asn(entry.clone()).map_err(allow_error)?;
+        let mut lifted = 0;
+        if unban && !nets.is_empty() {
+            let trie = df2b_core::Allowlist::new(nets.iter().copied());
+            let mut targets: Vec<IpNet> = c
+                .active_decisions()
+                .iter()
+                .filter(|d| trie.overlaps(&d.target))
+                .map(|d| d.target)
+                .collect();
+            targets.sort();
+            targets.dedup();
+            for t in targets {
+                lifted += c
+                    .unban(t, caller.origin(), &format!("allowlisted (AS{asn})"))
+                    .map_err(ApiError::internal)?
+                    .len();
+            }
+        }
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "allowlist.add",
+            json!({ "asn": asn, "comment": entry.comment, "networks": nets.len(), "unbanned": lifted }),
+        )
+        .map_err(ApiError::internal)?;
+        Ok::<_, ApiError>((nets.len(), lifted))
+    })
+    .await
+    .map_err(ApiError::internal)??;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "asn": asn, "networks": networks, "unbanned": unbanned })),
+    ))
+}
+
+/// Admin: adds a network or an autonomous system; by default also unbans
+/// what it overlaps.
 async fn add_allow(
     caller: Caller,
     State(ctl): State<Arc<Controller>>,
     Json(req): Json<NewAllow>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     caller.require(Role::Admin)?;
+    if let Some(asn) = parse_asn(&req.net) {
+        return add_allow_asn(caller, ctl, asn, req).await;
+    }
     let net = target(&req.net)?.trunc();
     // a /0 would silently switch banning off
     if too_broad(&net) {
@@ -1016,13 +1114,30 @@ struct AllowQuery {
     net: String,
 }
 
-/// Admin: removes an entry added through the API (`?net=<prefix>`).
+/// Admin: removes an entry added through the API (`?net=<prefix>` or
+/// `?net=AS64500`).
 async fn remove_allow(
     caller: Caller,
     State(ctl): State<Arc<Controller>>,
     Query(q): Query<AllowQuery>,
 ) -> ApiResult {
     caller.require(Role::Admin)?;
+    if let Some(asn) = parse_asn(&q.net) {
+        let c = ctl.clone();
+        tokio::task::spawn_blocking(move || {
+            c.remove_allow_asn(asn).map_err(allow_error)?;
+            c.audit(
+                &caller.name,
+                caller.addr(),
+                "allowlist.remove",
+                json!({ "asn": asn }),
+            )
+            .map_err(ApiError::internal)
+        })
+        .await
+        .map_err(ApiError::internal)??;
+        return Ok(Json(json!({ "removed": format!("AS{asn}") })));
+    }
     let net = target(&q.net)?.trunc();
     let c = ctl.clone();
     tokio::task::spawn_blocking(move || {
@@ -1271,6 +1386,9 @@ struct RuleBody {
     enabled: bool,
     #[serde(default)]
     monitor: bool,
+    /// only addresses in these autonomous systems (64500 or "AS64500")
+    #[serde(default)]
+    asns: Vec<Value>,
 }
 
 /// Admin: creates or replaces a correlation rule.
@@ -1304,6 +1422,26 @@ async fn set_rule(
             .transpose()?,
         enabled: req.enabled,
         monitor: req.monitor,
+        asns: {
+            let mut v = req
+                .asns
+                .iter()
+                .map(|a| match a {
+                    Value::Number(n) => n
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n != 0),
+                    Value::String(s) => parse_asn(s),
+                    _ => None,
+                })
+                .collect::<Option<Vec<u32>>>()
+                .ok_or_else(|| {
+                    ApiError::bad_request("asns: AS numbers such as 64500 or \"AS64500\"")
+                })?;
+            v.sort_unstable();
+            v.dedup();
+            v
+        },
         updated_by: caller.name.clone(),
         updated_at: Utc::now(),
     };
@@ -5466,5 +5604,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(h.status(), S::OK);
+    }
+
+    #[tokio::test]
+    async fn asn_allowlist() {
+        use crate::geo::testdb::*;
+        let dbdir = std::env::temp_dir().join(format!("df2b-api-asnallow-{}", std::process::id()));
+        std::fs::create_dir_all(&dbdir).unwrap();
+        let a = dbdir.join("asn.mmdb");
+        std::fs::write(
+            &a,
+            build(
+                "GeoLite2-ASN",
+                vec![
+                    ("203.0.113.0/25", asn(64500, "Example Hosting")),
+                    ("2001:db8::/32", asn(64500, "Example Hosting")),
+                    ("198.51.100.0/24", asn(64501, "Example ISP")),
+                ],
+            ),
+        )
+        .unwrap();
+        let env = Env::with_geo("asnallow", crate::geo::Geo::open(&[a]).unwrap()).await;
+        let (admin, op) = (
+            env.token("ada", Role::Admin),
+            env.token("olga", Role::Operator),
+        );
+        let ban = |t: &'static str| {
+            let (env, op) = (&env, op.clone());
+            async move {
+                env.call("POST", "/api/v1/bans", &op, json!({ "target": t }))
+                    .await
+                    .0
+            }
+        };
+        assert_eq!(ban("203.0.113.7").await, S::CREATED);
+
+        // operators may not; a TTL is refused; AS0 is no ASN
+        assert_eq!(
+            env.call(
+                "POST",
+                "/api/v1/allowlist",
+                &op,
+                json!({ "net": "AS64500" })
+            )
+            .await
+            .0,
+            S::FORBIDDEN
+        );
+        assert_eq!(
+            env.call(
+                "POST",
+                "/api/v1/allowlist",
+                &admin,
+                json!({ "net": "AS64500", "ttl": "1h" })
+            )
+            .await
+            .0,
+            S::BAD_REQUEST
+        );
+        assert_eq!(
+            env.call("POST", "/api/v1/allowlist", &admin, json!({ "net": "AS0" }))
+                .await
+                .0,
+            S::BAD_REQUEST
+        );
+
+        let (st, v) = env
+            .call(
+                "POST",
+                "/api/v1/allowlist",
+                &admin,
+                json!({ "net": "AS64500", "comment": "ours" }),
+            )
+            .await;
+        assert_eq!(st, S::CREATED, "{v}");
+        assert_eq!(
+            (v["networks"].clone(), v["unbanned"].clone()),
+            (json!(2), json!(1))
+        );
+        assert_eq!(
+            env.call(
+                "POST",
+                "/api/v1/allowlist",
+                &admin,
+                json!({ "net": "as64500" })
+            )
+            .await
+            .0,
+            S::CONFLICT
+        );
+
+        // no new bans inside it; outside still fine
+        assert_eq!(ban("203.0.113.8").await, S::CONFLICT);
+        assert_eq!(ban("2001:db8::1").await, S::CONFLICT);
+        assert_eq!(ban("203.0.113.200").await, S::CREATED);
+        // agents get its networks
+        let snap = env.ctl.allowlist_watch().borrow().clone();
+        assert!(snap
+            .entries
+            .iter()
+            .any(|(n, _)| n.to_string() == "203.0.113.0/25"));
+
+        let (_, v) = env.call("GET", "/api/v1/allowlist", &op, json!({})).await;
+        assert_eq!(v["asns"][0]["asn"], 64500);
+        assert_eq!(v["asns"][0]["as_org"], "Example Hosting");
+        assert_eq!(v["asns"][0]["networks"], 2);
+        assert_eq!(v["asns"][0]["comment"], "ours");
+
+        let r = env
+            .http
+            .delete(format!("{}/api/v1/allowlist?net=AS64500", env.base))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        assert_eq!(ban("203.0.113.8").await, S::CREATED, "allowed to ban again");
+        let r = env
+            .http
+            .delete(format!("{}/api/v1/allowlist?net=AS64500", env.base))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dbdir);
+    }
+
+    #[test]
+    fn asn_syntax() {
+        assert_eq!(parse_asn("AS64500"), Some(64500));
+        assert_eq!(parse_asn(" as13335 "), Some(13335));
+        for no in ["AS", "AS0", "AS-1", "AS1x", "64500", "AS99999999999", "As1"] {
+            assert_eq!(parse_asn(no), None, "{no}");
+        }
     }
 }

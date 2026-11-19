@@ -20,6 +20,8 @@ const AGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("agents");
 const DECISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("decisions");
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 const ALLOWLIST: TableDefinition<&str, &[u8]> = TableDefinition::new("allowlist");
+/// Allowlisted autonomous systems, by AS number.
+const ALLOWLIST_ASN: TableDefinition<u32, &[u8]> = TableDefinition::new("allowlist_asn");
 const JAIL_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_policies");
 const FILTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("filters");
 const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("correlation_rules");
@@ -29,6 +31,16 @@ const JAIL_DEFS: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_defs"
 const OBSERVATIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("observations");
 /// Runtime settings changed through the API (e.g. "propagate").
 const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
+
+/// An allowlisted autonomous system (its networks come from the GeoIP
+/// databases).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AsnAllow {
+    pub asn: u32,
+    pub comment: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
 
 /// An allowlist entry added through the API (`--allow` entries are not
 /// stored).
@@ -98,6 +110,7 @@ impl Store {
         tx.open_table(DECISIONS)?;
         tx.open_table(AUDIT)?;
         tx.open_table(ALLOWLIST)?;
+        tx.open_table(ALLOWLIST_ASN)?;
         tx.open_table(JAIL_POLICIES)?;
         tx.open_table(SETTINGS)?;
         tx.open_table(FILTERS)?;
@@ -171,6 +184,32 @@ impl Store {
             out.push(serde_json::from_slice(v.value())?);
         }
         Ok(out)
+    }
+
+    pub fn allow_asns(&self) -> anyhow::Result<Vec<AsnAllow>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for item in tx.open_table(ALLOWLIST_ASN)?.iter()? {
+            let (_, v) = item?;
+            out.push(serde_json::from_slice(v.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn put_allow_asn(&self, e: &AsnAllow) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(ALLOWLIST_ASN)?
+            .insert(e.asn, serde_json::to_vec(e)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// False if there was no such entry.
+    pub fn delete_allow_asn(&self, asn: u32) -> anyhow::Result<bool> {
+        let tx = self.db.begin_write()?;
+        let found = tx.open_table(ALLOWLIST_ASN)?.remove(asn)?.is_some();
+        tx.commit()?;
+        Ok(found)
     }
 
     pub fn put_allow(&self, e: &AllowEntry) -> anyhow::Result<()> {

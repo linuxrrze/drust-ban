@@ -78,6 +78,9 @@ pub struct Rule {
     /// only record what would be banned
     #[serde(default)]
     pub monitor: bool,
+    /// Only addresses in these autonomous systems (GeoIP data); empty: all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asns: Vec<u32>,
     pub updated_by: String,
     pub updated_at: DateTime<Utc>,
 }
@@ -102,6 +105,9 @@ impl Rule {
             // one agent alone is what propagation already does
             RuleKind::Quorum => 2,
         };
+        if self.asns.len() > 100 || self.asns.contains(&0) {
+            return Err("asns: at most 100 AS numbers, none 0".into());
+        }
         if self.min_agents < min || self.min_agents > 1000 {
             return Err(format!("min_agents must be between {min} and 1000"));
         }
@@ -142,10 +148,12 @@ impl Rule {
         )
     }
 
-    fn applies(&self, jail: &str, group: &str) -> bool {
+    /// `asn`: of the address, if the GeoIP data knows it.
+    fn applies(&self, jail: &str, group: &str, asn: Option<u32>) -> bool {
         self.enabled
             && self.jail.as_deref().map_or(true, |j| j == jail)
             && self.group.as_deref().map_or(true, |g| g == group)
+            && (self.asns.is_empty() || asn.is_some_and(|a| self.asns.contains(&a)))
     }
 }
 
@@ -389,13 +397,14 @@ impl Correlator {
         jail: &str,
         key: IpNet,
         group: &str,
+        asn: Option<u32>,
         now: DateTime<Utc>,
     ) -> Vec<Trigger> {
         let Some(entries) = self.seen.get(&(jail.to_owned(), key)) else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for r in rules.iter().filter(|r| r.applies(jail, group)) {
+        for r in rules.iter().filter(|r| r.applies(jail, group, asn)) {
             let fired_key = (r.name.clone(), jail.to_owned(), key);
             if self.fired.get(&fired_key).is_some_and(|t| *t > now) {
                 continue;
@@ -559,6 +568,7 @@ pub(crate) mod tests {
             max_bantime: None,
             enabled: true,
             monitor: false,
+            asns: Vec::new(),
             updated_by: "ada".into(),
             updated_at: Utc::now(),
         }
@@ -592,7 +602,7 @@ pub(crate) mod tests {
         let mut monitor = rule(RuleKind::Threshold, 2, 5);
         monitor.monitor = true;
         assert_eq!(
-            c.evaluate(&[monitor.clone()], "sshd", key, "web", now)
+            c.evaluate(&[monitor.clone()], "sshd", key, "web", None, now)
                 .len(),
             1
         );
@@ -614,7 +624,7 @@ pub(crate) mod tests {
         assert_eq!(r.samples(&key)[0].2.line, "Failed password for root");
         assert_eq!(r.hits().len(), 1);
         assert!(
-            r.evaluate(&[monitor.clone()], "sshd", key, "web", now)
+            r.evaluate(&[monitor.clone()], "sshd", key, "web", None, now)
                 .is_empty(),
             "the pause survives"
         );
@@ -626,7 +636,10 @@ pub(crate) mod tests {
             hits: vec![],
         };
         r.restore(c.seen_for_test(), Some(expired), now, MIN_KEEP);
-        assert_eq!(r.evaluate(&[monitor], "sshd", key, "web", now).len(), 1);
+        assert_eq!(
+            r.evaluate(&[monitor], "sshd", key, "web", None, now).len(),
+            1
+        );
         // sorted: pruning keeps the newer one
         r.prune(now, Duration::from_secs(60));
         assert_eq!(r.recent(&key).len(), 1);
@@ -660,6 +673,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn asn_limited_rule() {
+        let now = Utc::now();
+        let key: IpNet = "203.0.113.7/32".parse().unwrap();
+        let mut r = rule(RuleKind::Threshold, 1, 2);
+        r.asns = vec![64500];
+        let fire = |r: &Rule, asn: Option<u32>| {
+            let mut c = Correlator::default();
+            c.record("sshd", key, seen("a1", "web", now, 2, false));
+            c.evaluate(std::slice::from_ref(r), "sshd", key, "web", asn, now)
+                .len()
+        };
+        assert_eq!(fire(&r, Some(64500)), 1);
+        assert_eq!(fire(&r, Some(64501)), 0, "other AS");
+        assert_eq!(
+            fire(&r, None),
+            0,
+            "AS unknown: a limited rule does not apply"
+        );
+        r.asns.clear();
+        assert_eq!(fire(&r, None), 1, "unlimited rule");
+        let mut bad = rule(RuleKind::Threshold, 1, 2);
+        bad.asns = vec![0];
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
     fn threshold_across_agents() {
         let mut c = Correlator::default();
         let now = Utc::now();
@@ -674,7 +713,7 @@ pub(crate) mod tests {
             );
         }
         assert!(
-            c.evaluate(&rules, "sshd", key, "web", now).is_empty(),
+            c.evaluate(&rules, "sshd", key, "web", None, now).is_empty(),
             "2 agents, 4 failures"
         );
         // an old one outside the window does not count
@@ -683,20 +722,20 @@ pub(crate) mod tests {
             key,
             seen("a3", "web", now - TimeDelta::minutes(30), 2, false),
         );
-        assert!(c.evaluate(&rules, "sshd", key, "web", now).is_empty());
+        assert!(c.evaluate(&rules, "sshd", key, "web", None, now).is_empty());
         c.record("sshd", key, seen("a3", "web", now, 2, false));
-        let t = c.evaluate(&rules, "sshd", key, "web", now);
+        let t = c.evaluate(&rules, "sshd", key, "web", None, now);
         assert_eq!((t.len(), t[0].failures), (1, 6));
         assert_eq!(t[0].agents, ["a1", "a2", "a3"]);
         // fires once per ban
         c.record("sshd", key, seen("a4", "web", now, 5, false));
-        assert!(c.evaluate(&rules, "sshd", key, "web", now).is_empty());
+        assert!(c.evaluate(&rules, "sshd", key, "web", None, now).is_empty());
         // local bans are not failures for threshold rules
         let k2: IpNet = "203.0.113.8/32".parse().unwrap();
         for a in ["a1", "a2", "a3"] {
             c.record("sshd", k2, seen(a, "web", now, 5, true));
         }
-        assert!(c.evaluate(&rules, "sshd", k2, "web", now).is_empty());
+        assert!(c.evaluate(&rules, "sshd", k2, "web", None, now).is_empty());
     }
 
     #[test]
@@ -711,27 +750,28 @@ pub(crate) mod tests {
         c.record("sshd", key, seen("w1", "web", now, 5, true));
         c.record("sshd", key, seen("d1", "db", now, 5, true));
         assert!(
-            c.evaluate(&rules, "sshd", key, "web", now).is_empty(),
+            c.evaluate(&rules, "sshd", key, "web", None, now).is_empty(),
             "only web counts"
         );
         c.record("sshd", key, seen("w1", "web", now, 5, true));
         assert!(
-            c.evaluate(&rules, "sshd", key, "web", now).is_empty(),
+            c.evaluate(&rules, "sshd", key, "web", None, now).is_empty(),
             "same agent twice is one vote"
         );
         c.record("nginx", key, seen("w2", "web", now, 5, true));
         assert!(
-            c.evaluate(&rules, "nginx", key, "web", now).is_empty(),
+            c.evaluate(&rules, "nginx", key, "web", None, now)
+                .is_empty(),
             "other jail"
         );
         c.record("sshd", key, seen("w2", "web", now, 5, true));
-        assert_eq!(c.evaluate(&rules, "sshd", key, "web", now).len(), 1);
+        assert_eq!(c.evaluate(&rules, "sshd", key, "web", None, now).len(), 1);
 
         let mut m = rule(RuleKind::Threshold, 1, 3);
         m.monitor = true;
         let k: IpNet = "198.51.100.1/32".parse().unwrap();
         c.record("sshd", k, seen("w1", "web", now, 3, false));
-        let t = c.evaluate(&[m], "sshd", k, "web", now);
+        let t = c.evaluate(&[m], "sshd", k, "web", None, now);
         assert!(t[0].monitor);
         assert_eq!(c.hits().len(), 1);
     }

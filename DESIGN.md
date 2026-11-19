@@ -928,7 +928,9 @@ df2bctl config check | reload
   read into memory; housekeeping (every minute) reloads one whose mtime
   changed (e.g. `geoipupdate`), a broken update keeps the previous data
   and shows "reload failed". No file is downloaded or shipped (licenses):
-  the operator provides them. Display only — never used for decisions.
+  the operator provides them. Used for display, and for decisions only
+  where an operator asks for it explicitly (ASN allowlist entries, rules
+  limited to some AS; below).
   - API: `geo` in `GET /api/v1/history`; `geo` (target → record, unknown
     left out) in `GET /api/v1/decisions`; `geoip`, `top_asns`,
     `top_countries` in `GET /api/v1/stats` (active bans); the loaded
@@ -942,7 +944,20 @@ df2bctl config check | reload
     NETWORK column in `bans list`, files in `status`.
   - Tests build small MaxMind DB files (a minimal writer in
     `geo::testdb`) and read them with the real reader.
-- Not yet: ASN-based rules or allowlist entries.
+- **ASN allowlist entries** (`AS64500` wherever a network is accepted:
+  API `POST/DELETE /api/v1/allowlist`, `df2bctl allowlist add|rm`, the
+  Allowlist page; admin; permanent only): stored in their own table and
+  expanded into the AS's networks from all loaded databases (walking them:
+  at start, on adding, after a database reload). The networks count for
+  the controller's checks and go to agents as ordinary entries; adding one
+  lifts overlapping bans (unless `unban: false`). Without ASN data an entry
+  matches nothing (shown as "none known"). The controller keeps every
+  allowlist source in one prefix trie, rebuilt on changes and when the
+  next temporary entry expires. Data errors can only mean fewer bans.
+- **Rules limited to autonomous systems**: correlation rules take `asns`
+  (API, `df2bctl correlation set --asn`, rule dialog); such a rule only
+  applies to addresses whose AS (GeoIP) is listed — unknown AS: it does not
+  apply. The AS is looked up only when some rule is limited.
 
 Pages:
 

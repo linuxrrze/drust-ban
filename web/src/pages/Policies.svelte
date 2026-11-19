@@ -310,7 +310,10 @@
                 <td><strong>{r.name}</strong></td>
                 <td>{describe(r)}</td>
                 <td>{r.jail ?? 'all'}</td>
-                <td>{r.group ? `group ${r.group}` : 'all'}</td>
+                <td>
+                  {r.group ? `group ${r.group}` : 'all'}
+                  {#if r.asns?.length}<div class="faint small mono">only {r.asns.map((a) => `AS${a}`).join(', ')}</div>{/if}
+                </td>
                 <td>
                   {#if !r.enabled}<span class="pill plain">off</span>
                   {:else if r.monitor}<span class="pill warn">monitor</span>

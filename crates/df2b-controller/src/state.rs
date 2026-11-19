@@ -179,6 +179,13 @@ pub struct Controller {
     token_last_used: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Allowlist entries added through the API (persisted in the store).
     allow_entries: Mutex<Vec<AllowEntry>>,
+    /// Allowlisted autonomous systems (persisted) and their networks from
+    /// the GeoIP databases (recomputed when those change).
+    asn_allow: Mutex<Vec<crate::store::AsnAllow>>,
+    asn_nets: Mutex<HashMap<u32, Vec<IpNet>>>,
+    /// Every live entry (--allow, API, ASN networks) as a prefix trie, and
+    /// when the next temporary one expires (then it is rebuilt).
+    allow_trie: Mutex<(Allowlist, Option<DateTime<Utc>>)>,
     /// The complete allowlist as sent to agents; changes wake up streams.
     allow_tx: tokio::sync::watch::Sender<Arc<AllowSnapshot>>,
     /// Central jail settings; streams send each agent its group's merge.
@@ -330,6 +337,10 @@ pub enum AllowError {
     Fixed(IpNet),
     #[error("{0} is not on the allowlist")]
     Missing(IpNet),
+    #[error("AS{0} is already on the allowlist")]
+    AsnExists(u32),
+    #[error("AS{0} is not on the allowlist")]
+    AsnMissing(u32),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
@@ -356,6 +367,7 @@ impl Controller {
             inner.count(&d);
         })?;
         let allow_entries = store.allow_entries()?;
+        let asn_allow = store.allow_asns()?;
         for a in store.agents()? {
             inner.agents.insert(a.id.clone(), a);
         }
@@ -424,7 +436,7 @@ impl Controller {
                 .collect(),
         )))
         .0;
-        Ok(Self {
+        let this = Self {
             settings,
             ca,
             store,
@@ -434,6 +446,9 @@ impl Controller {
             token_last_used: Mutex::new(HashMap::new()),
             allow_tx,
             allow_entries: Mutex::new(allow_entries),
+            asn_allow: Mutex::new(asn_allow),
+            asn_nets: Mutex::new(HashMap::new()),
+            allow_trie: Mutex::new((Allowlist::default(), None)),
             jail_tx,
             propagate: Mutex::new(propagate),
             jail_write: Mutex::new(()),
@@ -443,11 +458,17 @@ impl Controller {
             geo: Default::default(),
             redaction,
             redaction_tx,
-        })
+        };
+        {
+            let entries = this.allow_lock();
+            this.publish_allowlist(&entries);
+        }
+        Ok(this)
     }
 
     pub fn with_geo(mut self, geo: crate::geo::Geo) -> Self {
         self.geo = geo;
+        self.refresh_asn_networks();
         self
     }
 
@@ -686,18 +707,96 @@ impl Controller {
         self.allow_entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether banning `net` would touch an allowlisted address (fixed and
-    /// API entries).
-    /// Whether banning `net` would touch an allowlisted address (fixed and
-    /// API entries; temporary ones until they expire).
+    fn trie_lock(&self) -> MutexGuard<'_, (Allowlist, Option<DateTime<Utc>>)> {
+        self.allow_trie.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether banning `net` would touch an allowlisted address (fixed,
+    /// API and ASN entries; temporary ones until they expire).
     pub fn allowlisted(&self, net: &IpNet) -> bool {
-        let now = Utc::now();
-        self.settings.allowlist.overlaps(net)
-            || self
-                .allow_lock()
-                .iter()
-                .filter(|e| e.is_live(now))
-                .any(|e| e.net.contains(net) || net.contains(&e.net))
+        let stale = self.trie_lock().1.is_some_and(|t| t <= Utc::now());
+        if stale {
+            // lock order: entries, ASN networks, trie
+            let entries = self.allow_lock();
+            self.publish_allowlist(&entries);
+        }
+        self.trie_lock().0.overlaps(net)
+    }
+
+    /// Looks up the networks of the allowlisted autonomous systems again
+    /// (start, GeoIP reload, new entry) and publishes the result.
+    /// Blocking: walks the databases.
+    pub fn refresh_asn_networks(&self) {
+        let asns: Vec<u32> = self.asn_lock().iter().map(|a| a.asn).collect();
+        if asns.is_empty() && self.asn_nets_lock().is_empty() {
+            return;
+        }
+        let nets = self.geo.networks_of(&asns);
+        for a in &asns {
+            let n = nets.get(a).map_or(0, Vec::len);
+            if n == 0 {
+                tracing::warn!(asn = a, "allowlisted AS has no networks in the GeoIP data");
+            } else {
+                tracing::info!(asn = a, networks = n, "allowlisted AS");
+            }
+        }
+        let entries = self.allow_lock();
+        *self.asn_nets_lock() = nets;
+        self.publish_allowlist(&entries);
+    }
+
+    fn asn_lock(&self) -> MutexGuard<'_, Vec<crate::store::AsnAllow>> {
+        self.asn_allow.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn asn_nets_lock(&self) -> MutexGuard<'_, HashMap<u32, Vec<IpNet>>> {
+        self.asn_nets.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Allowlisted autonomous systems with their current networks.
+    pub fn allowlist_asns(&self) -> Vec<(crate::store::AsnAllow, Vec<IpNet>)> {
+        let nets = self.asn_nets_lock().clone();
+        let mut v: Vec<_> = self
+            .asn_lock()
+            .iter()
+            .map(|a| (a.clone(), nets.get(&a.asn).cloned().unwrap_or_default()))
+            .collect();
+        v.sort_by_key(|(a, _)| a.asn);
+        v
+    }
+
+    /// Adds an autonomous system (blocking: one fsync, then a walk of the
+    /// GeoIP databases). Returns its networks.
+    pub fn add_allow_asn(&self, e: crate::store::AsnAllow) -> Result<Vec<IpNet>, AllowError> {
+        {
+            let mut list = self.asn_lock();
+            if list.iter().any(|a| a.asn == e.asn) {
+                return Err(AllowError::AsnExists(e.asn));
+            }
+            self.store.put_allow_asn(&e)?;
+            list.push(e.clone());
+        }
+        let nets = self
+            .geo
+            .networks_of(&[e.asn])
+            .remove(&e.asn)
+            .unwrap_or_default();
+        let entries = self.allow_lock();
+        self.asn_nets_lock().insert(e.asn, nets.clone());
+        self.publish_allowlist(&entries);
+        Ok(nets)
+    }
+
+    /// Removes an autonomous system (blocking).
+    pub fn remove_allow_asn(&self, asn: u32) -> Result<(), AllowError> {
+        if !self.store.delete_allow_asn(asn)? {
+            return Err(AllowError::AsnMissing(asn));
+        }
+        self.asn_lock().retain(|a| a.asn != asn);
+        let entries = self.allow_lock();
+        self.asn_nets_lock().remove(&asn);
+        self.publish_allowlist(&entries);
+        Ok(())
     }
 
     /// All live entries: `--allow` first, then API entries by network.
@@ -790,22 +889,33 @@ impl Controller {
         Ok(expired.len())
     }
 
+    /// Rebuilds the trie and sends the list to agents. Called with the
+    /// entries locked (lock order: entries, ASN networks, trie).
     fn publish_allowlist(&self, entries: &[AllowEntry]) {
         let now = Utc::now();
-        let snap = AllowSnapshot::new(
-            self.settings
-                .allowlist
-                .iter()
-                .map(|n| (*n, None))
-                .chain(
-                    entries
-                        .iter()
-                        .filter(|e| e.is_live(now))
-                        .map(|e| (e.net, e.expires_at)),
-                )
-                .collect(),
-        );
-        self.allow_tx.send_replace(Arc::new(snap));
+        let asn = self.asn_nets_lock();
+        let all: Vec<(IpNet, Option<DateTime<Utc>>)> = self
+            .settings
+            .allowlist
+            .iter()
+            .map(|n| (*n, None))
+            .chain(
+                entries
+                    .iter()
+                    .filter(|e| e.is_live(now))
+                    .map(|e| (e.net, e.expires_at)),
+            )
+            .chain(asn.values().flatten().map(|n| (*n, None)))
+            .collect();
+        drop(asn);
+        let next = entries
+            .iter()
+            .filter(|e| e.is_live(now))
+            .filter_map(|e| e.expires_at)
+            .min();
+        *self.trie_lock() = (Allowlist::new(all.iter().map(|(n, _)| *n)), next);
+        self.allow_tx
+            .send_replace(Arc::new(AllowSnapshot::new(all)));
     }
 
     /// The current allowlist for agents, and a receiver for changes.
@@ -1700,7 +1810,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                k.evaluate(&[monitor.clone()], "sshd", key, "web", now)
+                k.evaluate(&[monitor.clone()], "sshd", key, "web", None, now)
                     .len(),
                 1
             );
@@ -1730,7 +1840,8 @@ mod tests {
             assert_eq!(k.recent(&key).len(), 2, "observations restored");
             assert_eq!(k.hits().len(), 1, "monitor hits restored");
             assert!(
-                k.evaluate(&[monitor], "sshd", key, "web", now).is_empty(),
+                k.evaluate(&[monitor], "sshd", key, "web", None, now)
+                    .is_empty(),
                 "no second firing after the restart"
             );
         }

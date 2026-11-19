@@ -443,7 +443,10 @@ async fn serve(args: Args) -> anyhow::Result<()> {
                 let (c, dir) = (ctl.clone(), dir.clone());
                 let _ = tokio::task::spawn_blocking(move || {
                     c.prune();
-                    c.geo.reload_changed();
+                    // networks of allowlisted autonomous systems may move
+                    if c.geo.reload_changed() {
+                        c.refresh_asn_networks();
+                    }
                     files::prune_tokens(&dir);
                 })
                 .await;

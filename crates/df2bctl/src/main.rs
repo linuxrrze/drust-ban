@@ -233,10 +233,12 @@ enum SessionsCmd {
 enum AllowlistCmd {
     /// Networks the controller never bans.
     List,
-    /// Add a network (admin); lifts active bans overlapping it.
+    /// Add a network or an autonomous system ("AS64500"; its networks come
+    /// from the controller's GeoIP data) (admin); lifts active bans
+    /// overlapping it.
     Add {
-        #[arg(value_parser = parse_target)]
-        target: IpNet,
+        #[arg(value_parser = parse_allow_target)]
+        target: String,
         #[arg(long)]
         comment: Option<String>,
         /// Keep active bans overlapping the network.
@@ -246,10 +248,10 @@ enum AllowlistCmd {
         #[arg(long = "for", value_parser = humantime::parse_duration)]
         ttl: Option<Duration>,
     },
-    /// Remove a network added through the API (admin).
+    /// Remove a network or autonomous system added through the API (admin).
     Rm {
-        #[arg(value_parser = parse_target)]
-        target: IpNet,
+        #[arg(value_parser = parse_allow_target)]
+        target: String,
     },
 }
 
@@ -361,6 +363,10 @@ enum CorrelationCmd {
         /// Only this group's agents count, and the ban applies there.
         #[arg(long)]
         group: Option<String>,
+        /// Only addresses in this autonomous system (repeatable; "AS64500"
+        /// or 64500; needs the controller's GeoIP data).
+        #[arg(long = "asn")]
+        asns: Vec<String>,
         /// Only record what would be banned.
         #[arg(long)]
         monitor: bool,
@@ -463,6 +469,18 @@ async fn run_local(cmd: Command, socket: &std::path::Path, json: bool) -> anyhow
             "not available with --local; the agent answers: status, jails list, bans list, ban, unban, config check|reload"
         ),
     }
+}
+
+/// An address, a prefix or "AS64500".
+fn parse_allow_target(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if let Some(d) = t.strip_prefix("AS").or_else(|| t.strip_prefix("as")) {
+        return match d.parse::<u32>() {
+            Ok(n) if n != 0 => Ok(format!("AS{n}")),
+            _ => Err(format!("{s}: not an AS number")),
+        };
+    }
+    parse_target(t).map(|n| n.to_string())
 }
 
 fn parse_target(s: &str) -> Result<IpNet, String> {
@@ -645,15 +663,27 @@ async fn run() -> anyhow::Result<()> {
                     max_bantime,
                     jail,
                     group,
+                    asns,
                     monitor,
                     disabled,
                 } => {
+                    let asns: Vec<String> = asns
+                        .iter()
+                        .map(|a| {
+                            let a = a.trim();
+                            if a.starts_with("AS") || a.starts_with("as") {
+                                a.to_owned()
+                            } else {
+                                format!("AS{a}")
+                            }
+                        })
+                        .collect();
                     let body = serde_json::json!({
                         "bantime_factor": bantime_factor, "max_bantime": max_bantime,
                         "kind": format!("{kind:?}").to_lowercase(),
                         "min_failures": min_failures.unwrap_or(0), "min_agents": min_agents,
                         "window": window, "bantime": bantime, "jail": jail, "group": group,
-                        "monitor": monitor, "enabled": !disabled,
+                        "monitor": monitor, "enabled": !disabled, "asns": asns,
                     });
                     commands::correlation_set(&c, &name, body, json).await
                 }

@@ -72,7 +72,11 @@ impl CertFiles {
     /// mtime/size/inode this also sees an in-place rewrite of the same
     /// size within the same second.
     fn stamp(&self) -> Option<[[u8; 32]; 2]> {
-        let s = |p: &PathBuf| std::fs::read(p).ok().map(|b| df2b_tls::pki::fingerprint(&b));
+        let s = |p: &PathBuf| {
+            std::fs::read(p)
+                .ok()
+                .map(|b| df2b_tls::pki::fingerprint(&b))
+        };
         Some([s(&self.cert)?, s(&self.key)?])
     }
 

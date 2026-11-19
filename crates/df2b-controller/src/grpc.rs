@@ -160,7 +160,13 @@ impl Service {
                 sample,
             };
             if c.record(&jail, net, seen) {
-                triggers.extend(c.evaluate(&rules, &jail, net, &record.group, now));
+                // the AS only matters to rules limited to some
+                let asn = if rules.iter().any(|r| !r.asns.is_empty()) {
+                    self.ctl.geo.lookup_net(&net).and_then(|g| g.asn)
+                } else {
+                    None
+                };
+                triggers.extend(c.evaluate(&rules, &jail, net, &record.group, asn, now));
             }
         }
         if consumed < batch.len() {
@@ -1295,6 +1301,7 @@ mod tests {
                 max_bantime: None,
                 enabled: true,
                 monitor,
+                asns: Vec::new(),
                 updated_by: "ada".into(),
                 updated_at: Utc::now(),
             };
