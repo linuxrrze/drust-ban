@@ -7,9 +7,16 @@ use std::time::Duration;
 use ipnet::IpNet;
 
 pub mod dry_run;
+pub mod exec;
+pub mod ipset;
 pub mod nftables;
 
+#[cfg(test)]
+mod testutil;
+
 pub use dry_run::DryRun;
+pub use exec::Exec;
+pub use ipset::Ipset;
 pub use nftables::Nftables;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

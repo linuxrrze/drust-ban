@@ -22,7 +22,10 @@ state_dir = "/var/lib/df2b"          # agent.redb: positions, offenders
 offense_memory = "30d"
 
 # "nftables" or "dry-run"
+# nftables (default), ipset (iptables + ipset), exec (a program, see
+# firewall_exec), dry-run (log only)
 firewall = "dry-run"
+# firewall_exec = ["/usr/local/bin/my-firewall"]   # with firewall = "exec"
 
 # Never ban these (CIDR notation).
 allowlist = ["127.0.0.0/8", "::1/128"]

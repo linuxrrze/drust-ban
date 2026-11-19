@@ -67,6 +67,10 @@ pub struct AgentSection {
     /// they hide.
     #[serde(default = "yes")]
     pub central_redaction: bool,
+    /// `firewall = "exec"`: program (absolute path) and arguments; it is
+    /// called with setup|ban|unban|check|list appended.
+    #[serde(default)]
+    pub firewall_exec: Vec<String>,
     /// Unix socket for `df2bctl --local` (default `<state_dir>/agent.sock`,
     /// mode 0600; "" turns it off).
     #[serde(default)]
@@ -89,6 +93,10 @@ impl AgentSection {
 pub enum FirewallKind {
     #[default]
     Nftables,
+    /// ipset sets with iptables/ip6tables DROP rules
+    Ipset,
+    /// a program (`firewall_exec`)
+    Exec,
     DryRun,
 }
 
@@ -226,6 +234,14 @@ impl AgentConfig {
         }
         if self.agent.ipv6_prefix == 0 || self.agent.ipv6_prefix > 128 {
             bail!("ipv6_prefix must be 1..=128");
+        }
+        match (self.agent.firewall, self.agent.firewall_exec.is_empty()) {
+            (FirewallKind::Exec, true) => bail!("firewall = \"exec\" needs firewall_exec"),
+            (FirewallKind::Exec, false) => {
+                df2b_firewall::Exec::new(self.agent.firewall_exec.clone())?;
+            }
+            (_, false) => bail!("firewall_exec is only used with firewall = \"exec\""),
+            (_, true) => {}
         }
         let mut names = HashSet::new();
         for s in &self.source {
@@ -390,7 +406,7 @@ pub fn controller_addr(url: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod addr_tests {
-    use super::controller_addr;
+    use super::{controller_addr, AgentConfig};
 
     #[test]
     fn controller_urls() {
@@ -408,5 +424,34 @@ mod addr_tests {
         for bad in ["http://ctl", "https://", "https://ctl/path", "2001:db8::1"] {
             assert!(controller_addr(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn firewall_backends() {
+        let check = |agent: &str| {
+            toml::from_str::<AgentConfig>(&format!("[agent]\n{agent}"))
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map_err(|e| e.to_string()))
+        };
+        assert!(check(r#"firewall = "ipset""#).is_ok());
+        assert!(check(
+            r#"firewall = "exec"
+firewall_exec = ["/usr/local/bin/fw", "--x"]"#
+        )
+        .is_ok());
+        assert!(check(r#"firewall = "exec""#).is_err(), "program missing");
+        assert!(
+            check(
+                r#"firewall = "exec"
+firewall_exec = ["fw"]"#
+            )
+            .is_err(),
+            "relative path"
+        );
+        assert!(
+            check(r#"firewall_exec = ["/usr/local/bin/fw"]"#).is_err(),
+            "without exec"
+        );
+        assert!(check(r#"firewall = "iptables""#).is_err());
     }
 }

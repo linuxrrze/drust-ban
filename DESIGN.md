@@ -422,8 +422,18 @@ table inet df2b {
   fails too, the table is set up again and everything re-added. Only
   presence is compared, not remaining timeouts. On agent start the table
   is recreated and re-populated from persisted state.
-- Further backends behind the `FirewallBackend` trait: iptables + ipset (legacy),
-  `exec` hook (custom scripts), `dry-run` (log only; for rollout).
+- Further backends behind the `FirewallBackend` trait (`firewall = …`):
+  - `ipset`: `hash:net` sets `df2b4`/`df2b6` with timeouts and one DROP
+    rule each at the top of INPUT (iptables/ip6tables `-m set`); batches
+    via `ipset restore`; no overlap conflicts. ipset timeouts end at
+    2147483 s (~24.8 days): longer bans go in without one and the reconcile
+    loop removes them when they expire. `list` reads `ipset save`, `check`
+    the sets and both rules.
+  - `exec` (`firewall_exec = ["/path/prog", args…]`): the program gets
+    `setup|ban|unban|check|list` as last argument, `PREFIX TIMEOUT` /
+    `PREFIX` lines on stdin; `list` prints prefixes or exits 2 ("cannot
+    list"). No shell, cleared environment, 60 s timeout.
+  - `dry-run` (log only; for rollout).
 
 **Controller-side actions** (network-wide; `--actions FILE`, module
 `actions.rs`, example `config/actions.example.toml`):

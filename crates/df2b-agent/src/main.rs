@@ -169,6 +169,8 @@ async fn main() -> anyhow::Result<()> {
     let stats = Arc::new(LinkStats::default());
     let inner: Arc<dyn FirewallBackend> = match cfg.agent.firewall {
         FirewallKind::Nftables => Arc::new(Nftables::default()),
+        FirewallKind::Ipset => Arc::new(df2b_firewall::Ipset::default()),
+        FirewallKind::Exec => Arc::new(df2b_firewall::Exec::new(cfg.agent.firewall_exec.clone())?),
         FirewallKind::DryRun => Arc::new(DryRun),
     };
     // every call's outcome goes into the heartbeats

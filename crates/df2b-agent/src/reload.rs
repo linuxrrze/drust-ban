@@ -42,6 +42,9 @@ fn restart_needed(old: &AgentSection, new: &AgentSection) -> Vec<&'static str> {
     if old.firewall != new.firewall {
         out.push("firewall");
     }
+    if old.firewall_exec != new.firewall_exec {
+        out.push("firewall_exec");
+    }
     if old.control_socket_path() != new.control_socket_path() {
         out.push("control_socket");
     }
@@ -59,6 +62,7 @@ fn keep_running(old: &AgentSection, new: &mut AgentSection) {
     new.controller.clone_from(&old.controller);
     new.state_dir.clone_from(&old.state_dir);
     new.firewall = old.firewall;
+    new.firewall_exec.clone_from(&old.firewall_exec);
     new.control_socket.clone_from(&old.control_socket);
     new.ipv4_prefix = old.ipv4_prefix;
     new.ipv6_prefix = old.ipv6_prefix;

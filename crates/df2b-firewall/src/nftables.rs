@@ -306,12 +306,10 @@ mod tests {
 
     /// A stand-in `nft` that prints `out` (exit 0) or fails.
     fn fake_nft(tag: &str, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("df2b-nft-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("nft");
-        std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testutil::write_script(&p, script);
         p
     }
 
