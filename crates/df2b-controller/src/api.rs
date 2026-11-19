@@ -317,6 +317,12 @@ pub fn router(ctl: Arc<Controller>) -> Router {
             "/api/v1/correlation/:name",
             axum::routing::put(set_rule).delete(delete_rule),
         )
+        .route("/api/v1/redaction", get(list_redaction))
+        .route("/api/v1/redaction/test", post(test_redaction))
+        .route(
+            "/api/v1/redaction/:name",
+            axum::routing::put(set_redaction).delete(delete_redaction),
+        )
         .route("/api/v1/filters", get(list_filters))
         .route("/api/v1/filters/test", post(test_filter))
         .route(
@@ -1321,6 +1327,171 @@ async fn delete_rule(
         return Err(ApiError::not_found(format!("no rule {name:?}")));
     }
     Ok(Json(json!({ "removed": name })))
+}
+
+// ------------------------------------------------- sample line redaction
+
+async fn list_redaction(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    let presets: Vec<Value> = df2b_core::redact::PRESETS
+        .iter()
+        .map(|(name, description, pattern, replace)| {
+            json!({ "name": name, "description": description, "pattern": pattern, "replace": replace })
+        })
+        .collect();
+    Ok(Json(json!({
+        "rules": *ctl.redaction_rules(),
+        "presets": presets,
+        "default_replace": df2b_core::redact::DEFAULT_REPLACE,
+        "max_rules": df2b_core::redact::MAX_RULES,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedactBody {
+    pattern: String,
+    replace: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+/// Admin: creates or replaces a redaction rule. Lines kept so far are
+/// redacted at once (memory and database).
+async fn set_redaction(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Json(req): Json<RedactBody>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    if !crate::policy::valid_jail(&name) {
+        return Err(ApiError::bad_request(
+            "invalid rule name (letters, digits, - _ .; at most 64)",
+        ));
+    }
+    let rule = df2b_core::RedactRule {
+        name: name.clone(),
+        pattern: req.pattern,
+        replace: req
+            .replace
+            .unwrap_or_else(|| df2b_core::redact::DEFAULT_REPLACE.to_owned()),
+        enabled: req.enabled,
+    };
+    df2b_core::redact::compile(&rule.pattern).map_err(ApiError::bad_request)?;
+    let rules = ctl.redaction_rules();
+    if !rules.iter().any(|r| r.name == name) && rules.len() >= df2b_core::redact::MAX_RULES {
+        return Err(ApiError::bad_request(format!(
+            "at most {} redaction rules",
+            df2b_core::redact::MAX_RULES
+        )));
+    }
+    let c = ctl.clone();
+    let audit_rule = serde_json::to_value(&rule).map_err(ApiError::internal)?;
+    let (replaced, redacted) = blocking(move || {
+        let (prev, changed) = c.set_redaction_rule(rule)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "redaction.set",
+            json!({ "rule": name, "definition": audit_rule, "replaced": prev.is_some(), "lines_redacted": changed }),
+        )?;
+        Ok((prev.is_some(), changed))
+    })
+    .await?;
+    Ok(Json(
+        json!({ "replaced": replaced, "lines_redacted": redacted }),
+    ))
+}
+
+async fn delete_redaction(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    let n = name.clone();
+    let found = blocking(move || {
+        let found = c.remove_redaction_rule(&n)?;
+        if found {
+            c.audit(
+                &caller.name,
+                caller.addr(),
+                "redaction.remove",
+                json!({ "rule": n }),
+            )?;
+        }
+        Ok(found)
+    })
+    .await?;
+    if !found {
+        return Err(ApiError::not_found(format!("no redaction rule {name:?}")));
+    }
+    Ok(Json(json!({ "removed": name })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedactTest {
+    /// a rule to try; without one, only the current rules apply
+    pattern: Option<String>,
+    replace: Option<String>,
+    /// the rule being edited (left out of the current rules)
+    name: Option<String>,
+    lines: Vec<String>,
+}
+
+/// Shows what lines look like after the current rules plus (optionally)
+/// a rule being edited, without storing anything. `stable`: applying the
+/// rules again changes nothing (needed because kept lines are redacted
+/// again whenever the rules change).
+async fn test_redaction(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Json(req): Json<RedactTest>,
+) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    if req.lines.len() > 100 || req.lines.iter().any(|l| l.len() > 4096) {
+        return Err(ApiError::bad_request("at most 100 lines of 4 KiB"));
+    }
+    let mut rules: Vec<df2b_core::RedactRule> = ctl
+        .redaction_rules()
+        .iter()
+        .filter(|r| req.name.as_deref() != Some(r.name.as_str()))
+        .cloned()
+        .collect();
+    if let Some(p) = req.pattern {
+        df2b_core::redact::compile(&p).map_err(ApiError::bad_request)?;
+        let rule = df2b_core::RedactRule {
+            name: req.name.clone().unwrap_or_else(|| "test".into()),
+            pattern: p,
+            replace: req
+                .replace
+                .unwrap_or_else(|| df2b_core::redact::DEFAULT_REPLACE.to_owned()),
+            enabled: true,
+        };
+        // an edited rule keeps its place
+        match req
+            .name
+            .as_deref()
+            .and_then(|n| ctl.redaction_rules().iter().position(|r| r.name == n))
+        {
+            Some(i) => rules.insert(i.min(rules.len()), rule),
+            None => rules.push(rule),
+        }
+    }
+    let r = df2b_core::Redactor::new(&rules).map_err(ApiError::bad_request)?;
+    let results: Vec<Value> = req
+        .lines
+        .iter()
+        .map(|l| {
+            let once = df2b_core::sample_line(&r.apply(&df2b_core::sample_line(l)));
+            let twice = df2b_core::sample_line(&r.apply(&once));
+            json!({ "line": once, "stable": once == twice })
+        })
+        .collect();
+    Ok(Json(json!({ "results": results })))
 }
 
 // ----------------------------------------------------------- central jails
@@ -4625,6 +4796,169 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn sample_redaction_rules() {
+        let env = Env::new("redact").await;
+        let viewer = env.token("vic", Role::Viewer);
+        let op = env.token("olga", Role::Operator);
+        let admin = env.token("ada", Role::Admin);
+        let send = |method: &'static str, tok: &str, path: &str, body: Value| {
+            let (env, tok, url) = (&env, tok.to_owned(), format!("{}{path}", env.base));
+            async move {
+                let req = match method {
+                    "PUT" => env.http.put(url).json(&body),
+                    _ => env.http.delete(url),
+                };
+                let r = req.bearer_auth(tok).send().await.unwrap();
+                (r.status(), r.json::<Value>().await.unwrap_or(Value::Null))
+            }
+        };
+        // a line kept before any rule (memory and database)
+        let key: IpNet = "203.0.113.4/32".parse().unwrap();
+        env.ctl.correlator.lock().unwrap().record(
+            "sshd",
+            key,
+            crate::correlation::Seen {
+                agent: "web-1".into(),
+                group: "web".into(),
+                at: Utc::now(),
+                failures: 1,
+                banned: false,
+                sample: Some("Failed password for alice from 203.0.113.4 port 22".into()),
+            },
+        );
+        env.ctl.flush_observations();
+
+        let (st, v) = env
+            .call("GET", "/api/v1/redaction", &viewer, json!({}))
+            .await;
+        assert_eq!(st, S::OK);
+        assert_eq!(v["rules"], json!([]));
+        assert_eq!(v["presets"][0]["name"], "ssh-user");
+        let rule = json!({ "pattern": r"(for )\S+( from)", "replace": "${1}[user]${2}" });
+        assert_eq!(
+            send("PUT", &op, "/api/v1/redaction/ssh-user", rule.clone())
+                .await
+                .0,
+            S::FORBIDDEN
+        );
+        for (name, body, want) in [
+            ("bad name", rule.clone(), "rule name"),
+            ("x", json!({ "pattern": "(" }), "invalid pattern"),
+            ("x", json!({ "pattern": "a*" }), "empty string"),
+        ] {
+            let (st, v) = send("PUT", &admin, &format!("/api/v1/redaction/{name}"), body).await;
+            assert_eq!(st, S::BAD_REQUEST, "{v}");
+            assert!(v["error"].as_str().unwrap().contains(want), "{v}");
+        }
+
+        // preview (not stored), with the stability check
+        let (_, v) = env
+            .call(
+                "POST",
+                "/api/v1/redaction/test",
+                &viewer,
+                json!({ "pattern": r"(for )\S+( from)", "replace": "${1}[user]${2}", "lines": ["Failed password for bob from x"] }),
+            )
+            .await;
+        assert_eq!(
+            v["results"][0],
+            json!({ "line": "Failed password for [user] from x", "stable": true })
+        );
+        let (_, v) = env
+            .call(
+                "POST",
+                "/api/v1/redaction/test",
+                &viewer,
+                json!({ "pattern": "x", "replace": "xx", "lines": ["x"] }),
+            )
+            .await;
+        assert_eq!(v["results"][0]["stable"], false);
+
+        let (st, v) = send("PUT", &admin, "/api/v1/redaction/ssh-user", rule).await;
+        assert_eq!(st, S::OK, "{v}");
+        assert_eq!(
+            (v["replaced"].as_bool(), v["lines_redacted"].as_u64()),
+            (Some(false), Some(2)),
+            "the kept line, in memory and in the database"
+        );
+        let (_, v) = env
+            .call(
+                "GET",
+                "/api/v1/history?target=203.0.113.4",
+                &viewer,
+                json!({}),
+            )
+            .await;
+        assert_eq!(
+            v["samples"][0]["line"],
+            "Failed password for [user] from 203.0.113.4 port 22"
+        );
+        let stored = env
+            .ctl
+            .store
+            .observations(Utc::now() - chrono::Duration::hours(1))
+            .unwrap();
+        assert_eq!(
+            stored[0].sample.as_deref(),
+            Some("Failed password for [user] from 203.0.113.4 port 22")
+        );
+        // without a pattern the test applies the current rules
+        let (_, v) = env
+            .call(
+                "POST",
+                "/api/v1/redaction/test",
+                &viewer,
+                json!({ "lines": ["Failed password for root from y"] }),
+            )
+            .await;
+        assert_eq!(v["results"][0]["line"], "Failed password for [user] from y");
+
+        // disabled, then removed; audited
+        let (_, v) = send(
+            "PUT",
+            &admin,
+            "/api/v1/redaction/ssh-user",
+            json!({ "pattern": "for", "enabled": false }),
+        )
+        .await;
+        assert_eq!(v["replaced"], true);
+        let (_, v) = env
+            .call("GET", "/api/v1/redaction", &viewer, json!({}))
+            .await;
+        assert_eq!(
+            (
+                v["rules"][0]["enabled"].as_bool(),
+                v["rules"][0]["replace"].as_str()
+            ),
+            (Some(false), Some("[redacted]"))
+        );
+        assert_eq!(
+            send("DELETE", &admin, "/api/v1/redaction/ssh-user", json!({}))
+                .await
+                .0,
+            S::OK
+        );
+        assert_eq!(
+            send("DELETE", &admin, "/api/v1/redaction/ssh-user", json!({}))
+                .await
+                .0,
+            S::NOT_FOUND
+        );
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let actions: Vec<&str> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["action"].as_str())
+            .filter(|a| a.starts_with("redaction."))
+            .collect();
+        assert_eq!(
+            actions,
+            ["redaction.remove", "redaction.set", "redaction.set"]
+        );
     }
 
     #[tokio::test]

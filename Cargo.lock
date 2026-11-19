@@ -661,6 +661,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ipnet",
+ "regex",
  "serde",
  "serde_json",
  "uuid",

@@ -300,6 +300,32 @@ impl Correlator {
         q.push_back(sample);
     }
 
+    /// Applies redaction rules to the kept sample lines (also those not
+    /// yet written); returns how many changed.
+    pub fn redact_samples(&mut self, r: &df2b_core::Redactor) -> usize {
+        if r.is_empty() {
+            return 0;
+        }
+        let redact = |line: &mut String| {
+            let new = df2b_core::sample_line(&r.apply(line));
+            let changed = new != *line;
+            *line = new;
+            changed
+        };
+        let mut n = 0;
+        for q in self.samples.values_mut() {
+            for s in q.iter_mut() {
+                n += usize::from(redact(&mut s.line));
+            }
+        }
+        for o in &mut self.pending {
+            if let Some(l) = o.sample.as_mut() {
+                redact(l);
+            }
+        }
+        n
+    }
+
     /// Replays stored observations and state (startup). Observations
     /// older than `keep` and expired pauses are skipped.
     pub fn restore(

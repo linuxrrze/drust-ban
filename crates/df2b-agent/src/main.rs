@@ -230,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
                                 locally_banned: true,
                                 local_ban_expires_unix_ms: action.until.timestamp_millis(),
                                 sample: if cfg.agent.send_samples {
-                                    df2b_core::sample_line(&action.sample)
+                                    engine.sample(&action.sample)
                                 } else {
                                     String::new()
                                 },

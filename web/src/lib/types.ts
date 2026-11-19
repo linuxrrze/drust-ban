@@ -265,3 +265,18 @@ export interface CorrelationHit {
   agents: string[];
   at: string;
 }
+
+/** a rule that rewrites sample log lines on the controller */
+export interface RedactRule {
+  name: string;
+  pattern: string;
+  replace: string;
+  enabled: boolean;
+}
+
+export interface RedactPreset {
+  name: string;
+  description: string;
+  pattern: string;
+  replace: string;
+}

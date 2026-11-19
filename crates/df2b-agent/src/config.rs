@@ -16,6 +16,10 @@ pub struct AgentConfig {
     pub source: Vec<SourceConfig>,
     #[serde(default)]
     pub jail: Vec<JailConfig>,
+    /// Applied to sample log lines before they leave this host (in order;
+    /// the controller may redact further).
+    #[serde(default)]
+    pub redact: Vec<df2b_core::RedactRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +196,7 @@ impl AgentConfig {
         if let Some(c) = &self.agent.controller {
             controller_addr(c)?;
         }
+        df2b_core::Redactor::new(&self.redact).map_err(|e| anyhow::anyhow!("redact: {e}"))?;
         if self.agent.ipv4_prefix == 0 || self.agent.ipv4_prefix > 32 {
             bail!("ipv4_prefix must be 1..=32");
         }
@@ -251,6 +256,44 @@ mod tests {
             } if d == Duration::from_secs(600)
         ));
         assert!(matches!(cfg.source[1].kind, SourceKind::File { .. }));
+    }
+
+    #[test]
+    fn redaction_rules() {
+        let parse = |rules: &str| {
+            let cfg: AgentConfig = toml::from_str(&format!("[agent]\n{rules}")).unwrap();
+            cfg.validate().map(|()| cfg)
+        };
+        let cfg = parse(
+            r#"
+            [[redact]]
+            pattern = '(for )\S+( from)'
+            replace = "${1}[user]${2}"
+            [[redact]]
+            pattern = '[\w.]+@[\w.]+'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.redact.len(), 2);
+        assert_eq!(cfg.redact[1].replace, df2b_core::redact::DEFAULT_REPLACE);
+        let err = parse("[[redact]]\npattern = '('").unwrap_err();
+        assert!(format!("{err:#}").contains("redact"), "{err:#}");
+        // the commented example in agent.example.toml works
+        let example = include_str!("../../../config/agent.example.toml")
+            .replace("# [[redact]]", "[[redact]]")
+            .replace("# pattern = '", "pattern = '")
+            .replace("# replace = '", "replace = '");
+        let cfg: AgentConfig = toml::from_str(&example).unwrap();
+        cfg.validate().unwrap();
+        let r = df2b_core::Redactor::new(&cfg.redact).unwrap();
+        assert_eq!(
+            r.apply("Failed password for invalid user admin from 203.0.113.7 port 22"),
+            "Failed password for [user] from 203.0.113.7 port 22"
+        );
+        // typos are errors, as elsewhere in agent.toml
+        let typo: Result<AgentConfig, _> =
+            toml::from_str("[agent]\n[[redact]]\npattern = 'x'\nreplacement = 'y'");
+        assert!(typo.is_err());
     }
 
     #[test]

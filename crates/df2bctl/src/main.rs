@@ -127,6 +127,9 @@ enum Command {
     /// Correlation rules (DESIGN.md §4.2).
     #[command(subcommand)]
     Correlation(CorrelationCmd),
+    /// Rules that rewrite sample log lines on the controller.
+    #[command(subcommand)]
+    Redaction(RedactionCmd),
     /// Show or set (admin) where agents' local bans apply: global, group or
     /// off.
     Propagate {
@@ -139,6 +142,39 @@ enum Command {
     /// Configuration management.
     #[command(subcommand)]
     Config(ConfigCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum RedactionCmd {
+    /// The rules (in order) and the presets.
+    List,
+    /// Create or replace a rule (admin); lines kept so far are rewritten.
+    Set {
+        name: String,
+        /// Regular expression, e.g. '(for )\S+( from)'.
+        #[arg(long)]
+        pattern: String,
+        /// Replacement; $1, ${name} for groups (default "[redacted]").
+        #[arg(long)]
+        replace: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Add a preset (ssh-user, auth-header, email, url-query) under its name.
+    Preset {
+        name: String,
+    },
+    Rm {
+        name: String,
+    },
+    /// Show what lines look like after the current rules (and --pattern).
+    Test {
+        lines: Vec<String>,
+        #[arg(long)]
+        pattern: Option<String>,
+        #[arg(long)]
+        replace: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -580,6 +616,30 @@ async fn run() -> anyhow::Result<()> {
                     commands::correlation_set(&c, &name, body, json).await
                 }
                 CorrelationCmd::Rm { name } => commands::correlation_rm(&c, &name, json).await,
+            }
+        }
+        Command::Redaction(cmd) => {
+            let c = client()?;
+            match cmd {
+                RedactionCmd::List => commands::redaction_list(&c, json).await,
+                RedactionCmd::Set {
+                    name,
+                    pattern,
+                    replace,
+                    disabled,
+                } => {
+                    let body = serde_json::json!({
+                        "pattern": pattern, "replace": replace, "enabled": !disabled,
+                    });
+                    commands::redaction_set(&c, &name, body, json).await
+                }
+                RedactionCmd::Preset { name } => commands::redaction_preset(&c, &name, json).await,
+                RedactionCmd::Rm { name } => commands::redaction_rm(&c, &name, json).await,
+                RedactionCmd::Test {
+                    lines,
+                    pattern,
+                    replace,
+                } => commands::redaction_test(&c, lines, pattern, replace, json).await,
             }
         }
         Command::Propagate { mode } => {

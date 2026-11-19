@@ -7,6 +7,7 @@
 //! atomically, so no decision falls between the initial snapshot/backlog and
 //! the live stream.
 
+use df2b_core::{RedactRule, Redactor};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -163,7 +164,7 @@ impl Inner {
 pub struct Controller {
     pub settings: Settings,
     pub ca: Ca,
-    store: Store,
+    pub(crate) store: Store,
     inner: Mutex<Inner>,
     events: broadcast::Sender<Arc<Decision>>,
     pub sessions: Sessions,
@@ -183,6 +184,8 @@ pub struct Controller {
     central_tx: tokio::sync::watch::Sender<Arc<crate::central::CentralConfig>>,
     /// Correlation rules (stored) and what agents observed (memory).
     rules: Mutex<Arc<Vec<crate::correlation::Rule>>>,
+    /// Redaction rules for sample log lines, and the compiled enabled ones.
+    redaction: Mutex<(Arc<Vec<RedactRule>>, Arc<Redactor>)>,
     pub correlator: Mutex<crate::correlation::Correlator>,
     /// ASN/country databases (optional; display only)
     pub geo: crate::geo::Geo,
@@ -334,6 +337,23 @@ impl Controller {
                 "correlation observations restored"
             );
         }
+        // stored rules that no longer compile are skipped, not fatal
+        let redaction_rules: Vec<RedactRule> = store
+            .setting::<Vec<RedactRule>>("redaction")?
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| match df2b_core::redact::compile(&r.pattern) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(rule = %r.name, error = %e, "ignoring redaction rule");
+                    false
+                }
+            })
+            .collect();
+        let redactor = Redactor::new(&redaction_rules).unwrap_or_default();
+        // rows written before a rule was added are redacted now
+        correlator.redact_samples(&redactor);
+        let redaction = Mutex::new((Arc::new(redaction_rules), Arc::new(redactor)));
         let rules = Mutex::new(Arc::new(rules));
         // a stored change wins over the default; an explicit flag is
         // applied by main.rs with set_propagate
@@ -371,6 +391,7 @@ impl Controller {
             rules,
             correlator: Mutex::new(correlator),
             geo: Default::default(),
+            redaction,
         })
     }
 
@@ -835,6 +856,75 @@ impl Controller {
         v.retain(|x| x.name != name);
         *rules = Arc::new(v);
         Ok(true)
+    }
+
+    pub fn redaction_rules(&self) -> Arc<Vec<RedactRule>> {
+        self.redaction
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone()
+    }
+
+    /// The enabled redaction rules, compiled.
+    pub fn redactor(&self) -> Arc<Redactor> {
+        self.redaction
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .clone()
+    }
+
+    /// Changes the redaction rules with `edit` (one writer at a time) and
+    /// redacts the sample lines kept so far, in memory and in the database,
+    /// so no line that a rule now hides stays anywhere. `edit` returns its
+    /// result, or None for "nothing changed". Blocking.
+    fn edit_redaction<T>(
+        &self,
+        edit: impl FnOnce(&mut Vec<RedactRule>) -> Option<T>,
+    ) -> anyhow::Result<Option<(T, usize)>> {
+        let mut cur = self.redaction.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rules = (*cur.0).clone();
+        let Some(out) = edit(&mut rules) else {
+            return Ok(None);
+        };
+        let redactor = Redactor::new(&rules).map_err(|e| anyhow::anyhow!(e))?;
+        self.store.put_setting("redaction", &rules)?;
+        let mut changed = self
+            .correlator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .redact_samples(&redactor);
+        changed += self
+            .store
+            .map_observation_samples(|l| df2b_core::sample_line(&redactor.apply(l)))?;
+        *cur = (Arc::new(rules), Arc::new(redactor));
+        Ok(Some((out, changed)))
+    }
+
+    /// Adds or replaces (in place) a redaction rule; returns the previous
+    /// one and how many kept lines changed. Blocking.
+    pub fn set_redaction_rule(&self, r: RedactRule) -> anyhow::Result<(Option<RedactRule>, usize)> {
+        let done = self.edit_redaction(|v| {
+            Some(match v.iter_mut().find(|x| x.name == r.name) {
+                Some(x) => Some(std::mem::replace(x, r)),
+                None => {
+                    v.push(r);
+                    None
+                }
+            })
+        })?;
+        Ok(done.unwrap_or((None, 0)))
+    }
+
+    /// False if there is no such rule. Blocking.
+    pub fn remove_redaction_rule(&self, name: &str) -> anyhow::Result<bool> {
+        let done = self.edit_redaction(|v| {
+            let before = v.len();
+            v.retain(|x| x.name != name);
+            (v.len() != before).then_some(())
+        })?;
+        Ok(done.is_some())
     }
 
     /// Earlier correlation bans of exactly this target within

@@ -92,6 +92,7 @@ impl Service {
         // agent timestamps in controller time (skew from heartbeats)
         let skew = chrono::Duration::milliseconds(self.ctl.clock_skew_ms(&record.id));
         let oldest = now - chrono::Duration::from_std(MAX_WINDOW).unwrap_or_default();
+        let redactor = self.ctl.redactor();
         let mut parsed = Vec::new();
         for o in batch {
             let banned = o.locally_banned;
@@ -114,8 +115,10 @@ impl Service {
                 at,
                 if banned { 0 } else { o.count },
                 banned,
-                // untrusted: cleaned and cut again
-                (!o.sample.trim().is_empty()).then(|| df2b_core::sample_line(&o.sample)),
+                // untrusted: cleaned, redacted (central rules) and cut again
+                (!o.sample.trim().is_empty()).then(|| {
+                    df2b_core::sample_line(&redactor.apply(&df2b_core::sample_line(&o.sample)))
+                }),
             ));
         }
         let mut c = self
@@ -1171,6 +1174,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctl.last_seq(), 1);
+        // sample lines: cleaned and redacted by the central rules on arrival
+        ctl.set_redaction_rule(df2b_core::RedactRule {
+            name: "ssh-user".into(),
+            pattern: r"(for )\S+( from)".into(),
+            replace: "${1}[user]${2}".into(),
+            enabled: true,
+        })
+        .unwrap();
+        a.report(report(vec![v1::Observation {
+            sample: "Failed password for alice from 203.0.113.9 port 22\x1b[0m".into(),
+            ..fails("203.0.113.9/32", 1, 0)
+        }]))
+        .await
+        .unwrap();
+        let samples = ctl
+            .correlator
+            .lock()
+            .unwrap()
+            .samples(&"203.0.113.9/32".parse().unwrap());
+        assert_eq!(
+            samples[0].2.line,
+            "Failed password for [user] from 203.0.113.9 port 22 [0m"
+        );
         // allowlisted addresses are never correlated
         a.report(report(vec![fails("10.1.1.1/32", 50, 0)]))
             .await

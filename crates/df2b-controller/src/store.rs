@@ -393,6 +393,37 @@ impl Store {
         Ok(out)
     }
 
+    /// Rewrites the sample lines of stored observations with `f` (after a
+    /// redaction rule changed); returns how many changed. Blocking.
+    pub fn map_observation_samples(&self, f: impl Fn(&str) -> String) -> anyhow::Result<usize> {
+        let tx = self.db.begin_write()?;
+        let mut n = 0;
+        {
+            let mut t = tx.open_table(OBSERVATIONS)?;
+            let mut updates = Vec::new();
+            for item in t.iter()? {
+                let (k, v) = item?;
+                let Ok(mut row) = serde_json::from_slice::<serde_json::Value>(v.value()) else {
+                    continue;
+                };
+                let Some(line) = row["obs"]["sample"].as_str() else {
+                    continue;
+                };
+                let new = f(line);
+                if new != line {
+                    row["obs"]["sample"] = serde_json::Value::String(new);
+                    updates.push((k.value(), serde_json::to_vec(&row)?));
+                }
+            }
+            for (k, v) in &updates {
+                t.insert(*k, v.as_slice())?;
+            }
+            n += updates.len();
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Deletes observations received before `before`; returns how many.
     pub fn prune_observations(&self, before: DateTime<Utc>) -> anyhow::Result<usize> {
         #[derive(Deserialize)]

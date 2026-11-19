@@ -174,6 +174,8 @@ pub struct Engine {
     observations: Option<HashMap<(String, IpKey), Observed>>,
     /// Keep the latest matching line per observation.
     samples: bool,
+    /// `[[redact]]` rules for those lines.
+    redactor: df2b_core::Redactor,
     /// From the agent's configuration.
     allowlist: Allowlist,
     /// The controller's allowlist (replaced on every update).
@@ -213,6 +215,8 @@ impl Engine {
             central_errors: Vec::new(),
             observations: None,
             samples: false,
+            redactor: df2b_core::Redactor::new(&cfg.redact)
+                .map_err(|e| anyhow::anyhow!("redact: {e}"))?,
             allowlist: Allowlist::new(cfg.agent.allowlist.iter().copied()),
             central: Allowlist::default(),
             prefix: PrefixPolicy {
@@ -284,7 +288,9 @@ impl Engine {
             }
             if let Some(obs) = self.observations.as_mut() {
                 let k = (jail.name.clone(), key);
-                let sample = self.samples.then(|| df2b_core::sample_line(&line.line));
+                let sample = self
+                    .samples
+                    .then(|| df2b_core::sample_line(&self.redactor.apply(&line.line)));
                 if let Some(o) = obs.get_mut(&k) {
                     o.failures = o.failures.saturating_add(1);
                     o.first = o.first.min(ts);
@@ -381,6 +387,11 @@ impl Engine {
             j.max_bantime = p.max_bantime;
             j.overridden = changed;
         }
+    }
+
+    /// A log line as sent to the controller: redacted, cleaned, cut.
+    pub fn sample(&self, line: &str) -> String {
+        df2b_core::sample_line(&self.redactor.apply(line))
     }
 
     /// Starts counting failures for the controller; with `samples`, the
@@ -981,6 +992,22 @@ mod tests {
         e.collect_observations(false);
         e.process(&line("auth", "198.51.100.3"), now);
         assert_eq!(e.take_observations()[0].2.sample, None);
+
+        // [[redact]] rules apply before a line leaves the host
+        e.redactor = df2b_core::Redactor::new(&[df2b_core::RedactRule {
+            name: String::new(),
+            pattern: r"for (\S+) from".into(),
+            replace: "for [user] from".into(),
+            enabled: true,
+        }])
+        .unwrap();
+        e.collect_observations(true);
+        e.process(&line("auth", "198.51.100.4"), now); // not banned yet
+        let s = e.take_observations()[0].2.sample.clone().unwrap();
+        assert!(s.contains("for [user] from 198.51.100.4"), "{s}");
+        assert!(e
+            .sample("Failed password for root from x")
+            .contains("[user]"));
     }
 
     #[test]

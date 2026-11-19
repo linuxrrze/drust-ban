@@ -965,3 +965,100 @@ pub async fn correlation_rm(c: &Client, name: &str, json: bool) -> anyhow::Resul
     println!("rule {name} deleted");
     Ok(())
 }
+
+pub async fn redaction_list(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/redaction").await?;
+    if json {
+        return json_out(&v);
+    }
+    let rules = v["rules"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if rules.is_empty() {
+        println!("no redaction rules (sample lines are kept as the agents send them)");
+    }
+    for r in rules {
+        println!(
+            "{:<16} {:<4} {}  ->  {}",
+            s(r, &["name"]),
+            if r["enabled"].as_bool() == Some(false) {
+                "off"
+            } else {
+                "on"
+            },
+            s(r, &["pattern"]),
+            s(r, &["replace"])
+        );
+    }
+    println!();
+    println!("presets (df2bctl redaction preset <name>):");
+    for p in v["presets"].as_array().into_iter().flatten() {
+        println!("  {:<14} {}", s(p, &["name"]), s(p, &["description"]));
+    }
+    Ok(())
+}
+
+pub async fn redaction_set(c: &Client, name: &str, body: Value, json: bool) -> anyhow::Result<()> {
+    let v = c.put(&format!("/api/v1/redaction/{name}"), body).await?;
+    if json {
+        return json_out(&v);
+    }
+    let what = if v["replaced"].as_bool() == Some(true) {
+        "replaced"
+    } else {
+        "created"
+    };
+    println!(
+        "rule {name} {what}; {} kept line(s) redacted",
+        v["lines_redacted"].as_u64().unwrap_or(0)
+    );
+    Ok(())
+}
+
+pub async fn redaction_preset(c: &Client, name: &str, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/redaction").await?;
+    let Some(p) = v["presets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["name"] == name)
+    else {
+        anyhow::bail!("no preset {name:?} (see: df2bctl redaction list)");
+    };
+    let body = json!({ "pattern": p["pattern"], "replace": p["replace"], "enabled": true });
+    redaction_set(c, name, body, json).await
+}
+
+pub async fn redaction_rm(c: &Client, name: &str, json: bool) -> anyhow::Result<()> {
+    let v = c.delete(&format!("/api/v1/redaction/{name}"), &[]).await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("rule {name} deleted");
+    Ok(())
+}
+
+pub async fn redaction_test(
+    c: &Client,
+    lines: Vec<String>,
+    pattern: Option<String>,
+    replace: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let v = c
+        .post(
+            "/api/v1/redaction/test",
+            json!({ "lines": lines, "pattern": pattern, "replace": replace }),
+        )
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    for r in v["results"].as_array().into_iter().flatten() {
+        let note = if r["stable"].as_bool() == Some(false) {
+            "   (changes again when applied twice)"
+        } else {
+            ""
+        };
+        println!("{}{note}", s(r, &["line"]));
+    }
+    Ok(())
+}

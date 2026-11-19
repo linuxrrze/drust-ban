@@ -39,6 +39,13 @@ allowlist = ["127.0.0.0/8", "::1/128"]
 # leaves this host.
 # send_samples = true
 
+# Rewrite those lines before they leave this host (in order; regular
+# expression, replacement with $1 for groups, default "[redacted]"). The
+# controller can redact further (Policies page).
+# [[redact]]
+# pattern = '(?i)((?:\bfor|\binvalid user)\s+)(?:invalid user\s+)?\S+(\s+from\b)'
+# replace = '${1}[user]${2}'
+
 [[source]]
 name = "sshd-journal"
 type = "journald"

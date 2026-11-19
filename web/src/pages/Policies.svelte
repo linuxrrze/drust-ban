@@ -6,7 +6,8 @@
   import { notify } from '../lib/toast.svelte';
   import RuleDialog from '../components/RuleDialog.svelte';
   import { relative } from '../lib/format';
-  import type { CorrelationHit, CorrelationRule, CentralFilter, JailDefinition, JailInfo, JailOverride, JailView, Policies, Propagate } from '../lib/types';
+  import RedactionDialog from '../components/RedactionDialog.svelte';
+  import type { RedactPreset, RedactRule, CorrelationHit, CorrelationRule, CentralFilter, JailDefinition, JailInfo, JailOverride, JailView, Policies, Propagate } from '../lib/types';
   import Dialog from '../components/Dialog.svelte';
   import FilterDialog from '../components/FilterDialog.svelte';
   import JailDefDialog from '../components/JailDefDialog.svelte';
@@ -29,6 +30,11 @@
   let editingDef = $state<JailDefinition | null>(null);
   let filterOpen = $state(false);
   let editingFilter = $state<CentralFilter | null>(null);
+  let redactRules = $state<RedactRule[]>([]);
+  let presets = $state<RedactPreset[]>([]);
+  let defaultReplace = $state('[redacted]');
+  let redactOpen = $state(false);
+  let editingRedact = $state<RedactRule | null>(null);
   let confirmOpen = $state(false);
   let confirm = $state<{ title: string; text: string; run: () => Promise<void> } | null>(null);
 
@@ -40,12 +46,16 @@
 
   async function load() {
     try {
-      const [p, d, f, c] = await Promise.all([
+      const [p, d, f, c, r] = await Promise.all([
         get<Policies>('/policies'),
         get<{ definitions: JailDefinition[] }>('/jail-definitions'),
         get<{ filters: CentralFilter[] }>('/filters'),
         get<{ rules: CorrelationRule[]; monitor_hits: CorrelationHit[]; tracked_addresses: number }>('/correlation'),
+        get<{ rules: RedactRule[]; presets: RedactPreset[]; default_replace: string }>('/redaction'),
       ]);
+      redactRules = r.rules;
+      presets = r.presets;
+      defaultReplace = r.default_replace;
       rules = c.rules;
       hits = c.monitor_hits;
       tracked = c.tracked_addresses;
@@ -112,6 +122,13 @@
   function removeRule(r: CorrelationRule) {
     ask(`Delete rule ${r.name}?`, 'Bans it made stay until they expire.', async () => {
       await api('DELETE', `/correlation/${encodeURIComponent(r.name)}`);
+      notify(`Rule ${r.name} deleted`);
+    });
+  }
+
+  function removeRedaction(r: RedactRule) {
+    ask(`Delete redaction rule ${r.name}?`, 'New sample lines are no longer rewritten by it; lines it already rewrote stay rewritten.', async () => {
+      await api('DELETE', `/redaction/${encodeURIComponent(r.name)}`);
       notify(`Rule ${r.name} deleted`);
     });
   }
@@ -322,6 +339,44 @@
 
   <div class="card section">
     <div class="row head">
+      <h2>Sample line redaction</h2>
+      <span class="spacer"></span>
+      {#if can('admin')}<button onclick={() => { editingRedact = null; redactOpen = true; }}>New rule…</button>{/if}
+    </div>
+    <p class="muted">
+      Agents send the latest matching log line with their reports (shown on the address page). These
+      rules rewrite such lines on the controller, in order, e.g. to hide user names, e-mail addresses
+      or tokens.
+    </p>
+    {#if redactRules.length === 0}
+      <div class="empty">No redaction rules: lines are kept as the agents send them.</div>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Rule</th><th>Pattern</th><th>Replace with</th><th></th>{#if can('admin')}<th></th>{/if}</tr></thead>
+          <tbody>
+            {#each redactRules as r (r.name)}
+              <tr>
+                <td><strong>{r.name}</strong></td>
+                <td class="mono pattern" title={r.pattern}>{r.pattern}</td>
+                <td class="mono">{r.replace}</td>
+                <td>{#if r.enabled}<span class="pill good">on</span>{:else}<span class="pill plain">off</span>{/if}</td>
+                {#if can('admin')}
+                  <td class="nowrap">
+                    <button class="link" onclick={() => { editingRedact = r; redactOpen = true; }}>Edit…</button>
+                    · <button class="link danger-link" onclick={() => removeRedaction(r)}>Delete</button>
+                  </td>
+                {/if}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </div>
+
+  <div class="card section">
+    <div class="row head">
       <h2>Jail definitions</h2>
       <span class="spacer"></span>
       {#if can('admin')}<button onclick={() => { editingDef = null; defOpen = true; }}>Define a jail…</button>{/if}
@@ -397,6 +452,7 @@
 <JailDialog bind:open={dialogOpen} jail={editing} groups={data?.groups ?? []} ondone={load} />
 <JailDefDialog bind:open={defOpen} def={editingDef} groups={data?.groups ?? []} filters={filters.map((f) => f.name)} ondone={load} />
 <FilterDialog bind:open={filterOpen} filter={editingFilter} ondone={load} />
+<RedactionDialog bind:open={redactOpen} rule={editingRedact} {presets} {defaultReplace} ondone={load} />
 <RuleDialog bind:open={ruleOpen} rule={editingRule} jails={data?.jails.map((j) => j.name) ?? []} groups={data?.groups ?? []} ondone={load} />
 <Dialog bind:open={confirmOpen} title={confirm?.title ?? ''} onsubmit={runConfirm}>
   <p class="muted confirm-text">{confirm?.text}</p>
@@ -423,6 +479,7 @@
   .sources { max-width: 280px; overflow-wrap: anywhere; }
   .nowrap { white-space: nowrap; }
   .danger-link { color: var(--bad); }
+  .pattern { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sub { margin-top: 8px; }
   p.confirm-text { margin: 0; }
 </style>
