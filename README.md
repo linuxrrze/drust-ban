@@ -128,6 +128,14 @@ curl --cacert /tmp/df2b-ctl/ca.pem --resolve df2b-controller:7444:127.0.0.1 \
     -H "Authorization: Bearer df2bapi1.…" https://df2b-controller:7444/api/v1/status
 ```
 
+The API is described in OpenAPI 3.1 at `/api/v1/openapi.json` (no token
+needed; also in the repository as `crates/df2b-controller/openapi.json`):
+
+```sh
+curl --cacert /tmp/df2b-ctl/ca.pem --resolve df2b-controller:7444:127.0.0.1 \
+    https://df2b-controller:7444/api/v1/openapi.json
+```
+
 ### Web UI (same port, 7444)
 
 ```sh

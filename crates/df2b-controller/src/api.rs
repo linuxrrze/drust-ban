@@ -11,7 +11,8 @@
 //! tokens, audit log). Every change is written to the audit log with the
 //! token or user name and client address.
 //!
-//! TODO: OpenAPI (utoipa).
+//! OpenAPI: `../openapi.json` (hand-written), served unauthenticated at
+//! `/api/v1/openapi.json`; openapi_tests.rs keeps it in sync with the router.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -324,6 +325,7 @@ pub fn router_with_limit(ctl: Arc<Controller>, limit: crate::ratelimit::ApiLimit
     }
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/session", post(login).delete(logout))
         .route("/api/v1/auth-methods", get(auth_methods))
         .route("/api/v1/sessions", get(list_sessions).delete(end_sessions))
@@ -407,6 +409,15 @@ pub fn router_with_limit(ctl: Arc<Controller>, limit: crate::ratelimit::ApiLimit
         }))
         .layer(axum::middleware::map_response(crate::ui::security_headers))
         .with_state(ctl)
+}
+
+/// Unauthenticated: it only describes the API.
+async fn openapi() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        include_str!("../openapi.json"),
+    )
+        .into_response()
 }
 
 /// Unauthenticated: for load balancers and monitoring.
@@ -5740,4 +5751,24 @@ mod tests {
             assert_eq!(parse_asn(no), None, "{no}");
         }
     }
+
+    #[tokio::test]
+    async fn openapi_needs_no_token() {
+        let env = Env::new("openapi").await;
+        let r = env
+            .http
+            .get(format!("{}/api/v1/openapi.json", env.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        assert_eq!(r.headers()["content-type"], "application/json");
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["openapi"], "3.1.0");
+        assert!(v["paths"]["/api/v1/openapi.json"]["get"].is_object());
+    }
 }
+
+#[cfg(test)]
+#[path = "openapi_tests.rs"]
+mod openapi_tests;

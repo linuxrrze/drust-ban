@@ -1,0 +1,6232 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "dist-f2b controller REST API",
+    "version": "1",
+    "description": "REST API of the dist-f2b controller, served over HTTPS only (default port 7444) under /api/v1.\n\nAuthentication: `Authorization: Bearer df2bapi1.<secret>` (API tokens: CLI, scripts), or the browser session cookie `__Host-df2b_session` from `POST /api/v1/session` or an OpenID Connect login. With a session cookie, every request other than GET/HEAD must send the session's CSRF token in `X-CSRF-Token` (returned by login and whoami). A bearer token takes precedence over a cookie.\n\nRoles: viewer < operator (ban/unban) < admin; each operation states its minimum in `x-required-role` (`none`: unauthenticated, `authenticated`: any role).\n\nErrors are JSON `{\"error\": \"...\"}`. Request bodies that are not valid JSON for the operation (syntax, unknown or missing fields, wrong types, missing `Content-Type: application/json`) and invalid query strings are rejected by the framework with 400/413/415/422 and a plain-text body. All of /api/ except /api/v1/health is subject to a per-client rate limit (429 with Retry-After).\n\nThis document is hand-written; a test in crates/df2b-controller/src/api.rs keeps its paths, methods and roles in sync with the router."
+  },
+  "servers": [
+    {
+      "url": "https://df2b-controller:7444"
+    }
+  ],
+  "tags": [
+    {
+      "name": "meta"
+    },
+    {
+      "name": "session"
+    },
+    {
+      "name": "users"
+    },
+    {
+      "name": "api-tokens"
+    },
+    {
+      "name": "oidc"
+    },
+    {
+      "name": "dashboard"
+    },
+    {
+      "name": "decisions"
+    },
+    {
+      "name": "agents"
+    },
+    {
+      "name": "audit"
+    },
+    {
+      "name": "allowlist"
+    },
+    {
+      "name": "policies"
+    },
+    {
+      "name": "correlation"
+    },
+    {
+      "name": "redaction"
+    },
+    {
+      "name": "central-jails"
+    }
+  ],
+  "security": [
+    {
+      "bearerToken": []
+    },
+    {
+      "sessionCookie": []
+    }
+  ],
+  "paths": {
+    "/api/v1/agents": {
+      "get": {
+        "operationId": "agents",
+        "summary": "List agents",
+        "tags": [
+          "agents"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "agents": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Agent"
+                      }
+                    }
+                  },
+                  "required": [
+                    "agents"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/agents/{id}": {
+      "get": {
+        "operationId": "agent",
+        "summary": "One agent",
+        "tags": [
+          "agents"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Agent id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "agent": {
+                      "$ref": "#/components/schemas/Agent"
+                    }
+                  },
+                  "required": [
+                    "agent"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateAgent",
+        "summary": "Move an agent to another group",
+        "tags": [
+          "agents"
+        ],
+        "description": "Requires role admin.\n\nBans scoped to the old group are removed from it and those of the new group applied.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Agent id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "agent": {
+                      "type": "string"
+                    },
+                    "group": {
+                      "type": "string"
+                    },
+                    "previous_group": {
+                      "type": "string"
+                    },
+                    "changed": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "agent",
+                    "group",
+                    "previous_group",
+                    "changed"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "No such agent, or it is revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/agents/{id}/revoke": {
+      "post": {
+        "operationId": "revokeAgent",
+        "summary": "Revoke an agent",
+        "tags": [
+          "agents"
+        ],
+        "description": "Requires role admin.\n\nNo request body.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Agent id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "revoked": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "revoked"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/allowlist": {
+      "get": {
+        "operationId": "listAllow",
+        "summary": "The allowlist",
+        "tags": [
+          "allowlist"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/AllowView"
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "active_bans": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Active decisions overlapping the entry."
+                              }
+                            },
+                            "required": [
+                              "active_bans"
+                            ]
+                          }
+                        ]
+                      }
+                    },
+                    "asns": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "asn": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "as_org": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "networks": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Networks of the AS in the GeoIP data."
+                          },
+                          "comment": {
+                            "type": "string"
+                          },
+                          "created_by": {
+                            "type": "string"
+                          },
+                          "created_at": {
+                            "$ref": "#/components/schemas/DateTime"
+                          },
+                          "active_bans": {
+                            "type": "integer",
+                            "minimum": 0
+                          }
+                        },
+                        "required": [
+                          "asn",
+                          "as_org",
+                          "networks",
+                          "comment",
+                          "created_by",
+                          "created_at",
+                          "active_bans"
+                        ]
+                      },
+                      "description": "Allowlisted autonomous systems."
+                    },
+                    "version": {
+                      "type": "string",
+                      "description": "Allowlist version agents apply."
+                    },
+                    "agents": {
+                      "type": "object",
+                      "properties": {
+                        "connected": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "Connected agents applying this version."
+                        }
+                      },
+                      "required": [
+                        "connected",
+                        "current"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "entries",
+                    "asns",
+                    "version",
+                    "agents"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "post": {
+        "operationId": "addAllow",
+        "summary": "Add a network or an autonomous system",
+        "tags": [
+          "allowlist"
+        ],
+        "description": "Requires role admin.\n\nBy default also unbans what it overlaps.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAllow"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Added.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "description": "Network entry.",
+                      "properties": {
+                        "net": {
+                          "$ref": "#/components/schemas/IpNet"
+                        },
+                        "unbanned": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "Bans lifted."
+                        },
+                        "expires_at": {
+                          "anyOf": [
+                            {
+                              "$ref": "#/components/schemas/DateTime"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "net",
+                        "unbanned",
+                        "expires_at"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "description": "Autonomous system entry.",
+                      "properties": {
+                        "asn": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "networks": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "Networks of the AS in the GeoIP data."
+                        },
+                        "unbanned": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "required": [
+                        "asn",
+                        "networks",
+                        "unbanned"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "removeAllow",
+        "summary": "Remove an API-added entry",
+        "tags": [
+          "allowlist"
+        ],
+        "description": "Requires role admin.\n\nFixed (--allow) entries cannot be removed (409).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "net",
+            "in": "query",
+            "required": true,
+            "description": "Network (as added) or \"AS64500\".",
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/Target"
+                },
+                {
+                  "$ref": "#/components/schemas/Asn"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "removed": {
+                      "type": "string",
+                      "description": "The network (CIDR) or \"AS<n>\"."
+                    }
+                  },
+                  "required": [
+                    "removed"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/api-tokens": {
+      "get": {
+        "operationId": "listTokens",
+        "summary": "List API tokens",
+        "tags": [
+          "api-tokens"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tokens (never the secrets).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tokens": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "$ref": "#/components/schemas/Role"
+                          },
+                          "created_at": {
+                            "$ref": "#/components/schemas/DateTime"
+                          },
+                          "created_by": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "null: created on the controller host."
+                          },
+                          "expires_at": {
+                            "anyOf": [
+                              {
+                                "$ref": "#/components/schemas/DateTime"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "expired": {
+                            "type": "boolean"
+                          },
+                          "last_used_at": {
+                            "anyOf": [
+                              {
+                                "$ref": "#/components/schemas/DateTime",
+                                "description": "Since the controller started."
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "current": {
+                            "type": "boolean",
+                            "description": "The token making this request."
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "role",
+                          "created_at",
+                          "created_by",
+                          "expires_at",
+                          "expired",
+                          "last_used_at",
+                          "current"
+                        ]
+                      }
+                    },
+                    "ca_fingerprint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Internal CA fingerprint (hex) when it serves HTTPS, for df2bctl.toml."
+                    }
+                  },
+                  "required": [
+                    "tokens",
+                    "ca_fingerprint"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createToken",
+        "summary": "Create an API token",
+        "tags": [
+          "api-tokens"
+        ],
+        "description": "Requires role admin.\n\nBrowser sessions only: API tokens cannot create API tokens (403).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewToken"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created; the secret is returned once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "df2bapi1.<secret>"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "$ref": "#/components/schemas/Role"
+                    },
+                    "expires_at": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/DateTime"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "token",
+                    "name",
+                    "role",
+                    "expires_at"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/api-tokens/{name}": {
+      "delete": {
+        "operationId": "revokeToken",
+        "summary": "Revoke an API token",
+        "tags": [
+          "api-tokens"
+        ],
+        "description": "Requires role admin.\n\nAlso possible with a token (e.g. its own).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Token name.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked at once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "revoked": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "revoked"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/audit": {
+      "get": {
+        "operationId": "audit",
+        "summary": "Audit log",
+        "tags": [
+          "audit"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Entries (default 100, at most 1000).",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "description": "Only entries with seq below this (paging).",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AuditEntry"
+                      }
+                    }
+                  },
+                  "required": [
+                    "entries"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/auth-methods": {
+      "get": {
+        "operationId": "authMethods",
+        "summary": "Login methods the UI offers",
+        "tags": [
+          "session"
+        ],
+        "description": "No authentication.",
+        "x-required-role": "none",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "password": {
+                      "type": "boolean",
+                      "description": "Password login enabled."
+                    },
+                    "oidc": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "description": "Display name of the provider."
+                        }
+                      },
+                      "required": [
+                        "name"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "password",
+                    "oidc"
+                  ]
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/bans": {
+      "post": {
+        "operationId": "ban",
+        "summary": "Ban an address or prefix",
+        "tags": [
+          "decisions"
+        ],
+        "description": "Requires role operator or higher.",
+        "x-required-role": "operator",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Nothing recorded: already covered by an active ban with the same scope lasting at least as long.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "decision": {
+                      "type": "null"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "decision",
+                    "message"
+                  ]
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Ban recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "decision": {
+                      "$ref": "#/components/schemas/Decision"
+                    }
+                  },
+                  "required": [
+                    "decision"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "The target overlaps the controller allowlist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/correlation": {
+      "get": {
+        "operationId": "listRules",
+        "summary": "Correlation rules",
+        "tags": [
+          "correlation"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "rules": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Rule"
+                      }
+                    },
+                    "monitor_hits": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Trigger"
+                      },
+                      "description": "Recent firings (monitor rules and others)."
+                    },
+                    "tracked_addresses": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "propagate": {
+                      "$ref": "#/components/schemas/Propagate"
+                    }
+                  },
+                  "required": [
+                    "rules",
+                    "monitor_hits",
+                    "tracked_addresses",
+                    "propagate"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/correlation/{name}": {
+      "put": {
+        "operationId": "setRule",
+        "summary": "Create or replace a correlation rule",
+        "tags": [
+          "correlation"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Rule name.",
+            "schema": {
+              "$ref": "#/components/schemas/JailName"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "replaced": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "replaced"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteRule",
+        "summary": "Delete a correlation rule",
+        "tags": [
+          "correlation"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Rule name.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "removed": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "removed"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/decisions": {
+      "get": {
+        "operationId": "decisions",
+        "summary": "Active decisions",
+        "tags": [
+          "decisions"
+        ],
+        "description": "Requires role viewer or higher.\n\nNo paging: all active decisions matching the filters.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "target",
+            "in": "query",
+            "required": false,
+            "description": "Only decisions overlapping this address or prefix.",
+            "schema": {
+              "$ref": "#/components/schemas/Target"
+            }
+          },
+          {
+            "name": "jail",
+            "in": "query",
+            "required": false,
+            "description": "Only decisions of this jail.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "decisions": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Decision"
+                      }
+                    },
+                    "geo": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "$ref": "#/components/schemas/GeoInfo"
+                      },
+                      "description": "Target (CIDR) -> GeoIP data; targets the databases do not know are left out; empty without GeoIP."
+                    }
+                  },
+                  "required": [
+                    "decisions",
+                    "geo"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/enroll-tokens": {
+      "post": {
+        "operationId": "enrollToken",
+        "summary": "Create an enrollment token",
+        "tags": [
+          "agents"
+        ],
+        "description": "Requires role admin.\n\nAn invalid group is reported as 400.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrollTokenRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created; one-time use.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "df2b1.<secret>.<ca-fingerprint>"
+                    },
+                    "group": {
+                      "type": "string"
+                    },
+                    "expires_at": {
+                      "$ref": "#/components/schemas/DateTime"
+                    }
+                  },
+                  "required": [
+                    "token",
+                    "group",
+                    "expires_at"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "operationId": "events",
+        "summary": "Live updates (Server-Sent Events)",
+        "tags": [
+          "dashboard"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "text/event-stream. Events: `hello` (data {\"last_seq\": n}, retry 3 s), `decision` (data: a Decision), `resync` (client fell behind: reload lists), `logout` (token/session no longer valid; re-checked every 30 s). Streams end after 1 hour; clients reconnect.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/filters": {
+      "get": {
+        "operationId": "listFilters",
+        "summary": "Central filters",
+        "tags": [
+          "central-jails"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sorted by name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "filters": {
+                      "type": "array",
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/CentralFilter"
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "used_by": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                },
+                                "description": "Jail definitions using it (\"name\" or \"name (group g)\")."
+                              }
+                            },
+                            "required": [
+                              "used_by"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "filters"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/filters/test": {
+      "post": {
+        "operationId": "testFilter",
+        "summary": "Test a filter against log lines",
+        "tags": [
+          "central-jails"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FilterTest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Nothing is stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "lines": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "matched": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "matches": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "1-based line number."
+                          },
+                          "ip": {
+                            "type": "string",
+                            "description": "Matched address."
+                          },
+                          "pattern": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Index of the matching failregex."
+                          }
+                        },
+                        "required": [
+                          "line",
+                          "ip",
+                          "pattern"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "lines",
+                    "matched",
+                    "matches"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/filters/{name}": {
+      "put": {
+        "operationId": "setFilter",
+        "summary": "Create or replace a central filter",
+        "tags": [
+          "central-jails"
+        ],
+        "description": "Requires role admin.\n\nCompiled first (400 on errors).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Filter name.",
+            "schema": {
+              "$ref": "#/components/schemas/JailName"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FilterBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "replaced": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "replaced"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteFilter",
+        "summary": "Delete a central filter",
+        "tags": [
+          "central-jails"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Filter name.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "removed": {
+                      "type": "boolean",
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "removed"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "A jail definition still uses the filter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Health check",
+        "tags": [
+          "meta"
+        ],
+        "description": "No authentication.\n\nFor load balancers and monitoring; exempt from the request rate limit.",
+        "x-required-role": "none",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Always ok.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "const": "ok"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/history": {
+      "get": {
+        "operationId": "history",
+        "summary": "Everything known about an address or prefix",
+        "tags": [
+          "decisions"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "target",
+            "in": "query",
+            "required": true,
+            "description": "Address or prefix.",
+            "schema": {
+              "$ref": "#/components/schemas/Target"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "History entries (default 200, clamped to 1..1000).",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "$ref": "#/components/schemas/IpNet"
+                    },
+                    "geo": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/GeoInfo"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "allowlisted": {
+                      "type": "boolean"
+                    },
+                    "correlation_offenses": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Earlier correlation bans of this exact target (escalation)."
+                    },
+                    "offense_memory": {
+                      "type": "string",
+                      "description": "How long offenses are remembered (humantime)."
+                    },
+                    "samples": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "jail": {
+                            "type": "string"
+                          },
+                          "key": {
+                            "$ref": "#/components/schemas/IpNet"
+                          },
+                          "agent": {
+                            "type": "string"
+                          },
+                          "at": {
+                            "$ref": "#/components/schemas/DateTime"
+                          },
+                          "line": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "jail",
+                          "key",
+                          "agent",
+                          "at",
+                          "line"
+                        ]
+                      },
+                      "maxItems": 50,
+                      "description": "Log lines agents sent with reports, newest first (at most 50)."
+                    },
+                    "observations": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "jail": {
+                            "type": "string"
+                          },
+                          "key": {
+                            "$ref": "#/components/schemas/IpNet"
+                          },
+                          "agent": {
+                            "type": "string"
+                          },
+                          "at": {
+                            "$ref": "#/components/schemas/DateTime"
+                          },
+                          "failures": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "banned": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "jail",
+                          "key",
+                          "agent",
+                          "at",
+                          "failures",
+                          "banned"
+                        ]
+                      },
+                      "maxItems": 500,
+                      "description": "Reports within the longest rule window (at most 500)."
+                    },
+                    "allow_entries": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AllowView"
+                      },
+                      "description": "Overlapping allowlist entries."
+                    },
+                    "active": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Decision"
+                      },
+                      "description": "Overlapping active decisions."
+                    },
+                    "history": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Decision"
+                      },
+                      "description": "Overlapping decisions (bans and unbans, active or not), newest first."
+                    }
+                  },
+                  "required": [
+                    "target",
+                    "geo",
+                    "allowlisted",
+                    "correlation_offenses",
+                    "offense_memory",
+                    "samples",
+                    "observations",
+                    "allow_entries",
+                    "active",
+                    "history"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/jail-definitions": {
+      "get": {
+        "operationId": "listJailDefs",
+        "summary": "Central jail definitions",
+        "tags": [
+          "central-jails"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sorted by name and group.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "definitions": {
+                      "type": "array",
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/JailDef"
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "filter_is_central": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "filter_is_central"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "definitions"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/jail-definitions/{name}": {
+      "put": {
+        "operationId": "setJailDef",
+        "summary": "Define a jail centrally",
+        "tags": [
+          "central-jails"
+        ],
+        "description": "Requires role admin.\n\nFor all agents or a group (replacing the same name and scope).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Jail name.",
+            "schema": {
+              "$ref": "#/components/schemas/JailName"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JailDefBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "replaced": {
+                      "type": "boolean"
+                    },
+                    "filter_is_central": {
+                      "type": "boolean",
+                      "description": "false: the agents must have the filter locally."
+                    }
+                  },
+                  "required": [
+                    "replaced",
+                    "filter_is_central"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteJailDef",
+        "summary": "Delete a central jail definition",
+        "tags": [
+          "central-jails"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Jail name.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "query",
+            "required": false,
+            "description": "Agent group; left out: the definition for all agents.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "removed": {
+                      "type": "boolean",
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "removed"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/jails/{name}/policy": {
+      "put": {
+        "operationId": "setJailPolicy",
+        "summary": "Set a jail policy",
+        "tags": [
+          "policies"
+        ],
+        "description": "Requires role admin.\n\nFor all agents or one group; replaces the policy for that scope.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Jail name.",
+            "schema": {
+              "$ref": "#/components/schemas/JailName"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JailPolicyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "previous": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/JailSettings"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "previous"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteJailPolicy",
+        "summary": "Remove a jail policy",
+        "tags": [
+          "policies"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Jail name.",
+            "schema": {
+              "$ref": "#/components/schemas/JailName"
+            }
+          },
+          {
+            "name": "group",
+            "in": "query",
+            "required": false,
+            "description": "Agent group; left out: the policy for all agents.",
+            "schema": {
+              "$ref": "#/components/schemas/Group"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "removed": {
+                      "type": "boolean",
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "removed"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/oidc/backchannel-logout": {
+      "post": {
+        "operationId": "oidcBackchannelLogout",
+        "summary": "OIDC back-channel logout",
+        "tags": [
+          "oidc"
+        ],
+        "description": "No authentication.\n\nCalled by the provider. Ends the sessions named in a signed logout token (OIDC Back-Channel Logout 1.0).",
+        "x-required-role": "none",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Accepted (also when no session matched); empty body."
+          },
+          "400": {
+            "description": "The logout token does not verify.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "const": "invalid_request"
+                    },
+                    "error_description": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "error_description"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "logout_token": {
+                    "type": "string",
+                    "description": "Signed logout token (JWT)."
+                  }
+                },
+                "required": [
+                  "logout_token"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/oidc/callback": {
+      "get": {
+        "operationId": "oidcCallback",
+        "summary": "OpenID Connect redirect target",
+        "tags": [
+          "oidc"
+        ],
+        "description": "No authentication.\n\nBrowser endpoint (redirects, no JSON on success); 404 JSON error when single sign-on is not configured. Requires the binding cookie from the login request.",
+        "x-required-role": "none",
+        "security": [],
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "description": "Authorization code.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "description": "State.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "description": "Provider error.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "required": false,
+            "description": "Provider error text.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "To / with the session cookie, or to /#/login-error/<code> (expired, cancelled, denied, conflict, unavailable, failed).",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/oidc/frontchannel-logout": {
+      "get": {
+        "operationId": "oidcFrontchannelLogout",
+        "summary": "OIDC front-channel logout",
+        "tags": [
+          "oidc"
+        ],
+        "description": "No authentication.\n\nLoaded by the provider's logout page in an iframe. Ends only sessions with this sid, for the exact issuer.",
+        "x-required-role": "none",
+        "security": [],
+        "parameters": [
+          {
+            "name": "iss",
+            "in": "query",
+            "required": true,
+            "description": "Issuer; must be ours.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "query",
+            "required": true,
+            "description": "Provider session id (1-256 characters).",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Done (empty text body). Carries frame-ancestors <issuer origin>.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "iss or sid missing, wrong issuer or bad sid (text body).",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/oidc/login": {
+      "get": {
+        "operationId": "oidcLogin",
+        "summary": "Start an OpenID Connect login",
+        "tags": [
+          "oidc"
+        ],
+        "description": "No authentication.\n\nBrowser endpoint (redirects, no JSON on success); 404 JSON error when single sign-on is not configured.",
+        "x-required-role": "none",
+        "security": [],
+        "responses": {
+          "303": {
+            "description": "To the provider (sets the __Host-df2b_oidc binding cookie); to /#/login-error/unavailable if the provider cannot be reached.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "summary": "This OpenAPI description",
+        "tags": [
+          "meta"
+        ],
+        "description": "No authentication.\n\nUnauthenticated: it only describes the API.",
+        "x-required-role": "none",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1 document (hand-written, embedded in the binary).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/policies": {
+      "get": {
+        "operationId": "policies",
+        "summary": "Ban propagation and jail inventory",
+        "tags": [
+          "policies"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "propagate": {
+                      "$ref": "#/components/schemas/Propagate"
+                    },
+                    "jails": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "filters": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "Filters the agents use for it (working jails)."
+                          },
+                          "agents": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "agent": {
+                                  "type": "string"
+                                },
+                                "group": {
+                                  "type": "string"
+                                },
+                                "connected": {
+                                  "type": "boolean"
+                                },
+                                "jail": {
+                                  "$ref": "#/components/schemas/JailView"
+                                }
+                              },
+                              "required": [
+                                "agent",
+                                "group",
+                                "connected",
+                                "jail"
+                              ]
+                            }
+                          },
+                          "overrides": {
+                            "type": "array",
+                            "items": {
+                              "$ref": "#/components/schemas/JailOverride"
+                            }
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "filters",
+                          "agents",
+                          "overrides"
+                        ]
+                      },
+                      "description": "Every jail an agent reports or a policy / central definition mentions."
+                    },
+                    "groups": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Groups of non-revoked agents."
+                    }
+                  },
+                  "required": [
+                    "propagate",
+                    "jails",
+                    "groups"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/policies/propagate": {
+      "put": {
+        "operationId": "setPropagate",
+        "summary": "Set ban propagation",
+        "tags": [
+          "policies"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PropagateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "propagate": {
+                      "$ref": "#/components/schemas/Propagate"
+                    },
+                    "previous": {
+                      "$ref": "#/components/schemas/Propagate"
+                    }
+                  },
+                  "required": [
+                    "propagate",
+                    "previous"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/redaction": {
+      "get": {
+        "operationId": "listRedaction",
+        "summary": "Sample line redaction rules",
+        "tags": [
+          "redaction"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "rules": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RedactRule"
+                      }
+                    },
+                    "version": {
+                      "type": "string"
+                    },
+                    "agents": {
+                      "type": "object",
+                      "properties": {
+                        "connected": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "off": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "Agents that do not accept central rules."
+                        }
+                      },
+                      "required": [
+                        "connected",
+                        "current",
+                        "off"
+                      ]
+                    },
+                    "presets": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "pattern": {
+                            "type": "string"
+                          },
+                          "replace": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "description",
+                          "pattern",
+                          "replace"
+                        ]
+                      }
+                    },
+                    "default_replace": {
+                      "type": "string"
+                    },
+                    "max_rules": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "rules",
+                    "version",
+                    "agents",
+                    "presets",
+                    "default_replace",
+                    "max_rules"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/redaction/test": {
+      "post": {
+        "operationId": "testRedaction",
+        "summary": "Preview redaction",
+        "tags": [
+          "redaction"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RedactTest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Nothing is stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "line": {
+                            "type": "string"
+                          },
+                          "stable": {
+                            "type": "boolean",
+                            "description": "Applying the rules again changes nothing."
+                          }
+                        },
+                        "required": [
+                          "line",
+                          "stable"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "results"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/redaction/{name}": {
+      "put": {
+        "operationId": "setRedaction",
+        "summary": "Create or replace a redaction rule",
+        "tags": [
+          "redaction"
+        ],
+        "description": "Requires role admin.\n\nAt most 50 rules.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Rule name.",
+            "schema": {
+              "$ref": "#/components/schemas/JailName"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RedactBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Lines kept so far are redacted at once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "replaced": {
+                      "type": "boolean"
+                    },
+                    "lines_redacted": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "replaced",
+                    "lines_redacted"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteRedaction",
+        "summary": "Delete a redaction rule",
+        "tags": [
+          "redaction"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Rule name.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "removed": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "removed"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/session": {
+      "post": {
+        "operationId": "login",
+        "summary": "Log in with a password",
+        "tags": [
+          "session"
+        ],
+        "description": "No authentication.\n\nLocal users only. Failed logins are limited (10 per 15 min per client, 30 per user name).",
+        "x-required-role": "none",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Logged in; sets the session cookie.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whoami"
+                }
+              }
+            },
+            "headers": {
+              "Set-Cookie": {
+                "description": "__Host-df2b_session=<secret>; Path=/; Secure; HttpOnly; SameSite=Strict",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "description": "Invalid user name or password.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Password login is disabled (single sign-on only).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "logout",
+        "summary": "Log out",
+        "tags": [
+          "session"
+        ],
+        "description": "Any authenticated caller (any role).",
+        "x-required-role": "authenticated",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The session ended (no-op for API tokens); the cookie is cleared.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "logged_out": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "logout_url": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "OIDC sessions: the provider's logout page (RP-initiated logout)."
+                    }
+                  },
+                  "required": [
+                    "logged_out",
+                    "logout_url"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Set-Cookie": {
+                "description": "Clears the session cookie.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/session/password": {
+      "post": {
+        "operationId": "changeOwnPassword",
+        "summary": "Change the own password",
+        "tags": [
+          "session"
+        ],
+        "description": "Any authenticated caller (any role).\n\nLocal users signed in with a password only (400 for API tokens and OIDC sessions). A wrong current password counts towards the login limits and returns 403.",
+        "x-required-role": "authenticated",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnPasswordChange"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Changed; the session is replaced (new cookie and CSRF token), other sessions of the user end.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whoami"
+                }
+              }
+            },
+            "headers": {
+              "Set-Cookie": {
+                "description": "__Host-df2b_session=<secret>; Path=/; Secure; HttpOnly; SameSite=Strict",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "summary": "List browser sessions",
+        "tags": [
+          "session"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Live sessions (no secrets).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "sessions": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/SessionInfo"
+                      }
+                    }
+                  },
+                  "required": [
+                    "sessions"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "endSessions",
+        "summary": "End the sessions of a user, or all",
+        "tags": [
+          "session"
+        ],
+        "description": "Requires role admin.\n\nExactly one of ?user=<name> or ?all=true (incident response; includes the caller's own).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user",
+            "in": "query",
+            "required": false,
+            "description": "User name.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "all",
+            "in": "query",
+            "required": false,
+            "description": "End everybody's sessions.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Number of sessions ended.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ended": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "ended"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}": {
+      "delete": {
+        "operationId": "endSession",
+        "summary": "End one session",
+        "tags": [
+          "session"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Public session id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ended": {
+                      "type": "integer",
+                      "const": 1
+                    },
+                    "user": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ended",
+                    "user"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/stats": {
+      "get": {
+        "operationId": "stats",
+        "summary": "Dashboard statistics",
+        "tags": [
+          "dashboard"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Over active decisions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "bans_per_hour": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "hour": {
+                            "$ref": "#/components/schemas/DateTime"
+                          },
+                          "count": {
+                            "type": "integer",
+                            "minimum": 0
+                          }
+                        },
+                        "required": [
+                          "hour",
+                          "count"
+                        ]
+                      },
+                      "description": "New bans per hour, last 48 hours, oldest first."
+                    },
+                    "active": {
+                      "type": "object",
+                      "properties": {
+                        "total": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "ipv4": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "ipv6": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "permanent": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "required": [
+                        "total",
+                        "ipv4",
+                        "ipv6",
+                        "permanent"
+                      ]
+                    },
+                    "top_jails": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Count"
+                      },
+                      "maxItems": 8,
+                      "description": "Top 8; manual bans count as \"(manual)\"."
+                    },
+                    "top_prefixes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Count"
+                      },
+                      "maxItems": 8,
+                      "description": "Top 8 IPv4 /16 and IPv6 /32 networks."
+                    },
+                    "top_origins": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Count"
+                      },
+                      "maxItems": 8,
+                      "description": "Top 8 origins."
+                    },
+                    "geoip": {
+                      "type": "boolean",
+                      "description": "GeoIP databases are loaded."
+                    },
+                    "top_asns": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "asn": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "org": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "count": {
+                            "type": "integer",
+                            "minimum": 0
+                          }
+                        },
+                        "required": [
+                          "asn",
+                          "org",
+                          "count"
+                        ]
+                      },
+                      "maxItems": 8,
+                      "description": "Empty without GeoIP."
+                    },
+                    "top_countries": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "country": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "count": {
+                            "type": "integer",
+                            "minimum": 0
+                          }
+                        },
+                        "required": [
+                          "country",
+                          "name",
+                          "count"
+                        ]
+                      },
+                      "maxItems": 8,
+                      "description": "Empty without GeoIP."
+                    }
+                  },
+                  "required": [
+                    "bans_per_hour",
+                    "active",
+                    "top_jails",
+                    "top_prefixes",
+                    "top_origins",
+                    "geoip",
+                    "top_asns",
+                    "top_countries"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "operationId": "status",
+        "summary": "Controller status",
+        "tags": [
+          "dashboard"
+        ],
+        "description": "Requires role viewer or higher.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "string",
+                      "description": "Controller version."
+                    },
+                    "agents": {
+                      "type": "object",
+                      "properties": {
+                        "total": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "connected": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "revoked": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "required": [
+                        "total",
+                        "connected",
+                        "revoked"
+                      ]
+                    },
+                    "active_decisions": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "last_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "propagate": {
+                      "$ref": "#/components/schemas/Propagate"
+                    },
+                    "allowlist": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/IpNet"
+                      },
+                      "description": "All allowlisted networks (fixed and API entries; not autonomous systems)."
+                    },
+                    "allowlist_version": {
+                      "type": "string"
+                    },
+                    "redaction_version": {
+                      "type": "string"
+                    },
+                    "sessions": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Live browser sessions."
+                    },
+                    "geoip": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DbInfo"
+                      },
+                      "description": "Loaded GeoIP databases."
+                    }
+                  },
+                  "required": [
+                    "version",
+                    "agents",
+                    "active_decisions",
+                    "last_seq",
+                    "propagate",
+                    "allowlist",
+                    "allowlist_version",
+                    "redaction_version",
+                    "sessions",
+                    "geoip"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/unban": {
+      "post": {
+        "operationId": "unban",
+        "summary": "Unban an address or prefix",
+        "tags": [
+          "decisions"
+        ],
+        "description": "Requires role operator or higher.\n\nRevokes every active ban overlapping the target. With allow_for, a temporary allowlist entry is added first.",
+        "x-required-role": "operator",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnbanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "unbans": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Decision"
+                      },
+                      "description": "The unban decisions recorded (kind unban)."
+                    },
+                    "allowed_until": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/DateTime"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "already_allowlisted": {
+                      "type": "boolean",
+                      "description": "allow_for was asked for, but an entry at least as long (or permanent) exists."
+                    }
+                  },
+                  "required": [
+                    "unbans",
+                    "allowed_until",
+                    "already_allowlisted"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "No active ban overlaps the target (and no allow_for was given).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/users": {
+      "get": {
+        "operationId": "listUsers",
+        "summary": "List local users",
+        "tags": [
+          "users"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "users": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "$ref": "#/components/schemas/Role"
+                          },
+                          "created_at": {
+                            "$ref": "#/components/schemas/DateTime"
+                          },
+                          "password_changed_at": {
+                            "$ref": "#/components/schemas/DateTime"
+                          },
+                          "must_change_password": {
+                            "type": "boolean"
+                          },
+                          "sessions": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Live password sessions."
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "role",
+                          "created_at",
+                          "password_changed_at",
+                          "must_change_password",
+                          "sessions"
+                        ]
+                      }
+                    },
+                    "password_login": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "users",
+                    "password_login"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createUser",
+        "summary": "Create a local user",
+        "tags": [
+          "users"
+        ],
+        "description": "Requires role admin.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewUser"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "created": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "$ref": "#/components/schemas/Role"
+                    }
+                  },
+                  "required": [
+                    "created",
+                    "role"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/users/{name}": {
+      "patch": {
+        "operationId": "updateUser",
+        "summary": "Change a user's role",
+        "tags": [
+          "users"
+        ],
+        "description": "Requires role admin.\n\nAdmins cannot lower their own role (409).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "User name.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Effective at the user's next request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "$ref": "#/components/schemas/Role"
+                    }
+                  },
+                  "required": [
+                    "user",
+                    "role"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteUser",
+        "summary": "Delete a local user",
+        "tags": [
+          "users"
+        ],
+        "description": "Requires role admin.\n\nAdmins cannot delete themselves (409).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "User name.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted; the user's sessions ended.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "string"
+                    },
+                    "sessions_ended": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "deleted",
+                    "sessions_ended"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/users/{name}/password": {
+      "post": {
+        "operationId": "resetPassword",
+        "summary": "Reset a user's password",
+        "tags": [
+          "users"
+        ],
+        "description": "Requires role admin.\n\nTemporary by default. Not for the own account (409).",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "User name.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordReset"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Set; the user's sessions ended.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": {
+                      "type": "string"
+                    },
+                    "sessions_ended": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "user",
+                    "sessions_ended"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/whoami": {
+      "get": {
+        "operationId": "whoami",
+        "summary": "The caller",
+        "tags": [
+          "session"
+        ],
+        "description": "Any authenticated caller (any role).\n\nAlso allowed for sessions that must change a temporary password first.",
+        "x-required-role": "authenticated",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Name, role and how the caller authenticated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whoami"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "df2bapi1.<secret>",
+        "description": "API token (created with `df2b-controller api-token create` or by an admin in the web UI)."
+      },
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-df2b_session",
+        "description": "Browser session (Secure, HttpOnly, SameSite=Strict)."
+      },
+      "csrfToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-CSRF-Token",
+        "description": "The session's CSRF token; required with the session cookie for every method other than GET/HEAD."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid input (the message says what). Malformed JSON, unknown fields, missing fields or a wrong Content-Type are rejected by the framework before the handler with 400/415/422 and a plain-text body.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "No or invalid credentials (missing/unknown/expired API token, malformed bearer token, expired session).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        },
+        "headers": {
+          "WWW-Authenticate": {
+            "schema": {
+              "type": "string",
+              "const": "Bearer"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Role too low; or a session request without a valid X-CSRF-Token (unsafe methods); or a session whose temporary password must be changed first.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "No such object.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Conflicts with the current state (the message says what).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Per-client request rate limit (token bucket; IPv6 per /64).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        },
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "Every API error (except the OIDC browser endpoints and request-body/query rejections by the framework, which are plain text).",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable message."
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "Role": {
+        "type": "string",
+        "enum": [
+          "viewer",
+          "operator",
+          "admin"
+        ],
+        "description": "viewer < operator (ban/unban) < admin (everything else)."
+      },
+      "DateTime": {
+        "type": "string",
+        "format": "date-time",
+        "description": "RFC 3339 timestamp (UTC)."
+      },
+      "Duration": {
+        "type": "string",
+        "examples": [
+          "10m",
+          "24h"
+        ],
+        "description": "Duration in humantime syntax, e.g. \"90s\", \"10m\", \"1h 30m\", \"7d\", \"1y\"."
+      },
+      "IpNet": {
+        "type": "string",
+        "examples": [
+          "203.0.113.7/32",
+          "2001:db8::/64"
+        ],
+        "description": "IP network in CIDR notation, host bits cleared; single addresses are /32 or /128."
+      },
+      "Target": {
+        "type": "string",
+        "examples": [
+          "203.0.113.7",
+          "198.51.100.0/24",
+          "2001:db8::/64"
+        ],
+        "description": "IP address or prefix (CIDR); host bits are cleared."
+      },
+      "Asn": {
+        "type": "string",
+        "pattern": "^[Aa][Ss][0-9]+$",
+        "examples": [
+          "AS64500"
+        ],
+        "description": "Autonomous system, \"AS\" or \"as\" followed by the number (not AS0)."
+      },
+      "Name": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._@-]{1,64}$",
+        "description": "Letters, digits, - _ . @; at most 64 characters (users and API tokens share one name space; \"oidc-provider\" is reserved)."
+      },
+      "JailName": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-]{1,64}$",
+        "description": "Letters, digits, - _ .; at most 64 characters (also used for rule, filter and redaction rule names)."
+      },
+      "Group": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-]{1,64}$",
+        "description": "Agent group: letters, digits, - _ .; at most 64 characters."
+      },
+      "Propagate": {
+        "type": "string",
+        "enum": [
+          "global",
+          "group",
+          "off"
+        ],
+        "description": "What an agent's local ban turns into: a global ban, a ban for the agent's group, or nothing."
+      },
+      "DecisionKind": {
+        "description": "Internally tagged: {\"kind\":\"ban\"}, {\"kind\":\"unban\",\"revokes\":\"<uuid>\"} or {\"kind\":\"allow\"}.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "ban"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "unban"
+              },
+              "revokes": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Id of the revoked ban."
+              }
+            },
+            "required": [
+              "kind",
+              "revokes"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "allow"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        ]
+      },
+      "Scope": {
+        "description": "Which agents a decision applies to (adjacently tagged).",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "global"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "group"
+              },
+              "value": {
+                "type": "string",
+                "description": "Group name."
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "agents"
+              },
+              "value": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Agent ids."
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ]
+          }
+        ]
+      },
+      "Origin": {
+        "description": "Who created a decision (adjacently tagged).",
+        "type": "object",
+        "required": [
+          "type",
+          "value"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "correlation",
+              "user"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "description": "Agent id, correlation rule name, or user / API token name."
+          }
+        }
+      },
+      "Decision": {
+        "type": "object",
+        "description": "An entry of the append-only decision log.",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Position in the decision log."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DecisionKind"
+          },
+          "target": {
+            "$ref": "#/components/schemas/IpNet"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope"
+          },
+          "jail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/DateTime"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "origin": {
+            "$ref": "#/components/schemas/Origin"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "id",
+          "kind",
+          "target",
+          "scope",
+          "jail",
+          "created_at",
+          "expires_at",
+          "origin",
+          "reason"
+        ]
+      },
+      "GeoInfo": {
+        "type": "object",
+        "description": "GeoIP data; fields the databases do not know are left out.",
+        "properties": {
+          "asn": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "as_org": {
+            "type": "string"
+          },
+          "country": {
+            "type": "string",
+            "description": "ISO 3166-1 alpha-2."
+          },
+          "country_name": {
+            "type": "string"
+          }
+        }
+      },
+      "AllowView": {
+        "type": "object",
+        "description": "Allowlist entry (null expires_at: permanent).",
+        "properties": {
+          "net": {
+            "$ref": "#/components/schemas/IpNet"
+          },
+          "source": {
+            "type": "string",
+            "description": "\"command line\" for --allow entries, else \"api\"."
+          },
+          "comment": {
+            "type": "string"
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "net",
+          "source",
+          "comment",
+          "created_by",
+          "created_at",
+          "expires_at"
+        ]
+      },
+      "SourceView": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "lines_per_second": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lag_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How old the newest processed entry was (journald)."
+          },
+          "backlog_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Bytes written but not read yet (files)."
+          },
+          "error": {
+            "type": "string",
+            "description": "Why it stopped reading (\"\" = fine)."
+          }
+        },
+        "required": [
+          "name",
+          "lines_per_second",
+          "lag_ms",
+          "backlog_bytes",
+          "error"
+        ]
+      },
+      "JailView": {
+        "type": "object",
+        "description": "A jail as an agent reports it.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "filter": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxretry": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "findtime_secs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bantime_secs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bantime_factor": {
+            "type": "number"
+          },
+          "max_bantime_secs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "0 = no maximum"
+          },
+          "overridden": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Settings that come from a central policy."
+          },
+          "active_bans": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "origin": {
+            "type": "string",
+            "description": "\"local\" or \"central\"."
+          },
+          "error": {
+            "type": "string",
+            "description": "Why a central jail does not run."
+          },
+          "tracked": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "evicted": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "name",
+          "filter",
+          "enabled",
+          "maxretry",
+          "findtime_secs",
+          "bantime_secs",
+          "bantime_factor",
+          "max_bantime_secs",
+          "overridden",
+          "active_bans",
+          "origin",
+          "error",
+          "tracked",
+          "evicted"
+        ]
+      },
+      "AgentStatus": {
+        "type": "object",
+        "properties": {
+          "last_seen": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "agent_version": {
+            "type": "string"
+          },
+          "active_bans": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "clock_skew_ms": {
+            "type": "integer",
+            "description": "Controller time minus agent time."
+          },
+          "firewall_backend": {
+            "type": "string"
+          },
+          "firewall_healthy": {
+            "type": "boolean"
+          },
+          "firewall_error": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceView"
+            }
+          },
+          "last_applied_seq": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "streams": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Open decision streams (> 0 = connected)."
+          },
+          "allowlist_version": {
+            "type": "string"
+          },
+          "jails": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JailView"
+            }
+          },
+          "jail_policies_version": {
+            "type": "string"
+          },
+          "central_jails_version": {
+            "type": "string"
+          },
+          "redaction_version": {
+            "type": "string",
+            "description": "\"off\": the agent does not accept central rules; \"\" = unknown."
+          }
+        },
+        "required": [
+          "last_seen",
+          "agent_version",
+          "active_bans",
+          "clock_skew_ms",
+          "firewall_backend",
+          "firewall_healthy",
+          "firewall_error",
+          "sources",
+          "last_applied_seq",
+          "streams",
+          "allowlist_version",
+          "jails",
+          "jail_policies_version",
+          "central_jails_version",
+          "redaction_version"
+        ]
+      },
+      "Agent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "enrolled_at": {
+            "$ref": "#/components/schemas/DateTime"
+          },
+          "serials": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Accepted certificate serials (hex)."
+          },
+          "cert_not_after": {
+            "$ref": "#/components/schemas/DateTime"
+          },
+          "resync": {
+            "type": "boolean",
+            "description": "Present (true) only while a group change waits for the agent's next subscription."
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "revoked": {
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AgentStatus"
+          }
+        },
+        "required": [
+          "id",
+          "hostname",
+          "group",
+          "enrolled_at",
+          "serials",
+          "cert_not_after",
+          "connected",
+          "revoked",
+          "status"
+        ]
+      },
+      "RuleKind": {
+        "type": "string",
+        "enum": [
+          "threshold",
+          "quorum"
+        ]
+      },
+      "Rule": {
+        "type": "object",
+        "description": "A correlation rule as stored (max_bantime and asns are left out when unset).",
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/JailName"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RuleKind"
+          },
+          "jail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "min_agents": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "min_failures": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "window": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "bantime": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "bantime_factor": {
+            "type": "number"
+          },
+          "max_bantime": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "monitor": {
+            "type": "boolean"
+          },
+          "asns": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Only addresses in these autonomous systems; left out when empty (all addresses)."
+          },
+          "updated_by": {
+            "type": "string"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/DateTime"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "jail",
+          "group",
+          "min_agents",
+          "min_failures",
+          "window",
+          "bantime",
+          "bantime_factor",
+          "enabled",
+          "monitor",
+          "updated_by",
+          "updated_at"
+        ]
+      },
+      "Trigger": {
+        "type": "object",
+        "description": "A rule that fired.",
+        "properties": {
+          "rule": {
+            "type": "string"
+          },
+          "jail": {
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/IpNet"
+          },
+          "failures": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "agents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "at": {
+            "$ref": "#/components/schemas/DateTime"
+          },
+          "monitor": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "rule",
+          "jail",
+          "target",
+          "failures",
+          "agents",
+          "at",
+          "monitor"
+        ]
+      },
+      "JailSettings": {
+        "type": "object",
+        "description": "Policy settings; unset fields are left out (they keep what is below).",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxretry": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "findtime": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "bantime": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "bantime_factor": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "max_bantime": {
+            "$ref": "#/components/schemas/Duration"
+          }
+        }
+      },
+      "JailOverride": {
+        "allOf": [
+          {
+            "type": "object",
+            "properties": {
+              "jail": {
+                "type": "string"
+              },
+              "group": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "updated_by": {
+                "type": "string"
+              },
+              "updated_at": {
+                "$ref": "#/components/schemas/DateTime"
+              }
+            },
+            "required": [
+              "jail",
+              "group",
+              "updated_by",
+              "updated_at"
+            ]
+          },
+          {
+            "$ref": "#/components/schemas/JailSettings"
+          }
+        ],
+        "description": "Stored jail policy (settings flattened into the object)."
+      },
+      "RedactRule": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Regular expression."
+          },
+          "replace": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "pattern",
+          "replace",
+          "enabled"
+        ]
+      },
+      "SourceDef": {
+        "description": "A log source of a central jail (tagged by type).",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "file"
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "maxItems": 16,
+                "description": "Absolute paths or globs, without \"..\"."
+              },
+              "start_at_end": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "type",
+              "paths"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "journald"
+              },
+              "matches": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "description": "FIELD=value or \"+\" (OR)."
+              },
+              "start": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "\"tail\" (default), \"head\" or a duration."
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        ]
+      },
+      "JailDef": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filter": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceDef"
+            }
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxretry": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "findtime": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "bantime": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "bantime_factor": {
+            "type": "number"
+          },
+          "max_bantime": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Duration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_by": {
+            "type": "string"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/DateTime"
+          }
+        },
+        "required": [
+          "name",
+          "group",
+          "filter",
+          "sources",
+          "enabled",
+          "maxretry",
+          "findtime",
+          "bantime",
+          "bantime_factor",
+          "max_bantime",
+          "updated_by",
+          "updated_at"
+        ]
+      },
+      "CentralFilter": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "toml": {
+            "type": "string",
+            "description": "Filter definition (TOML, like the agent's filter files)."
+          },
+          "updated_by": {
+            "type": "string"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/DateTime"
+          }
+        },
+        "required": [
+          "name",
+          "toml",
+          "updated_by",
+          "updated_at"
+        ]
+      },
+      "SessionInfo": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Public session id (unrelated to the cookie secret)."
+          },
+          "user": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "password",
+              "oidc"
+            ]
+          },
+          "role": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Role"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/DateTime"
+          },
+          "last_used_at": {
+            "$ref": "#/components/schemas/DateTime"
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/DateTime"
+          },
+          "remote_addr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current": {
+            "type": "boolean",
+            "description": "The caller's own session."
+          }
+        },
+        "required": [
+          "id",
+          "user",
+          "method",
+          "role",
+          "created_at",
+          "last_used_at",
+          "expires_at",
+          "remote_addr",
+          "user_agent",
+          "current"
+        ]
+      },
+      "AuditEntry": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "time": {
+            "$ref": "#/components/schemas/DateTime"
+          },
+          "actor": {
+            "type": "string",
+            "description": "User / API token name, \"agent:<id>\" for enrollments, \"oidc-provider\" for provider logouts."
+          },
+          "remote_addr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "action": {
+            "type": "string",
+            "description": "e.g. ban, unban, allowlist.add, user.create"
+          },
+          "details": {
+            "type": "object",
+            "description": "Action-specific details."
+          }
+        },
+        "required": [
+          "seq",
+          "time",
+          "actor",
+          "remote_addr",
+          "action",
+          "details"
+        ]
+      },
+      "DbInfo": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "database_type": {
+            "type": "string"
+          },
+          "build": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "type": "string",
+            "description": "The last reload failed (the previous data is still used)."
+          }
+        },
+        "required": [
+          "path",
+          "database_type",
+          "build"
+        ]
+      },
+      "Whoami": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "auth": {
+            "type": "string",
+            "enum": [
+              "token",
+              "session"
+            ]
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "token",
+              "password",
+              "oidc"
+            ]
+          },
+          "csrf_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For sessions: the value to send in X-CSRF-Token."
+          },
+          "must_change_password": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "role",
+          "auth",
+          "method",
+          "csrf_token",
+          "must_change_password"
+        ]
+      },
+      "Count": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "description": "Jail name, network, or origin string (\"agent:<id>\", \"correlation:<rule>\", \"user:<name>\")."
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "key",
+          "count"
+        ]
+      },
+      "LoginRequest": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "password": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "additionalProperties": false
+      },
+      "OwnPasswordChange": {
+        "type": "object",
+        "properties": {
+          "current_password": {
+            "type": "string"
+          },
+          "new_password": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 1024,
+            "description": "12 to 1024 characters, not the user name."
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "additionalProperties": false
+      },
+      "NewUser": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "password": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 1024,
+            "description": "12 to 1024 characters, not the user name."
+          },
+          "temporary": {
+            "type": "boolean",
+            "default": true,
+            "description": "The user must change it at the first login."
+          }
+        },
+        "required": [
+          "name",
+          "role",
+          "password"
+        ],
+        "additionalProperties": false
+      },
+      "UserUpdate": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "additionalProperties": false
+      },
+      "PasswordReset": {
+        "type": "object",
+        "properties": {
+          "password": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 1024
+          },
+          "temporary": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "password"
+        ],
+        "additionalProperties": false
+      },
+      "NewAllow": {
+        "type": "object",
+        "properties": {
+          "net": {
+            "description": "Address or prefix (at most /8 for IPv4, /16 for IPv6), or an autonomous system (its networks come from the GeoIP data).",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Target"
+              },
+              {
+                "$ref": "#/components/schemas/Asn"
+              }
+            ]
+          },
+          "comment": {
+            "type": "string",
+            "default": "",
+            "description": "Control characters removed, at most 200 characters."
+          },
+          "unban": {
+            "type": "boolean",
+            "default": true,
+            "description": "Also lift active bans overlapping the entry."
+          },
+          "ttl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Temporary entry, 1 minute to 30 days (e.g. \"24h\"); \"never\" or left out: permanent. Not allowed for autonomous systems."
+          }
+        },
+        "required": [
+          "net"
+        ],
+        "additionalProperties": false
+      },
+      "PropagateRequest": {
+        "type": "object",
+        "properties": {
+          "propagate": {
+            "$ref": "#/components/schemas/Propagate"
+          }
+        },
+        "required": [
+          "propagate"
+        ],
+        "additionalProperties": false
+      },
+      "JailPolicyRequest": {
+        "type": "object",
+        "description": "Replaces the policy for the scope; unset fields keep what is below, all unset removes the policy.",
+        "properties": {
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent group; null, empty or left out: all agents."
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "maxretry": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "findtime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Duration, 1s to 7 days."
+          },
+          "bantime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Duration, 1 minute to 10 years."
+          },
+          "bantime_factor": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 10
+          },
+          "max_bantime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Duration, bantime to 10 years."
+          }
+        },
+        "additionalProperties": false
+      },
+      "RuleBody": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/RuleKind"
+          },
+          "jail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Jail name; null/empty: all jails."
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only this group's agents count and the ban applies to the group; null/empty: all agents, global ban."
+          },
+          "min_agents": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "description": "threshold: 1-1000, quorum: 2-1000."
+          },
+          "min_failures": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "threshold only: 1-1000000."
+          },
+          "window": {
+            "type": "string",
+            "description": "Duration, 1 minute to 24 hours."
+          },
+          "bantime": {
+            "type": "string",
+            "description": "Duration, 1 minute to 10 years."
+          },
+          "bantime_factor": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Repeat offenders: bantime x factor^(offense-1); default 1."
+          },
+          "max_bantime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Duration, bantime to 10 years; null/empty: none."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "monitor": {
+            "type": "boolean",
+            "default": false,
+            "description": "Only record what would be banned."
+          },
+          "asns": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295
+                },
+                {
+                  "$ref": "#/components/schemas/Asn"
+                }
+              ]
+            },
+            "maxItems": 100,
+            "default": [],
+            "description": "Only addresses in these autonomous systems (64500 or \"AS64500\"); at most 100; empty: all."
+          }
+        },
+        "required": [
+          "kind",
+          "min_agents",
+          "window",
+          "bantime"
+        ],
+        "additionalProperties": false
+      },
+      "RedactBody": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Regular expression, at most 500 characters."
+          },
+          "replace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Default \"[redacted]\"."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "additionalProperties": false
+      },
+      "RedactTest": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A rule to try; without one only the current rules apply."
+          },
+          "replace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The rule being edited (left out of the current rules, keeps its place)."
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "lines"
+        ],
+        "additionalProperties": false
+      },
+      "FilterBody": {
+        "type": "object",
+        "properties": {
+          "toml": {
+            "type": "string",
+            "description": "Filter definition (TOML); compiled before it is stored."
+          }
+        },
+        "required": [
+          "toml"
+        ],
+        "additionalProperties": false
+      },
+      "FilterTest": {
+        "type": "object",
+        "properties": {
+          "toml": {
+            "type": "string"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5000,
+            "description": "At most 5000 lines / 2 MiB."
+          }
+        },
+        "required": [
+          "toml",
+          "lines"
+        ],
+        "additionalProperties": false
+      },
+      "JailDefBody": {
+        "type": "object",
+        "properties": {
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent group; null/empty: all agents."
+          },
+          "filter": {
+            "$ref": "#/components/schemas/JailName"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceDef"
+            },
+            "minItems": 1
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "maxretry": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "findtime": {
+            "type": "string",
+            "description": "Duration."
+          },
+          "bantime": {
+            "type": "string",
+            "description": "Duration."
+          },
+          "bantime_factor": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 10
+          },
+          "max_bantime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Duration."
+          }
+        },
+        "required": [
+          "filter",
+          "sources",
+          "maxretry",
+          "findtime",
+          "bantime"
+        ],
+        "additionalProperties": false
+      },
+      "NewToken": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/Name"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "ttl": {
+            "type": "string",
+            "description": "Duration between 1s and 5 years (e.g. \"90d\"), or \"never\"."
+          }
+        },
+        "required": [
+          "name",
+          "role",
+          "ttl"
+        ],
+        "additionalProperties": false
+      },
+      "AgentUpdate": {
+        "type": "object",
+        "properties": {
+          "group": {
+            "$ref": "#/components/schemas/Group"
+          }
+        },
+        "required": [
+          "group"
+        ],
+        "additionalProperties": false
+      },
+      "EnrollTokenRequest": {
+        "type": "object",
+        "properties": {
+          "group": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Group"
+              }
+            ],
+            "default": "default"
+          },
+          "ttl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Duration, 1s to 7 days; default 1h."
+          }
+        },
+        "additionalProperties": false
+      },
+      "BanRequest": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Target"
+              }
+            ],
+            "description": "At most /8 for IPv4, /16 for IPv6; must not overlap the allowlist."
+          },
+          "duration": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Duration (e.g. \"24h\"); left out: permanent. The API enforces no bounds."
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "examples": [
+              "global",
+              "group:web",
+              "agent:web-1,web-2"
+            ],
+            "description": "\"global\" (default), \"group:<name>\" or \"agent:<id>[,<id>...]\" (known agents)."
+          },
+          "jail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Default \"manual\"."
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "additionalProperties": false
+      },
+      "UnbanRequest": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/Target"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Default \"manual unban\"."
+          },
+          "allow_for": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Then keep the target from being banned again for this long (temporary allowlist entry): 1 minute to 7 days for operators, 30 days for admins; target at most /24 (IPv4) or /48 (IPv6)."
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

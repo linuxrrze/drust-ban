@@ -362,7 +362,16 @@ Rules:
   when it changed, e.g. after a renewal; new connections use it. A pair
   that does not fit (key not matching, caught half written) is logged and
   the current certificate kept until the next check.
-- Not yet: OpenAPI.
+- **OpenAPI**: `crates/df2b-controller/openapi.json` (OpenAPI 3.1,
+  hand-written, no code generation), embedded into the binary and served
+  without authentication at `GET /api/v1/openapi.json` (it only describes
+  the API). Every operation names its minimum role in `x-required-role`
+  (`none`, `authenticated`, `viewer`, `operator`, `admin`). A test
+  (`openapi_tests.rs`) parses the router in `api.rs` and fails when a
+  route or method is missing from the document or documented but not
+  served, when a role differs from the handler's `require(Role::…)`, or
+  when the document is malformed (dangling `$ref`, missing responses or
+  path parameters). Response shapes are maintained by hand.
 
 ### 4.5 Abuse safeguards
 
@@ -585,7 +594,7 @@ df2bctl config check | reload
 ## 9. Web frontend
 
 - Backend: `axum` REST API on the HTTPS port, Server-Sent Events for live
-  updates; OpenAPI spec (`utoipa`) later.
+  updates; hand-written OpenAPI 3.1 description (§4.4).
 - Frontend: Svelte 5 + TypeScript, built with Vite into static files and
   embedded into the controller binary with `rust-embed` (single-binary
   deployment). Plain Vite rather than SvelteKit: SvelteKit's static output
