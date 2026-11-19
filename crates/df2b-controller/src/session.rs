@@ -157,6 +157,25 @@ impl Failures {
     }
 }
 
+/// Clients and user names whose failures are tracked at most.
+const MAX_TRACKED: usize = 10_000;
+
+/// Frees one place: expired entries first, else the one with the fewest
+/// failures (the oldest of those).
+fn make_room<K: Clone + Eq + std::hash::Hash>(m: &mut HashMap<K, Failures>, now: Instant) {
+    m.retain(|_, f| f.current(now) > 0);
+    if m.len() < MAX_TRACKED {
+        return;
+    }
+    if let Some(k) = m
+        .iter()
+        .min_by_key(|(_, f)| (f.count, f.since))
+        .map(|(k, _)| k.clone())
+    {
+        m.remove(&k);
+    }
+}
+
 #[derive(Default)]
 pub struct Sessions {
     sessions: Mutex<HashMap<[u8; 32], Session>>,
@@ -196,35 +215,52 @@ impl Sessions {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether another login attempt is allowed now.
-    pub fn login_allowed(&self, client: Option<IpAddr>, user: &str) -> bool {
+    /// Starts a password check: false if the client or the user name is
+    /// over its failure limit. Otherwise the attempt already counts as a
+    /// failure - checked and counted in one step, so parallel attempts
+    /// cannot all pass before the first failure is recorded - and
+    /// [`Self::login_succeeded`] takes it back.
+    pub fn login_begin(&self, client: Option<IpAddr>, user: &str) -> bool {
         let now = Instant::now();
+        // lock order: clients, then users
+        let mut by_client = Self::lock(&self.by_client);
+        let mut by_user = Self::lock(&self.by_user);
         let client_ok = client.map_or(true, |ip| {
-            Self::lock(&self.by_client)
-                .entry(client_key(ip))
-                .or_default()
-                .current(now)
-                < MAX_FAILURES_PER_CLIENT
+            by_client
+                .get_mut(&client_key(ip))
+                .map_or(true, |f| f.current(now) < MAX_FAILURES_PER_CLIENT)
         });
-        let user_ok = Self::lock(&self.by_user)
+        let user_ok = by_user
             .get_mut(user)
             .map_or(true, |f| f.current(now) < MAX_FAILURES_PER_USER);
-        client_ok && user_ok
-    }
-
-    pub fn login_failed(&self, client: Option<IpAddr>, user: &str) {
-        let now = Instant::now();
+        if !(client_ok && user_ok) {
+            return false;
+        }
         if let Some(ip) = client {
-            Self::lock(&self.by_client)
-                .entry(client_key(ip))
-                .or_default()
-                .add(now);
+            if by_client.len() >= MAX_TRACKED && !by_client.contains_key(&client_key(ip)) {
+                make_room(&mut by_client, now);
+            }
+            by_client.entry(client_key(ip)).or_default().add(now);
         }
         // only names that exist would be worth limiting, but checking that
-        // here would reveal which do; bound the map instead
+        // here would reveal which do: bounded, and when full the entries
+        // with the fewest failures go - never a name under attack
+        if by_user.len() >= MAX_TRACKED && !by_user.contains_key(user) {
+            make_room(&mut by_user, now);
+        }
+        by_user.entry(user.to_owned()).or_default().add(now);
+        true
+    }
+
+    /// The password was right: the attempt does not count.
+    pub fn login_succeeded(&self, client: Option<IpAddr>, user: &str) {
+        let mut by_client = Self::lock(&self.by_client);
         let mut by_user = Self::lock(&self.by_user);
-        if by_user.len() < 10_000 || by_user.contains_key(user) {
-            by_user.entry(user.to_owned()).or_default().add(now);
+        if let Some(f) = client.and_then(|ip| by_client.get_mut(&client_key(ip))) {
+            f.count = f.count.saturating_sub(1);
+        }
+        if let Some(f) = by_user.get_mut(user) {
+            f.count = f.count.saturating_sub(1);
         }
     }
 
@@ -464,6 +500,10 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"ab"));
     }
 
+    fn v4(i: u32) -> IpAddr {
+        IpAddr::V4((0x0a00_0000 + i).into())
+    }
+
     #[test]
     fn login_limits() {
         let s = Sessions::default();
@@ -471,15 +511,52 @@ mod tests {
         let b: IpAddr = "2001:db8::2".parse().unwrap(); // same /64
         let c: IpAddr = "192.0.2.1".parse().unwrap();
         for _ in 0..MAX_FAILURES_PER_CLIENT {
-            assert!(s.login_allowed(Some(a), "x"));
-            s.login_failed(Some(a), "x");
+            assert!(s.login_begin(Some(a), "x"));
         }
-        assert!(!s.login_allowed(Some(b), "y"), "same /64");
-        assert!(s.login_allowed(Some(c), "y"));
-        for _ in 0..MAX_FAILURES_PER_USER {
-            s.login_failed(Some(c), "victim");
+        assert!(!s.login_begin(Some(b), "y"), "same /64");
+        assert!(s.login_begin(Some(c), "y"));
+        for i in 0..MAX_FAILURES_PER_USER {
+            assert!(s.login_begin(Some(v4(i)), "victim"));
         }
-        assert!(!s.login_allowed(Some("198.51.100.1".parse().unwrap()), "victim"));
-        assert!(s.login_allowed(Some("198.51.100.1".parse().unwrap()), "other"));
+        assert!(!s.login_begin(Some(v4(999)), "victim"));
+        assert!(s.login_begin(Some(v4(999)), "other"));
+    }
+
+    /// Regression (security review): checking before and counting after
+    /// the password check let parallel attempts all pass (139 of 150).
+    /// Now the attempt counts when it starts; a right password gives it
+    /// back.
+    #[test]
+    fn attempts_count_when_they_start() {
+        let s = Sessions::default();
+        let c: IpAddr = "192.0.2.1".parse().unwrap();
+        let started = (0..150).filter(|_| s.login_begin(Some(c), "ada")).count();
+        assert_eq!(
+            started as u32, MAX_FAILURES_PER_CLIENT,
+            "no more in flight than the limit"
+        );
+        let s = Sessions::default();
+        for _ in 0..100 {
+            assert!(s.login_begin(Some(c), "ada"));
+            s.login_succeeded(Some(c), "ada");
+        }
+    }
+
+    /// Regression (security review): once 10 000 names were tracked, new
+    /// ones were not limited at all (fill with junk, then guess).
+    #[test]
+    fn a_full_table_keeps_names_under_attack() {
+        let s = Sessions::default();
+        for i in 0..5 {
+            assert!(s.login_begin(Some(v4(100_000 + i)), "admin"));
+        }
+        for i in 0..(MAX_TRACKED as u32 + 100) {
+            s.login_begin(Some(v4(i)), &format!("junk{i}"));
+        }
+        assert!(s.by_user.lock().unwrap().len() <= MAX_TRACKED);
+        for i in 5..MAX_FAILURES_PER_USER {
+            assert!(s.login_begin(Some(v4(200_000 + i)), "admin"));
+        }
+        assert!(!s.login_begin(Some(v4(300_000)), "admin"), "still limited");
     }
 }

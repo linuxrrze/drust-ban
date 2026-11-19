@@ -524,8 +524,9 @@ async fn login(
     if req.username.len() > 64 || req.password.len() > 1024 {
         return Err(unauthorized("invalid user name or password"));
     }
-    if !ctl.sessions.login_allowed(ip, &req.username) {
-        warn!(%addr, user = %req.username, "login rate limit reached");
+    if !ctl.sessions.login_begin(ip, &req.username) {
+        // Debug formatting: a user name is attacker text (no fake log lines)
+        warn!(%addr, user = ?req.username, "login rate limit reached");
         let mut r = ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed logins, try again in 15 minutes",
@@ -550,10 +551,11 @@ async fn login(
     })
     .await?;
     let Some(user) = user else {
-        ctl.sessions.login_failed(ip, &req.username);
-        warn!(%addr, user = %req.username, "failed login");
+        // already counted by login_begin
+        warn!(%addr, user = ?req.username, "failed login");
         return Err(unauthorized("invalid user name or password"));
     };
+    ctl.sessions.login_succeeded(ip, &req.username);
     let (secret, sess) = ctl.sessions.create(
         &user.name,
         session::Kind::Password {
@@ -663,7 +665,7 @@ async fn change_own_password(
         ));
     }
     let ip = Some(addr.ip());
-    if !ctl.sessions.login_allowed(ip, &name) {
+    if !ctl.sessions.login_begin(ip, &name) {
         let mut r = ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many wrong passwords, try again in 15 minutes",
@@ -693,14 +695,14 @@ async fn change_own_password(
     })
     .await?;
     let Some((changed_at, role)) = changed else {
-        // 403, not 401: the session itself is fine
-        ctl.sessions.login_failed(ip, &name);
+        // 403, not 401: the session itself is fine (counted by login_begin)
         warn!(%addr, user = %name, "wrong current password");
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "the current password is wrong",
         ));
     };
+    ctl.sessions.login_succeeded(ip, &name);
     ctl.sessions.end_user(Some(&name));
     let (secret, sess) = ctl.sessions.create(
         &name,
@@ -2296,7 +2298,7 @@ async fn oidc_backchannel_logout(
     let target = match o.verify_logout_token(&f.logout_token).await {
         Ok(t) => t,
         Err(e) => {
-            warn!(%addr, error = %format!("{e:#}"), "back-channel logout refused");
+            warn!(%addr, error = ?format!("{e:#}"), "back-channel logout refused");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "invalid_request", "error_description": "invalid logout token" })),
@@ -2400,7 +2402,7 @@ async fn oidc_callback(
             if let Some(s) = &q.state {
                 o.forget(s);
             }
-            warn!(%addr, error = %e, description = ?q.error_description, "OIDC provider returned an error");
+            warn!(%addr, error = ?e, description = ?q.error_description, "OIDC provider returned an error");
             Err(if e == "access_denied" {
                 crate::oidc::LoginError::Cancelled
             } else {
@@ -2413,7 +2415,7 @@ async fn oidc_callback(
     let ident = match result {
         Ok(i) => i,
         Err(e) => {
-            warn!(%addr, error = %e, "OIDC login failed");
+            warn!(%addr, error = ?format!("{e:#}"), "OIDC login failed");
             return login_error(e.code());
         }
     };
@@ -2422,7 +2424,7 @@ async fn oidc_callback(
     match tokio::task::spawn_blocking(move || crate::oidc::check_name(&dir, &name)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            warn!(%addr, error = %e, "OIDC login refused");
+            warn!(%addr, error = ?format!("{e:#}"), "OIDC login refused");
             return login_error(e.code());
         }
         Err(e) => {
