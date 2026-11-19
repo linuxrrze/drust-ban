@@ -311,6 +311,17 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/api-tokens", get(list_tokens).post(create_token))
         .route("/api/v1/policies", get(policies))
+        .route("/api/v1/filters", get(list_filters))
+        .route("/api/v1/filters/test", post(test_filter))
+        .route(
+            "/api/v1/filters/:name",
+            axum::routing::put(set_filter).delete(delete_filter),
+        )
+        .route("/api/v1/jail-definitions", get(list_jail_defs))
+        .route(
+            "/api/v1/jail-definitions/:name",
+            axum::routing::put(set_jail_def).delete(delete_jail_def),
+        )
         .route(
             "/api/v1/policies/propagate",
             axum::routing::put(set_propagate),
@@ -1005,22 +1016,27 @@ async fn policies(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResu
     let agents: Vec<_> = ctl.agents().into_iter().filter(|a| !a.revoked).collect();
     let mut names: std::collections::BTreeSet<String> =
         overrides.iter().map(|o| o.jail.clone()).collect();
+    names.extend(ctl.central().defs.iter().map(|d| d.name.clone()));
     for a in &agents {
         names.extend(a.status.jails.iter().map(|j| j.name.clone()));
     }
     let jails: Vec<Value> = names
         .into_iter()
         .map(|name| {
+            // every entry: an agent can run a local jail and report a
+            // refused central one of the same name
             let on: Vec<Value> = agents
                 .iter()
-                .filter_map(|a| {
-                    let j = a.status.jails.iter().find(|j| j.name == name)?;
-                    Some(json!({ "agent": a.record.id, "group": a.record.group, "connected": a.connected, "jail": j }))
+                .flat_map(|a| {
+                    a.status.jails.iter().filter(|j| j.name == name).map(|j| {
+                        json!({ "agent": a.record.id, "group": a.record.group, "connected": a.connected, "jail": j })
+                    })
                 })
                 .collect();
             let mut filters: Vec<String> = agents
                 .iter()
-                .filter_map(|a| a.status.jails.iter().find(|j| j.name == name).map(|j| j.filter.clone()))
+                .flat_map(|a| a.status.jails.iter().filter(|j| j.name == name && j.error.is_empty()))
+                .map(|j| j.filter.clone())
                 .collect();
             filters.sort();
             filters.dedup();
@@ -1187,6 +1203,234 @@ async fn delete_jail_policy(
         )
     })
     .await?;
+    Ok(Json(json!({ "removed": true })))
+}
+
+// ----------------------------------------------------------- central jails
+
+async fn list_filters(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    let c = ctl.central();
+    let mut list: Vec<Value> = c
+        .filters
+        .iter()
+        .map(|f| {
+            let mut v = serde_json::to_value(f).unwrap_or(Value::Null);
+            v["used_by"] = json!(c.users_of(&f.name));
+            v
+        })
+        .collect();
+    list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(Json(json!({ "filters": list })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilterBody {
+    toml: String,
+}
+
+/// Admin: creates or replaces a filter (compiled first).
+async fn set_filter(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Json(req): Json<FilterBody>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    crate::central::validate_filter(&name, &req.toml).map_err(ApiError::bad_request)?;
+    let f = crate::central::CentralFilter {
+        name: name.clone(),
+        toml: req.toml,
+        updated_by: caller.name.clone(),
+        updated_at: Utc::now(),
+    };
+    let c = ctl.clone();
+    let replaced = blocking(move || {
+        let replaced = c.set_filter(f)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "filter.set",
+            json!({ "filter": name, "replaced": replaced }),
+        )?;
+        Ok(replaced)
+    })
+    .await?;
+    Ok(Json(json!({ "replaced": replaced })))
+}
+
+fn central_error(e: crate::state::CentralError) -> ApiError {
+    use crate::state::CentralError as E;
+    match e {
+        E::FilterInUse(..) => conflict(e.to_string()),
+        E::Missing(_) => ApiError::not_found(e.to_string()),
+        E::Store(e) => ApiError::internal(e),
+    }
+}
+
+async fn delete_filter(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    tokio::task::spawn_blocking(move || {
+        c.remove_filter(&name).map_err(central_error)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "filter.remove",
+            json!({ "filter": name }),
+        )
+        .map_err(ApiError::internal)
+    })
+    .await
+    .map_err(ApiError::internal)??;
+    Ok(Json(json!({ "removed": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilterTest {
+    toml: String,
+    lines: Vec<String>,
+}
+
+/// Runs a filter (not stored) against sample log lines.
+async fn test_filter(caller: Caller, Json(req): Json<FilterTest>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    if req.lines.len() > 5000 || req.lines.iter().map(String::len).sum::<usize>() > 2 << 20 {
+        return Err(ApiError::bad_request("at most 5000 lines / 2 MiB"));
+    }
+    crate::central::validate_filter("test", &req.toml).map_err(ApiError::bad_request)?;
+    let def = df2b_matcher::FilterDef::from_toml(&req.toml).map_err(ApiError::bad_request_from)?;
+    let filter = df2b_matcher::Filter::compile("test", &def).map_err(ApiError::bad_request_from)?;
+    let mut matches = Vec::new();
+    for (i, line) in req.lines.iter().enumerate() {
+        if let Some(m) = filter.match_line(line) {
+            matches.push(json!({ "line": i + 1, "ip": m.ip, "pattern": m.pattern }));
+        }
+    }
+    Ok(Json(
+        json!({ "lines": req.lines.len(), "matched": matches.len(), "matches": matches }),
+    ))
+}
+
+async fn list_jail_defs(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    let c = ctl.central();
+    let mut defs: Vec<&crate::central::JailDef> = c.defs.iter().collect();
+    defs.sort_by(|a, b| (&a.name, &a.group).cmp(&(&b.name, &b.group)));
+    let list: Vec<Value> = defs
+        .iter()
+        .map(|d| {
+            let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
+            v["filter_is_central"] = json!(c.filters.iter().any(|f| f.name == d.filter));
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "definitions": list })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JailDefBody {
+    group: Option<String>,
+    filter: String,
+    sources: Vec<crate::central::SourceDef>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    maxretry: u32,
+    findtime: String,
+    bantime: String,
+    bantime_factor: Option<f64>,
+    max_bantime: Option<String>,
+}
+
+/// Admin: defines a jail for all agents or a group (replacing the same
+/// name and scope). The filter may be central or an agent-local one.
+async fn set_jail_def(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Json(req): Json<JailDefBody>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let group = req
+        .group
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(str::to_owned);
+    if group.as_deref().is_some_and(|g| !files::valid_group(g)) {
+        return Err(ApiError::bad_request("invalid group name"));
+    }
+    let d = crate::central::JailDef {
+        name: name.clone(),
+        group: group.clone(),
+        filter: req.filter.trim().to_owned(),
+        sources: req.sources,
+        enabled: req.enabled,
+        maxretry: req.maxretry,
+        findtime: parse_duration(&req.findtime, "findtime")?,
+        bantime: parse_duration(&req.bantime, "bantime")?,
+        bantime_factor: req.bantime_factor.unwrap_or(1.0),
+        max_bantime: req
+            .max_bantime
+            .as_deref()
+            .map(|t| parse_duration(t, "max_bantime"))
+            .transpose()?,
+        updated_by: caller.name.clone(),
+        updated_at: Utc::now(),
+    };
+    crate::central::validate_def(&d).map_err(ApiError::bad_request)?;
+    let filter_is_central = ctl.central().filters.iter().any(|f| f.name == d.filter);
+    let c = ctl.clone();
+    let audit_def = serde_json::to_value(&d).map_err(ApiError::internal)?;
+    let prev = blocking(move || {
+        let prev = c.set_jail_def(d)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "jail.define",
+            json!({ "jail": name, "group": group, "definition": audit_def, "replaced": prev.is_some() }),
+        )?;
+        Ok(prev)
+    })
+    .await?;
+    Ok(Json(
+        json!({ "replaced": prev.is_some(), "filter_is_central": filter_is_central }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct GroupQuery {
+    group: Option<String>,
+}
+
+async fn delete_jail_def(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Path(name): Path<String>,
+    Query(q): Query<GroupQuery>,
+) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    tokio::task::spawn_blocking(move || {
+        c.remove_jail_def(&name, q.group.as_deref())
+            .map_err(central_error)?;
+        c.audit(
+            &caller.name,
+            caller.addr(),
+            "jail.undefine",
+            json!({ "jail": name, "group": q.group }),
+        )
+        .map_err(ApiError::internal)
+    })
+    .await
+    .map_err(ApiError::internal)??;
     Ok(Json(json!({ "removed": true })))
 }
 
@@ -3991,6 +4235,171 @@ mod tests {
                 "jail.policy",
                 "jail.policy",
                 "policy.propagate"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn central_filters_and_jail_definitions() {
+        let env = Env::new("central").await;
+        let viewer = env.token("vic", Role::Viewer);
+        let admin = env.token("ada", Role::Admin);
+        let put = |tok: &str, path: &str, body: Value| {
+            let (env, tok, url) = (&env, tok.to_owned(), format!("{}{path}", env.base));
+            async move {
+                let r = env
+                    .http
+                    .put(url)
+                    .bearer_auth(tok)
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                (r.status(), r.json::<Value>().await.unwrap_or(Value::Null))
+            }
+        };
+        let del = |path: &str| {
+            let (env, admin, url) = (&env, admin.clone(), format!("{}{path}", env.base));
+            async move {
+                env.http
+                    .delete(url)
+                    .bearer_auth(admin)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        let toml = "literals = ['login failed']\nfailregex = ['login failed for \\S+ from <HOST>']";
+
+        // filters
+        assert_eq!(
+            put(&viewer, "/api/v1/filters/app-auth", json!({ "toml": toml }))
+                .await
+                .0,
+            S::FORBIDDEN
+        );
+        let (st, v) = put(
+            &admin,
+            "/api/v1/filters/app-auth",
+            json!({ "toml": "failregex = ['no tag']" }),
+        )
+        .await;
+        assert_eq!(st, S::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("HOST"), "{v}");
+        let (st, v) = put(&admin, "/api/v1/filters/app-auth", json!({ "toml": toml })).await;
+        assert_eq!((st, v["replaced"].as_bool()), (S::OK, Some(false)));
+        // try it on sample lines (viewers may test)
+        let (st, v) = env.call("POST", "/api/v1/filters/test", &viewer, json!({
+            "toml": toml,
+            "lines": ["login failed for bob from 192.0.2.7", "login ok for bob from 192.0.2.8", "login failed for eve from 2001:db8::9"],
+        })).await;
+        assert_eq!((st, v["matched"].as_u64()), (S::OK, Some(2)), "{v}");
+        assert_eq!(
+            (
+                v["matches"][0]["line"].as_u64(),
+                v["matches"][0]["ip"].as_str()
+            ),
+            (Some(1), Some("192.0.2.7"))
+        );
+        assert_eq!(v["matches"][1]["ip"], "2001:db8::9");
+
+        // jail definitions
+        let good = json!({
+            "filter": "app-auth",
+            "sources": [{ "type": "file", "paths": ["/var/log/app/auth.log"], "start_at_end": true },
+                        { "type": "journald", "matches": ["_SYSTEMD_UNIT=app.service"], "start": "10m" }],
+            "maxretry": 3, "findtime": "10m", "bantime": "1h", "bantime_factor": 2.0,
+        });
+        assert_eq!(
+            put(&viewer, "/api/v1/jail-definitions/app", good.clone())
+                .await
+                .0,
+            S::FORBIDDEN
+        );
+        for (what, patch) in [
+            (
+                "dotdot",
+                json!({ "sources": [{ "type": "file", "paths": ["/var/log/../etc/shadow"] }] }),
+            ),
+            (
+                "relative",
+                json!({ "sources": [{ "type": "file", "paths": ["app.log"] }] }),
+            ),
+            ("no sources", json!({ "sources": [] })),
+            (
+                "match",
+                json!({ "sources": [{ "type": "journald", "matches": ["not a match"] }] }),
+            ),
+            ("maxretry", json!({ "maxretry": 0 })),
+            ("bantime", json!({ "bantime": "5s" })),
+            ("group", json!({ "group": "a b" })),
+        ] {
+            let mut body = good.clone();
+            for (k, v) in patch.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let (st, v) = put(&admin, "/api/v1/jail-definitions/app", body).await;
+            assert_eq!(st, S::BAD_REQUEST, "{what}: {v}");
+        }
+        let (st, v) = put(&admin, "/api/v1/jail-definitions/app", good.clone()).await;
+        assert_eq!(
+            (st, v["filter_is_central"].as_bool()),
+            (S::OK, Some(true)),
+            "{v}"
+        );
+        // an agent-local filter is allowed (the agent reports if it lacks it)
+        let mut web = good.clone();
+        web["group"] = json!("web");
+        web["filter"] = json!("sshd");
+        let (_, v) = put(&admin, "/api/v1/jail-definitions/app", web).await;
+        assert_eq!(v["filter_is_central"], false);
+
+        let (_, v) = env
+            .call("GET", "/api/v1/jail-definitions", &viewer, json!({}))
+            .await;
+        let defs = v["definitions"].as_array().unwrap();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(
+            (defs[0]["group"].is_null(), defs[0]["findtime"].as_str()),
+            (true, Some("10m"))
+        );
+        let (_, v) = env.call("GET", "/api/v1/filters", &viewer, json!({})).await;
+        assert_eq!(v["filters"][0]["used_by"], json!(["app"]));
+        let (_, v) = env
+            .call("GET", "/api/v1/policies", &viewer, json!({}))
+            .await;
+        assert_eq!(
+            v["jails"][0]["name"], "app",
+            "defined jails appear in the inventory"
+        );
+
+        // a filter in use cannot be deleted
+        assert_eq!(del("/api/v1/filters/app-auth").await, S::CONFLICT);
+        assert_eq!(del("/api/v1/jail-definitions/app").await, S::OK);
+        assert_eq!(del("/api/v1/jail-definitions/app").await, S::NOT_FOUND);
+        assert_eq!(del("/api/v1/jail-definitions/app?group=web").await, S::OK);
+        assert_eq!(del("/api/v1/filters/app-auth").await, S::OK);
+        assert_eq!(del("/api/v1/filters/app-auth").await, S::NOT_FOUND);
+
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let actions: Vec<_> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action"].as_str().unwrap().to_owned())
+            .filter(|a| a.starts_with("filter.") || a.starts_with("jail."))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "filter.remove",
+                "jail.undefine",
+                "jail.undefine",
+                "jail.define",
+                "jail.define",
+                "filter.set"
             ]
         );
         let _ = std::fs::remove_dir_all(&env.dir);

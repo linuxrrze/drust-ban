@@ -10,6 +10,7 @@
 //! compaction.
 
 mod api;
+mod central;
 mod files;
 mod grpc;
 mod https;

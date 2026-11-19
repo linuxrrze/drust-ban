@@ -27,6 +27,13 @@ firewall = "dry-run"
 # Never ban these (CIDR notation).
 allowlist = ["127.0.0.0/8", "::1/128"]
 
+# Jails defined on the controller (Policies page, `df2bctl jails define`)
+# run here too, with their log sources and filter. What this agent accepts:
+# central_jails = true            # false: run local jails only
+# central_paths = ["/var/log"]    # central file sources only below these
+# central_journald = true         # central jails may read the journal
+# A local jail with the same name always wins.
+
 [[source]]
 name = "sshd-journal"
 type = "journald"

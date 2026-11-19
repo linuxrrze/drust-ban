@@ -62,6 +62,7 @@ pub struct LinkStats {
     /// Effective jail settings and the policy version applied.
     pub jails: std::sync::Mutex<Vec<v1::JailStatus>>,
     pub jail_policies_version: std::sync::Mutex<String>,
+    pub central_jails_version: std::sync::Mutex<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +93,8 @@ pub enum FromController {
     Allowlist(crate::state::CentralAllowlist),
     /// Central jail settings for this agent (replace earlier ones).
     JailPolicies(crate::state::JailPolicies),
+    /// Jails defined on the controller (replace earlier ones).
+    CentralJails(crate::central::CentralJails),
 }
 
 /// Converts jail policies; implausible entries are dropped (logged), the
@@ -536,6 +539,7 @@ impl Task {
                             }
                         }
                         Some(Event::JailPolicies(p)) => FromController::JailPolicies(parse_jail_policies(p)),
+                        Some(Event::CentralJails(c)) => FromController::CentralJails(crate::central::from_proto(c)),
                         Some(Event::Allowlist(a)) => match parse_allowlist(a) {
                             Some(ev) => ev,
                             None => { warn!("ignoring malformed allowlist update, keeping the previous one"); continue; }
@@ -563,6 +567,7 @@ impl Task {
                         allowlist_version: self.stats.allowlist_version.lock().map(|v| v.clone()).unwrap_or_default(),
                         jails: self.stats.jails.lock().map(|v| v.clone()).unwrap_or_default(),
                         jail_policies_version: self.stats.jail_policies_version.lock().map(|v| v.clone()).unwrap_or_default(),
+                        central_jails_version: self.stats.central_jails_version.lock().map(|v| v.clone()).unwrap_or_default(),
                     }).await?.into_inner();
                     // the controller decides the group (it filters the
                     // decisions); keep the local copy for logs up to date

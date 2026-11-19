@@ -31,6 +31,7 @@ const OFFENDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("offenders"
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const CENTRAL_ALLOWLIST: &str = "central_allowlist";
 const JAIL_POLICIES: &str = "jail_policies";
+const CENTRAL_JAILS: &str = "central_jails";
 
 /// The controller's jail settings as last applied.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -123,6 +124,7 @@ pub struct Loaded {
     pub offenders: Vec<OffenderRecord>,
     pub central_allowlist: Option<CentralAllowlist>,
     pub jail_policies: Option<JailPolicies>,
+    pub central_jails: Option<crate::central::CentralJails>,
 }
 
 #[derive(Clone)]
@@ -177,6 +179,12 @@ impl State {
                 }
             }
         }
+        if let Some(v) = tx.open_table(META)?.get(CENTRAL_JAILS)? {
+            match serde_json::from_slice(v.value()) {
+                Ok(c) => loaded.central_jails = Some(c),
+                Err(e) => tracing::warn!(error = %e, "ignoring unreadable saved central jails"),
+            }
+        }
         if let Some(v) = tx.open_table(META)?.get(JAIL_POLICIES)? {
             match serde_json::from_slice(v.value()) {
                 Ok(p) => loaded.jail_policies = Some(p),
@@ -190,6 +198,15 @@ impl State {
             }
         }
         Ok(loaded)
+    }
+
+    /// Saves the central jail definitions (only when they change). Blocking.
+    pub fn save_central_jails(&self, c: &crate::central::CentralJails) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?
+            .insert(CENTRAL_JAILS, serde_json::to_vec(c)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Saves the jail policies (only when they change). Blocking.

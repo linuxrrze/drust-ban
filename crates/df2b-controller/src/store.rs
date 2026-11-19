@@ -20,6 +20,8 @@ const DECISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("decisions")
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 const ALLOWLIST: TableDefinition<&str, &[u8]> = TableDefinition::new("allowlist");
 const JAIL_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_policies");
+const FILTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("filters");
+const JAIL_DEFS: TableDefinition<&str, &[u8]> = TableDefinition::new("jail_defs");
 /// Runtime settings changed through the API (e.g. "propagate").
 const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
@@ -87,6 +89,8 @@ impl Store {
         tx.open_table(ALLOWLIST)?;
         tx.open_table(JAIL_POLICIES)?;
         tx.open_table(SETTINGS)?;
+        tx.open_table(FILTERS)?;
+        tx.open_table(JAIL_DEFS)?;
         tx.commit()?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -203,6 +207,50 @@ impl Store {
             .open_table(JAIL_POLICIES)?
             .remove(key.as_str())?
             .is_some();
+        tx.commit()?;
+        Ok(found)
+    }
+
+    pub fn central_config(&self) -> anyhow::Result<crate::central::CentralConfig> {
+        let tx = self.db.begin_read()?;
+        let mut c = crate::central::CentralConfig::default();
+        for item in tx.open_table(FILTERS)?.iter()? {
+            c.filters.push(serde_json::from_slice(item?.1.value())?);
+        }
+        for item in tx.open_table(JAIL_DEFS)?.iter()? {
+            c.defs.push(serde_json::from_slice(item?.1.value())?);
+        }
+        Ok(c)
+    }
+
+    pub fn put_filter(&self, f: &crate::central::CentralFilter) -> anyhow::Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(FILTERS)?
+            .insert(f.name.as_str(), serde_json::to_vec(f)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_filter(&self, name: &str) -> anyhow::Result<bool> {
+        let tx = self.db.begin_write()?;
+        let found = tx.open_table(FILTERS)?.remove(name)?.is_some();
+        tx.commit()?;
+        Ok(found)
+    }
+
+    pub fn put_jail_def(&self, d: &crate::central::JailDef) -> anyhow::Result<()> {
+        let key = crate::central::JailDef::key(&d.name, d.group.as_deref());
+        let tx = self.db.begin_write()?;
+        tx.open_table(JAIL_DEFS)?
+            .insert(key.as_str(), serde_json::to_vec(d)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_jail_def(&self, name: &str, group: Option<&str>) -> anyhow::Result<bool> {
+        let key = crate::central::JailDef::key(name, group);
+        let tx = self.db.begin_write()?;
+        let found = tx.open_table(JAIL_DEFS)?.remove(key.as_str())?.is_some();
         tx.commit()?;
         Ok(found)
     }

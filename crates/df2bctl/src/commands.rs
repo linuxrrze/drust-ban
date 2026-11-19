@@ -582,6 +582,16 @@ pub async fn jails_list(c: &Client, json: bool) -> anyhow::Result<()> {
         }
         for (i, a) in agents.iter().enumerate() {
             let jv = &a["jail"];
+            if let Some(err) = jv["error"].as_str().filter(|e| !e.is_empty()) {
+                println!(
+                    "{:<16} {:<28} {:<7} {}",
+                    if i == 0 { name } else { "" },
+                    s(a, &["agent"]),
+                    "ERROR",
+                    err
+                );
+                continue;
+            }
             println!(
                 "{:<16} {:<28} {:<7} {:>5} {:>7} {:>7} {:>6} {:>7}  {}",
                 if i == 0 { name } else { "" },
@@ -651,5 +661,98 @@ pub async fn propagate(c: &Client, mode: Option<String>, json: bool) -> anyhow::
         Some(prev) => println!("ban propagation: {prev} -> {}", s(&v, &["propagate"])),
         None => println!("ban propagation: {}", s(&v, &["propagate"])),
     }
+    Ok(())
+}
+
+pub async fn jails_define(c: &Client, jail: &str, body: Value, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .put(&format!("/api/v1/jail-definitions/{jail}"), body.clone())
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    let scope = body["group"]
+        .as_str()
+        .map_or("all agents".to_owned(), |g| format!("group {g}"));
+    println!("{jail}: defined for {scope}; connected agents start it at once");
+    if v["filter_is_central"] == false {
+        println!(
+            "note: filter {:?} is not central; agents need it in their filter_dir",
+            body["filter"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+pub async fn jails_undefine(
+    c: &Client,
+    jail: &str,
+    group: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let q: Vec<(&str, String)> = group.iter().map(|g| ("group", g.clone())).collect();
+    let v = c
+        .delete(&format!("/api/v1/jail-definitions/{jail}"), &q)
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("{jail}: definition removed; agents stop the jail");
+    Ok(())
+}
+
+pub async fn filters_list(c: &Client, json: bool) -> anyhow::Result<()> {
+    let v = c.get("/api/v1/filters").await?;
+    if json {
+        return json_out(&v);
+    }
+    let list = v["filters"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("no central filters");
+    }
+    for f in &list {
+        let used: Vec<&str> = f["used_by"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        println!(
+            "{:<24} used by {}",
+            s(f, &["name"]),
+            if used.is_empty() {
+                "-".into()
+            } else {
+                used.join(", ")
+            }
+        );
+    }
+    Ok(())
+}
+
+pub async fn filter_push(c: &Client, name: &str, toml: String, json: bool) -> anyhow::Result<()> {
+    let v = c
+        .put(&format!("/api/v1/filters/{name}"), json!({ "toml": toml }))
+        .await?;
+    if json {
+        return json_out(&v);
+    }
+    println!(
+        "filter {name} {}",
+        if v["replaced"] == true {
+            "replaced"
+        } else {
+            "uploaded"
+        }
+    );
+    Ok(())
+}
+
+pub async fn filter_rm(c: &Client, name: &str, json: bool) -> anyhow::Result<()> {
+    let v = c.delete(&format!("/api/v1/filters/{name}"), &[]).await?;
+    if json {
+        return json_out(&v);
+    }
+    println!("filter {name} deleted");
     Ok(())
 }

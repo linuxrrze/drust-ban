@@ -12,6 +12,7 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 df2b-core.workspace = true
+df2b-matcher.workspace = true
 df2b-proto.workspace = true
 df2b-tls.workspace = true
 humantime.workspace = true

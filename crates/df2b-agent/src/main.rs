@@ -5,6 +5,7 @@
 //! and the controller's decisions are applied (see link.rs).
 //! TODO: local control socket for `df2bctl --local`, reconcile loop.
 
+mod central;
 mod config;
 mod engine;
 mod link;
@@ -96,13 +97,20 @@ async fn main() -> anyhow::Result<()> {
 
     let state = State::open(&cfg.agent.state_dir)?;
     let loaded = state.load()?;
+    // jails defined on the controller, as last received: set up before the
+    // offender records are restored, so their bans come back too
+    let mut central_jails = loaded.central_jails.clone().unwrap_or_default();
+    let running_central = {
+        let (accepted, rejected) = central::split(&cfg.agent, &central_jails);
+        engine.set_central_jails(&accepted, &central_jails.filters, rejected)
+    };
     let mut restored = engine.restore(loaded.offenders, Utc::now());
     let mut pending = Pending::default();
-    // the controller's allowlist as last received: applies before the
-    // controller is reachable again
     // the controller's jail settings as last received
     let mut jail_policies = loaded.jail_policies.clone().unwrap_or_default();
     engine.apply_jail_overrides(&jail_policies.jails);
+    // the controller's allowlist as last received: applies before the
+    // controller is reachable again
     let mut central = loaded.central_allowlist.clone().unwrap_or_default();
     engine.set_central_allowlist(central.live(Utc::now()));
     for r in engine.lift_allowlisted(Utc::now()) {
@@ -150,7 +158,11 @@ async fn main() -> anyhow::Result<()> {
     for src in &cfg.source {
         spawn_source(src, &tx, &loaded.positions)?;
     }
-    drop(tx);
+    // kept: central jails start sources later (and an agent without local
+    // sources must keep running)
+    let src_tx = tx;
+    let mut central_sources = CentralSources::default();
+    central_sources.update(&central_jails, &running_central, &src_tx, &loaded.positions);
 
     let stats = Arc::new(LinkStats::default());
     if let Ok(mut v) = stats.allowlist_version.lock() {
@@ -158,6 +170,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Ok(mut v) = stats.jail_policies_version.lock() {
         v.clone_from(&jail_policies.version);
+    }
+    if let Ok(mut v) = stats.central_jails_version.lock() {
+        v.clone_from(&central_jails.version);
     }
     let mut link: Option<Link> = match &cfg.agent.controller {
         Some(url) => Some(link::spawn(
@@ -236,6 +251,27 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 };
                 let now = Utc::now();
+                if let FromController::CentralJails(c) = ev {
+                    let (accepted, rejected) = central::split(&cfg.agent, &c);
+                    let running = engine.set_central_jails(&accepted, &c.filters, rejected);
+                    // the policies apply to central jails as well
+                    engine.apply_jail_overrides(&jail_policies.jails);
+                    central_sources.update(&c, &running, &src_tx, &loaded.positions);
+                    if c.version != central_jails.version {
+                        info!(version = %c.version, defined = c.jails.len(), running = running.len(), "central jails applied");
+                        let (st, saved) = (state.clone(), c.clone());
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = st.save_central_jails(&saved) {
+                                error!(error = %format!("{e:#}"), "saving the central jails failed");
+                            }
+                        });
+                    }
+                    if let Ok(mut v) = stats.central_jails_version.lock() {
+                        v.clone_from(&c.version);
+                    }
+                    central_jails = c;
+                    continue;
+                }
                 if let FromController::JailPolicies(p) = ev {
                     engine.apply_jail_overrides(&p.jails);
                     if p.version != jail_policies.version {
@@ -363,6 +399,8 @@ fn jail_status(j: engine::JailStatus) -> v1::JailStatus {
         max_bantime_ms: j.params.max_bantime.map_or(0, ms),
         overridden: j.overridden.into_iter().map(str::to_owned).collect(),
         active_bans: j.active_bans as u64,
+        origin: j.origin.into(),
+        error: j.error,
     }
 }
 
@@ -399,11 +437,81 @@ fn apply_remote(backend: &Arc<dyn FirewallBackend>, c: Changes) {
     });
 }
 
+/// Running sources of central jails, by source name: definition and tasks.
+#[derive(Default)]
+struct CentralSources(HashMap<String, (central::CentralSource, Vec<tokio::task::JoinHandle<()>>)>);
+
+impl CentralSources {
+    /// Stops sources that are gone or changed, starts new ones; unchanged
+    /// sources keep running (and their read position).
+    fn update(
+        &mut self,
+        jails: &central::CentralJails,
+        running: &[String],
+        tx: &mpsc::Sender<SourceBatch>,
+        positions: &HashMap<String, Position>,
+    ) {
+        let mut wanted: HashMap<String, (central::CentralSource, SourceConfig)> = HashMap::new();
+        for j in jails.jails.iter().filter(|j| running.contains(&j.name)) {
+            if let Ok(cfgs) = j.source_configs() {
+                for (def, cfg) in j.sources.iter().zip(cfgs) {
+                    wanted.insert(cfg.name.clone(), (def.clone(), cfg));
+                }
+            }
+        }
+        self.0.retain(|name, (def, tasks)| {
+            let keep = wanted.get(name).is_some_and(|(w, _)| w == def);
+            if !keep {
+                for t in tasks.iter() {
+                    t.abort();
+                }
+                info!(source = %name, "central source stopped");
+            }
+            keep
+        });
+        for (name, (def, cfg)) in wanted {
+            if self.0.contains_key(&name) {
+                continue;
+            }
+            match spawn_central_source(&cfg, tx, positions) {
+                Ok(tasks) => {
+                    info!(source = %name, "central source started");
+                    self.0.insert(name, (def, tasks));
+                }
+                Err(e) => {
+                    error!(source = %name, error = %format!("{e:#}"), "central source failed")
+                }
+            }
+        }
+    }
+}
+
+/// A source with its own channel: aborting the tasks drops the receiver,
+/// which also stops journald readers (they notice the closed channel).
+fn spawn_central_source(
+    src: &SourceConfig,
+    tx: &mpsc::Sender<SourceBatch>,
+    positions: &HashMap<String, Position>,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let (own_tx, mut own_rx) = mpsc::channel::<SourceBatch>(16);
+    let mut tasks = spawn_source(src, &own_tx, positions)?;
+    let tx = tx.clone();
+    tasks.push(tokio::spawn(async move {
+        while let Some(b) = own_rx.recv().await {
+            if tx.send(b).await.is_err() {
+                break;
+            }
+        }
+    }));
+    Ok(tasks)
+}
+
 fn spawn_source(
     src: &SourceConfig,
     tx: &mpsc::Sender<SourceBatch>,
     positions: &HashMap<String, Position>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let mut tasks = Vec::new();
     let name: Arc<str> = Arc::from(src.name.as_str());
     match &src.kind {
         SourceKind::File {
@@ -421,11 +529,11 @@ fn spawn_source(
                 }
                 let tx = tx.clone();
                 let n = name.clone();
-                tokio::spawn(async move {
+                tasks.push(tokio::spawn(async move {
                     if let Err(e) = tailer.run(tx).await {
                         error!(source = %n, error = %e, "file source failed");
                     }
-                });
+                }));
             }
         }
         SourceKind::Journald {
@@ -466,5 +574,5 @@ fn spawn_source(
             }
         }
     }
-    Ok(())
+    Ok(tasks)
 }

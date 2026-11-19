@@ -43,6 +43,16 @@ pub struct AgentSection {
     /// Networks that are never banned (CIDR notation, e.g. "10.0.0.0/8").
     #[serde(default)]
     pub allowlist: Vec<IpNet>,
+    /// Accept jail definitions from the controller (with their filters and
+    /// log sources). Local jails of the same name always win.
+    #[serde(default = "yes")]
+    pub central_jails: bool,
+    /// Central file sources may only read below these directories.
+    #[serde(default = "default_central_paths")]
+    pub central_paths: Vec<PathBuf>,
+    /// Central jails may read the systemd journal.
+    #[serde(default = "yes")]
+    pub central_journald: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -129,6 +139,12 @@ pub struct JailConfig {
     pub max_tracked: usize,
 }
 
+fn yes() -> bool {
+    true
+}
+fn default_central_paths() -> Vec<PathBuf> {
+    vec!["/var/log".into()]
+}
 fn default_v4_prefix() -> u8 {
     32
 }
@@ -147,7 +163,7 @@ fn default_offense_memory() -> Duration {
 fn default_factor() -> f64 {
     1.0
 }
-fn default_max_tracked() -> usize {
+pub(crate) fn default_max_tracked() -> usize {
     100_000
 }
 
@@ -182,6 +198,12 @@ impl AgentConfig {
             if !names.insert(s.name.as_str()) {
                 bail!("duplicate source name '{}'", s.name);
             }
+            if s.name.starts_with("central:") {
+                bail!(
+                    "source name '{}': the prefix \"central:\" is reserved",
+                    s.name
+                );
+            }
         }
         let mut jails = HashSet::new();
         for j in &self.jail {
@@ -195,6 +217,11 @@ impl AgentConfig {
                 if !names.contains(s.as_str()) {
                     bail!("jail '{}' references unknown source '{s}'", j.name);
                 }
+            }
+        }
+        for p in &self.agent.central_paths {
+            if !p.is_absolute() {
+                bail!("central_paths: {} is not absolute", p.display());
             }
         }
         Ok(())

@@ -245,6 +245,43 @@ enum JailsCmd {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Define a jail on the controller for all agents or a group (admin):
+    /// created on the agents with its sources and filter.
+    Define {
+        jail: String,
+        #[arg(long)]
+        group: Option<String>,
+        /// A central filter, or one the agents have in their filter_dir.
+        #[arg(long)]
+        filter: String,
+        /// Log file (repeatable); agents accept paths below central_paths.
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// Read files from their end (only new lines).
+        #[arg(long)]
+        start_at_end: bool,
+        /// journald match, e.g. _SYSTEMD_UNIT=sshd.service (repeatable).
+        #[arg(long = "journald")]
+        journald: Vec<String>,
+        #[arg(long, default_value_t = 5)]
+        maxretry: u32,
+        #[arg(long, default_value = "10m")]
+        findtime: String,
+        #[arg(long, default_value = "1h")]
+        bantime: String,
+        #[arg(long)]
+        bantime_factor: Option<f64>,
+        #[arg(long)]
+        max_bantime: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Remove a central jail definition (all agents, or --group).
+    Undefine {
+        jail: String,
+        #[arg(long)]
+        group: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -256,6 +293,17 @@ enum PropagateArg {
 
 #[derive(Debug, Subcommand)]
 enum FilterCmd {
+    /// Central filters on the controller.
+    List,
+    /// Upload a filter file to the controller (admin; replaces one of the
+    /// same name). Central jails use it on the agents.
+    Push {
+        name: String,
+        /// Filter definition (TOML).
+        file: PathBuf,
+    },
+    /// Delete a central filter (admin; not while a central jail uses it).
+    Rm { name: String },
     /// Run a filter against a log file and report matches (like fail2ban-regex).
     Test {
         /// Filter definition (TOML).
@@ -391,6 +439,54 @@ async fn run() -> anyhow::Result<()> {
                 JailsCmd::Reset { jail, group } => {
                     commands::jails_reset(&c, &jail, group, json).await
                 }
+                JailsCmd::Define {
+                    jail,
+                    group,
+                    filter,
+                    files,
+                    start_at_end,
+                    journald,
+                    maxretry,
+                    findtime,
+                    bantime,
+                    bantime_factor,
+                    max_bantime,
+                    disabled,
+                } => {
+                    let mut sources = Vec::new();
+                    if !files.is_empty() {
+                        sources.push(serde_json::json!({ "type": "file", "paths": files, "start_at_end": start_at_end }));
+                    }
+                    if !journald.is_empty() {
+                        sources
+                            .push(serde_json::json!({ "type": "journald", "matches": journald }));
+                    }
+                    if sources.is_empty() {
+                        bail!("give at least one --file or --journald");
+                    }
+                    let body = serde_json::json!({
+                        "group": group, "filter": filter, "sources": sources,
+                        "enabled": !disabled, "maxretry": maxretry, "findtime": findtime,
+                        "bantime": bantime, "bantime_factor": bantime_factor, "max_bantime": max_bantime,
+                    });
+                    commands::jails_define(&c, &jail, body, json).await
+                }
+                JailsCmd::Undefine { jail, group } => {
+                    commands::jails_undefine(&c, &jail, group, json).await
+                }
+            }
+        }
+        Command::Filter(cmd) => {
+            let c = client()?;
+            match cmd {
+                FilterCmd::List => commands::filters_list(&c, json).await,
+                FilterCmd::Push { name, file } => {
+                    let toml = std::fs::read_to_string(&file)
+                        .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
+                    commands::filter_push(&c, &name, toml, json).await
+                }
+                FilterCmd::Rm { name } => commands::filter_rm(&c, &name, json).await,
+                FilterCmd::Test { .. } => unreachable!("handled before connecting"),
             }
         }
         Command::Propagate { mode } => {

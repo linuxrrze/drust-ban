@@ -178,6 +178,7 @@ impl AgentService for Service {
             s.last_applied_seq = h.last_applied_seq;
             s.allowlist_version = h.allowlist_version;
             s.jail_policies_version = h.jail_policies_version;
+            s.central_jails_version = h.central_jails_version;
             let secs = |ms: i64| u64::try_from(ms / 1000).unwrap_or(0);
             s.jails = h
                 .jails
@@ -194,6 +195,8 @@ impl AgentService for Service {
                     max_bantime_secs: secs(j.max_bantime_ms),
                     overridden: j.overridden.into_iter().take(8).collect(),
                     active_bans: j.active_bans,
+                    origin: j.origin.chars().take(16).collect(),
+                    error: j.error.chars().take(512).collect(),
                 })
                 .collect();
         });
@@ -288,6 +291,7 @@ impl AgentService for Service {
         let (tx, rx) = mpsc::channel(256);
         let mut allow = ctl.allowlist_watch();
         let mut jails = ctl.jail_watch();
+        let mut central = ctl.central_watch();
         tokio::spawn(async move {
             let id = record.id.clone();
             ctl.update_status(&id, |s| s.streams += 1);
@@ -342,9 +346,33 @@ impl AgentService for Service {
                 }
                 v
             };
+            // then the central jail definitions for its group
+            let mut sent_central = {
+                let c = central.borrow_and_update().for_group(&group);
+                let v = c.version.clone();
+                if tx.send(Ok(event(Event::CentralJails(c)))).await.is_err() {
+                    ctl.update_status(&id, |s| s.streams = s.streams.saturating_sub(1));
+                    return;
+                }
+                v
+            };
             let mut check = tokio::time::interval(REVOCATION_CHECK);
             loop {
                 tokio::select! {
+                    changed = central.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let c = central.borrow_and_update().for_group(&group);
+                        // other groups' changes do not concern this agent
+                        if c.version == sent_central {
+                            continue;
+                        }
+                        sent_central = c.version.clone();
+                        if tx.send(Ok(event(Event::CentralJails(c)))).await.is_err() {
+                            break;
+                        }
+                    }
                     changed = jails.changed() => {
                         if changed.is_err() {
                             break;
@@ -529,6 +557,10 @@ mod tests {
             next(&mut stream).await,
             Some(Event::JailPolicies(_))
         ));
+        assert!(matches!(
+            next(&mut stream).await,
+            Some(Event::CentralJails(_))
+        ));
 
         // a change reaches open streams at once, as the complete list
         let entry = |net: &str| crate::store::AllowEntry {
@@ -651,6 +683,10 @@ mod tests {
             panic!("expected the jail policies after the allowlist")
         };
         assert!(jp.jails.is_empty());
+        let Some(Event::CentralJails(cj)) = stream.message().await.unwrap().unwrap().event else {
+            panic!("expected the central jails after the jail policies")
+        };
+        assert!(cj.jails.is_empty());
 
         // local ban → decision; allowlisted, too broad and non-ban ignored
         let ack = a
@@ -738,6 +774,10 @@ mod tests {
             next(&mut stream).await,
             Some(Event::JailPolicies(_))
         ));
+        assert!(matches!(
+            next(&mut stream).await,
+            Some(Event::CentralJails(_))
+        ));
 
         ctl.set_group(&id, "db").unwrap();
         // closed within the check interval (5 s)
@@ -778,6 +818,10 @@ mod tests {
             panic!("jail policies expected")
         };
         assert!(empty.jails.is_empty());
+        assert!(matches!(
+            next(&mut stream).await,
+            Some(Event::CentralJails(_))
+        ));
 
         let ov = |group: Option<&str>, maxretry: u32| JailOverride {
             jail: "sshd".into(),
@@ -843,6 +887,78 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ctl.last_seq(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn central_jails_reach_their_group() {
+        use crate::central::{CentralFilter, JailDef, SourceDef};
+        let dir =
+            std::env::temp_dir().join(format!("df2b-ctl-grpc-central-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (addr, ctl) = start(&dir).await;
+        let mut a = enrolled(&addr, &ctl, &dir, "host-c").await; // group "web"
+        let mut stream = a
+            .subscribe(v1::SubscribeRequest { from_seq: 0 })
+            .await
+            .unwrap()
+            .into_inner();
+        for _ in 0..3 {
+            next(&mut stream).await; // snapshot, allowlist, jail policies
+        }
+        let Some(Event::CentralJails(c)) = next(&mut stream).await else {
+            panic!("central jails expected")
+        };
+        assert!(c.jails.is_empty());
+
+        let def = |group: Option<&str>| JailDef {
+            name: "app".into(),
+            group: group.map(Into::into),
+            filter: "app-auth".into(),
+            sources: vec![SourceDef::File {
+                paths: vec!["/var/log/app.log".into()],
+                start_at_end: true,
+            }],
+            enabled: true,
+            maxretry: 3,
+            findtime: Duration::from_secs(600),
+            bantime: Duration::from_secs(3600),
+            bantime_factor: 1.0,
+            max_bantime: None,
+            updated_by: "ada".into(),
+            updated_at: Utc::now(),
+        };
+        ctl.set_filter(CentralFilter {
+            name: "app-auth".into(),
+            toml: "failregex = ['failed from <HOST>']".into(),
+            updated_by: "ada".into(),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        // a filter alone changes nothing for this agent (no jail uses it);
+        // a definition for another group neither
+        ctl.set_jail_def(def(Some("db"))).unwrap();
+        ctl.set_jail_def(def(None)).unwrap();
+        let Some(Event::CentralJails(c)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        assert_eq!((c.jails.len(), c.jails[0].name.as_str()), (1, "app"));
+        assert_eq!(c.filters.len(), 1, "with the central filter it uses");
+        let Some(v1::source_definition::Kind::File(f)) = &c.jails[0].sources[0].kind else {
+            panic!()
+        };
+        assert_eq!(f.paths, ["/var/log/app.log"]);
+
+        // in use: cannot be deleted
+        assert!(matches!(
+            ctl.remove_filter("app-auth"),
+            Err(crate::state::CentralError::FilterInUse(..))
+        ));
+        ctl.remove_jail_def("app", None).unwrap();
+        let Some(Event::CentralJails(c)) = next(&mut stream).await else {
+            panic!("update expected")
+        };
+        assert!(c.jails.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

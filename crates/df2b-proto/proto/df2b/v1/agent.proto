@@ -74,6 +74,8 @@ message HeartbeatRequest {
   repeated JailStatus jails = 9;
   // Version of the jail policies the agent applies ("" = none / old agent).
   string jail_policies_version = 10;
+  // Version of the central jail definitions the agent applies.
+  string central_jails_version = 11;
 }
 
 message JailStatus {
@@ -89,6 +91,10 @@ message JailStatus {
   // Settings that come from a central policy, e.g. "maxretry".
   repeated string overridden = 9;
   uint64 active_bans = 10;
+  // "local" (agent configuration) or "central" (controller definition).
+  string origin = 11;
+  // Why a central jail does not run (conflict, path not allowed, ...).
+  string error = 12;
 }
 
 message HeartbeatResponse {
@@ -165,7 +171,55 @@ message DecisionEvent {
     // ones for all agents): sent after the allowlist and on every change.
     // Replaces the previous ones.
     JailPolicies jail_policies = 4;
+    // Jails defined on the controller for this agent's group, with the
+    // central filters they use: sent after the jail policies and on every
+    // change. Replaces earlier ones.
+    CentralJails central_jails = 5;
   }
+}
+
+message CentralJails {
+  string version = 1;
+  repeated CentralFilter filters = 2;
+  repeated JailDefinition jails = 3;
+}
+
+message CentralFilter {
+  string name = 1;
+  // Filter definition in the agent's filter format (TOML).
+  string toml = 2;
+}
+
+message JailDefinition {
+  string name = 1;
+  // A central filter of this message, else the agent's own filter file.
+  string filter = 2;
+  repeated SourceDefinition sources = 3;
+  bool enabled = 4;
+  uint32 maxretry = 5;
+  int64 findtime_ms = 6;
+  int64 bantime_ms = 7;
+  double bantime_factor = 8;
+  // 0 = no maximum
+  int64 max_bantime_ms = 9;
+}
+
+message SourceDefinition {
+  oneof kind {
+    FileSource file = 1;
+    JournaldSource journald = 2;
+  }
+}
+
+message FileSource {
+  repeated string paths = 1;
+  bool start_at_end = 2;
+}
+
+message JournaldSource {
+  repeated string matches = 1;
+  // "tail" (default), "head" or a duration such as "10m"
+  string start = 2;
 }
 
 message JailPolicies {

@@ -74,6 +74,8 @@ pub struct AgentStatus {
     pub jails: Vec<JailView>,
     /// Jail policies version the agent applies ("" = unknown).
     pub jail_policies_version: String,
+    /// Central jail definitions version the agent applies.
+    pub central_jails_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +156,19 @@ pub struct Controller {
     /// What an agent's local ban turns into (changeable at runtime).
     propagate: Mutex<Propagate>,
     jail_write: Mutex<()>,
+    /// Central filters and jail definitions; streams send each agent its
+    /// group's part.
+    central_tx: tokio::sync::watch::Sender<Arc<crate::central::CentralConfig>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CentralError {
+    #[error("filter {0:?} is used by {1}")]
+    FilterInUse(String, String),
+    #[error("no such {0}")]
+    Missing(&'static str),
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
 }
 
 /// A jail as an agent reports it.
@@ -171,6 +186,10 @@ pub struct JailView {
     /// settings that come from a central policy
     pub overridden: Vec<String>,
     pub active_bans: u64,
+    /// "local" or "central"
+    pub origin: String,
+    /// why a central jail does not run
+    pub error: String,
 }
 
 /// The central allowlist as distributed to agents.
@@ -269,6 +288,7 @@ impl Controller {
             "controller state loaded"
         );
         let jail_tx = tokio::sync::watch::channel(Arc::new(store.jail_overrides()?)).0;
+        let central_tx = tokio::sync::watch::channel(Arc::new(store.central_config()?)).0;
         // a stored change wins over the default; an explicit flag is
         // applied by main.rs with set_propagate
         let propagate = store
@@ -301,6 +321,7 @@ impl Controller {
             jail_tx,
             propagate: Mutex::new(propagate),
             jail_write: Mutex::new(()),
+            central_tx,
         })
     }
 
@@ -691,6 +712,77 @@ impl Controller {
         // only what is stored reaches the agents
         self.jail_tx.send_replace(Arc::new(v));
         Ok(prev)
+    }
+
+    pub fn central(&self) -> Arc<crate::central::CentralConfig> {
+        self.central_tx.borrow().clone()
+    }
+
+    pub fn central_watch(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Arc<crate::central::CentralConfig>> {
+        self.central_tx.subscribe()
+    }
+
+    /// Stores a filter (replacing one with the same name), then publishes.
+    /// Blocking; the caller validated it. True if it replaced one.
+    pub fn set_filter(&self, f: crate::central::CentralFilter) -> anyhow::Result<bool> {
+        let _write = self.jail_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = (**self.central_tx.borrow()).clone();
+        self.store.put_filter(&f)?;
+        let existed = c.filters.iter().any(|x| x.name == f.name);
+        c.filters.retain(|x| x.name != f.name);
+        c.filters.push(f);
+        self.central_tx.send_replace(Arc::new(c));
+        Ok(existed)
+    }
+
+    /// Removes a filter no central jail uses. Blocking.
+    pub fn remove_filter(&self, name: &str) -> Result<(), CentralError> {
+        let _write = self.jail_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = (**self.central_tx.borrow()).clone();
+        let users = c.users_of(name);
+        if !users.is_empty() {
+            return Err(CentralError::FilterInUse(name.into(), users.join(", ")));
+        }
+        if !self.store.delete_filter(name)? {
+            return Err(CentralError::Missing("filter"));
+        }
+        c.filters.retain(|x| x.name != name);
+        self.central_tx.send_replace(Arc::new(c));
+        Ok(())
+    }
+
+    /// Stores a jail definition (replacing the one with the same name and
+    /// scope), then publishes. Blocking; the caller validated it. Returns
+    /// the previous one.
+    pub fn set_jail_def(
+        &self,
+        d: crate::central::JailDef,
+    ) -> anyhow::Result<Option<crate::central::JailDef>> {
+        let _write = self.jail_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = (**self.central_tx.borrow()).clone();
+        self.store.put_jail_def(&d)?;
+        let prev = c
+            .defs
+            .iter()
+            .position(|x| x.name == d.name && x.group == d.group)
+            .map(|i| c.defs.remove(i));
+        c.defs.push(d);
+        self.central_tx.send_replace(Arc::new(c));
+        Ok(prev)
+    }
+
+    pub fn remove_jail_def(&self, name: &str, group: Option<&str>) -> Result<(), CentralError> {
+        let _write = self.jail_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = (**self.central_tx.borrow()).clone();
+        if !self.store.delete_jail_def(name, group)? {
+            return Err(CentralError::Missing("jail definition"));
+        }
+        c.defs
+            .retain(|x| !(x.name == name && x.group.as_deref() == group));
+        self.central_tx.send_replace(Arc::new(c));
+        Ok(())
     }
 
     pub fn token_used(&self, name: &str) {

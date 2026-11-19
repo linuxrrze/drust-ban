@@ -117,6 +117,9 @@ pub struct JailStatus {
     pub params: JailParams,
     pub overridden: Vec<&'static str>,
     pub active_bans: usize,
+    pub origin: &'static str,
+    /// why a central jail does not run (then `params` are zero)
+    pub error: String,
 }
 
 #[derive(Debug)]
@@ -125,8 +128,11 @@ struct Jail {
     filter_name: String,
     sources: Vec<String>,
     filter: Filter,
-    /// From the configuration; central overrides apply on top.
+    /// From the configuration (or the central definition); central
+    /// overrides apply on top.
     base: JailParams,
+    /// Defined by the controller.
+    central: bool,
     enabled: bool,
     overridden: Vec<&'static str>,
     tracker: Tracker,
@@ -146,6 +152,10 @@ struct Jail {
 #[derive(Debug)]
 pub struct Engine {
     jails: Vec<Jail>,
+    /// Filters not shipped by the controller are read from here.
+    filter_dir: std::path::PathBuf,
+    /// Central jails that do not run: (jail, filter, reason).
+    central_errors: Vec<(String, String, String)>,
     /// From the agent's configuration.
     allowlist: Allowlist,
     /// The controller's allowlist (replaced on every update).
@@ -181,6 +191,8 @@ impl Engine {
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             jails,
+            filter_dir: cfg.agent.filter_dir.clone(),
+            central_errors: Vec::new(),
             allowlist: Allowlist::new(cfg.agent.allowlist.iter().copied()),
             central: Allowlist::default(),
             prefix: PrefixPolicy {
@@ -329,8 +341,123 @@ impl Engine {
         }
     }
 
+    /// Replaces the central jails. `accepted` passed the agent's checks
+    /// (paths, journald); `rejected` did not, with the reason. A central
+    /// jail with the name of a local one is refused. Filters come from
+    /// `filters` (central) or the filter directory. A jail redefined under
+    /// the same name keeps its counters and offense history. Returns the
+    /// names of the central jails that now run. Call
+    /// `apply_jail_overrides` afterwards.
+    pub fn set_central_jails(
+        &mut self,
+        accepted: &[crate::central::CentralJail],
+        filters: &[(String, String)],
+        rejected: Vec<(String, String, String)>,
+    ) -> Vec<String> {
+        let mut old: HashMap<String, Jail> = HashMap::new();
+        let mut kept = Vec::new();
+        for j in std::mem::take(&mut self.jails) {
+            if j.central {
+                old.insert(j.name.clone(), j);
+            } else {
+                kept.push(j);
+            }
+        }
+        self.jails = kept;
+        // a name clash is the more fundamental reason
+        let clash = "a local jail with this name exists (local jails win)";
+        let mut errors: Vec<_> = rejected
+            .into_iter()
+            .map(|(name, filter, reason)| {
+                if self.jails.iter().any(|j| j.name == name) {
+                    (name, filter, clash.to_owned())
+                } else {
+                    (name, filter, reason)
+                }
+            })
+            .collect();
+        let mut running = Vec::new();
+        for def in accepted {
+            if self.jails.iter().any(|j| j.name == def.name) {
+                errors.push((def.name.clone(), def.filter.clone(), clash.into()));
+                continue;
+            }
+            let filter = match self.load_filter(&def.filter, filters) {
+                Ok(f) => f,
+                Err(e) => {
+                    errors.push((def.name.clone(), def.filter.clone(), format!("{e:#}")));
+                    continue;
+                }
+            };
+            let cfg = JailConfig {
+                name: def.name.clone(),
+                sources: def.source_names(),
+                filter: def.filter.clone(),
+                maxretry: def.maxretry,
+                findtime: def.findtime,
+                bantime: def.bantime,
+                bantime_factor: def.factor,
+                max_bantime: def.max_bantime,
+                max_tracked: crate::config::default_max_tracked(),
+            };
+            let mut jail = Jail::new(&cfg, filter);
+            jail.central = true;
+            jail.base.enabled = def.enabled;
+            jail.enabled = def.enabled;
+            if let Some(prev) = old.remove(&def.name) {
+                jail.offenders = prev.offenders;
+                jail.tracker = prev.tracker;
+                jail.tracker.set_limits(def.maxretry, def.findtime);
+            }
+            running.push(def.name.clone());
+            self.jails.push(jail);
+        }
+        for e in &errors {
+            warn!(jail = %e.0, reason = %e.2, "central jail not started");
+        }
+        self.central_errors = errors;
+        running
+    }
+
+    fn load_filter(&self, name: &str, central: &[(String, String)]) -> anyhow::Result<Filter> {
+        let (text, what) = match central.iter().find(|(n, _)| n == name) {
+            Some((_, toml)) => (toml.clone(), "central filter".to_owned()),
+            None => {
+                let path = self.filter_dir.join(format!("{name}.toml"));
+                let text = std::fs::read_to_string(&path).with_context(|| {
+                    format!(
+                        "filter {name:?} is neither central nor in {}",
+                        path.display()
+                    )
+                })?;
+                (text, path.display().to_string())
+            }
+        };
+        let def = FilterDef::from_toml(&text).with_context(|| format!("parsing {what}"))?;
+        Filter::compile(name, &def).with_context(|| format!("compiling {what}"))
+    }
+
     /// Effective settings per jail (heartbeats).
     pub fn jail_status(&self, now: DateTime<Utc>) -> Vec<JailStatus> {
+        let failed = self
+            .central_errors
+            .iter()
+            .map(|(name, filter, error)| JailStatus {
+                name: name.clone(),
+                filter: filter.clone(),
+                params: JailParams {
+                    enabled: false,
+                    maxretry: 0,
+                    findtime: Duration::ZERO,
+                    bantime: Duration::ZERO,
+                    factor: 1.0,
+                    max_bantime: None,
+                },
+                overridden: Vec::new(),
+                active_bans: 0,
+                origin: "central",
+                error: error.clone(),
+            });
         self.jails
             .iter()
             .map(|j| JailStatus {
@@ -350,7 +477,10 @@ impl Engine {
                     .values()
                     .filter(|o| o.banned_until > now)
                     .count(),
+                origin: if j.central { "central" } else { "local" },
+                error: String::new(),
             })
+            .chain(failed)
             .collect()
     }
 
@@ -449,6 +579,7 @@ impl Jail {
                 max_bantime: cfg.max_bantime,
             },
             enabled: true,
+            central: false,
             overridden: Vec::new(),
             sources: cfg.sources.clone(),
             filter,
@@ -653,6 +784,109 @@ mod tests {
         );
         assert!(st.overridden.is_empty());
         assert_eq!(fails(&mut e, "203.0.113.3", 2).len(), 1);
+    }
+
+    fn central_jail(name: &str, filter: &str) -> crate::central::CentralJail {
+        crate::central::CentralJail {
+            name: name.into(),
+            filter: filter.into(),
+            sources: vec![crate::central::CentralSource::File {
+                paths: vec!["/var/log/x.log".into()],
+                start_at_end: true,
+            }],
+            enabled: true,
+            maxretry: 3,
+            findtime: Duration::from_secs(600),
+            bantime: Duration::from_secs(1800),
+            factor: 2.0,
+            max_bantime: None,
+        }
+    }
+
+    #[test]
+    fn central_jails() {
+        let mut e = engine(); // local jail "sshd" on source "auth"
+        let now = Utc::now();
+        let filters = vec![(
+            "app-auth".to_string(),
+            "failregex = ['login failed for .* from <HOST>']".to_string(),
+        )];
+        let app_line = |ip: &str| LogLine {
+            source: Arc::from("central:app:0"),
+            ts: None,
+            line: format!("login failed for bob from {ip}"),
+        };
+        let running = e.set_central_jails(
+            &[
+                central_jail("app", "app-auth"),
+                central_jail("sshd", "sshd"), // local name: refused
+                central_jail("ghost", "no-such-filter"), // neither central nor on disk
+                central_jail("local-filter", "sshd"), // agent's own filter file
+            ],
+            &filters,
+            vec![(
+                "web".into(),
+                "nginx".into(),
+                "outside the allowed directories".into(),
+            )],
+        );
+        assert_eq!(running, ["app", "local-filter"]);
+        let st = e.jail_status(now);
+        let find = |n: &str| st.iter().find(|s| s.name == n).unwrap().clone();
+        assert_eq!(
+            (find("sshd").origin, find("app").origin),
+            ("local", "central")
+        );
+        assert!(find("ghost").error.contains("neither central nor"));
+        assert!(st
+            .iter()
+            .any(|s| s.name == "sshd" && s.error.contains("local jail")));
+        assert!(find("web").error.contains("outside"));
+        // a refused definition named like a local jail reports the clash
+        e.set_central_jails(
+            &[],
+            &filters,
+            vec![("sshd".into(), "sshd".into(), "outside".into())],
+        );
+        assert!(e
+            .jail_status(now)
+            .iter()
+            .any(|s| s.name == "sshd" && s.error.contains("local jail")));
+        let running = e.set_central_jails(
+            &[
+                central_jail("app", "app-auth"),
+                central_jail("local-filter", "sshd"),
+            ],
+            &filters,
+            vec![],
+        );
+        assert_eq!(running.len(), 2);
+
+        // lines of the central source are matched by the central filter
+        assert!(e.process(&app_line("198.51.100.4"), now).is_empty());
+        e.process(&app_line("198.51.100.4"), now);
+        let b = e.process(&app_line("198.51.100.4"), now);
+        assert_eq!(
+            (b.len(), b[0].jail.as_str(), b[0].duration),
+            (1, "app", Duration::from_secs(1800))
+        );
+
+        // policies apply to central jails too
+        e.apply_jail_overrides(&[JailOverride {
+            jail: "app".into(),
+            maxretry: Some(1),
+            ..Default::default()
+        }]);
+        assert_eq!(e.process(&app_line("198.51.100.5"), now).len(), 1);
+
+        // redefined: offense history stays
+        e.set_central_jails(&[central_jail("app", "app-auth")], &filters, vec![]);
+        e.apply_jail_overrides(&[]);
+        assert!(e.is_banned(&"198.51.100.4/32".parse().unwrap(), now));
+        // removed: the jail is gone, local ones stay
+        e.set_central_jails(&[], &filters, vec![]);
+        let names: Vec<_> = e.jail_status(now).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["sshd"]);
     }
 
     #[test]

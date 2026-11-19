@@ -668,10 +668,41 @@ df2bctl config check | reload
     `df2bctl jails list` show this inventory (values as ranges across
     agents). Policies for jails no agent has reported yet are possible
     (e.g. before rolling out a new jail). Changes are audited.
+- **Central jail definitions** (Policies page sections "Jail definitions"
+  and "Filters"; `PUT|DELETE /api/v1/jail-definitions/<name>[?group=]`,
+  `PUT|DELETE /api/v1/filters/<name>`, `POST /api/v1/filters/test`;
+  `df2bctl jails define|undefine`, `df2bctl filter list|push|rm`). A
+  definition has a filter, log sources (files, or journald matches with a
+  start) and limits, for all agents or one group (a group definition
+  replaces the all-agents one of the same name). Filters use the agents'
+  TOML format and are compiled when saved; a definition may also name a
+  filter the agents have in their `filter_dir`. Validation: absolute paths
+  without `..`, `FIELD=value` matches, at most 8 sources, 16 paths, 32
+  matches, 100 failregex, 64 KiB per filter; a filter in use cannot be
+  deleted. Stored in redb (`jail_defs`, `filters`); the decision stream
+  sends each agent its group's definitions with the central filters they
+  use (`CentralJails`, content-hash version) after the jail policies and on
+  every change that affects the group. Audited.
+- **On the agent** (the controller decides *what*, the agent *whether*):
+  `central_jails` (default on), `central_paths` (default `/var/log`;
+  component-wise prefix, so `/var/logx` is outside), `central_journald`
+  (default on). Rejected definitions, filters that do not compile or are
+  missing, and names of local jails (local jails win) are reported per jail
+  in heartbeats (`origin`, `error`) and shown in the inventory and
+  `df2bctl jails list`. Each central source (`central:<jail>:<n>`) runs with
+  its own channel: unchanged sources keep running and their read position
+  across updates, changed or removed ones are stopped (aborting the tasks
+  closes the channel, which also stops journald readers). A redefined jail
+  keeps its counters and offense history; jail policies apply to central
+  jails as well. Definitions are stored in `agent.redb` and set up before
+  offender records are restored, so their bans come back after a restart,
+  also while the controller is unreachable. The source channel stays open,
+  so an agent with only central jails keeps running. Lines read are only
+  matched to extract addresses; nothing is sent back. Source names starting
+  with `central:` are reserved in the agent configuration.
 - Not yet:
   observation timelines and sample log lines (needs observation reporting),
-  ASN/GeoIP, central jail *definitions* (filters and log sources shipped
-  to agent groups), correlation policies.
+  ASN/GeoIP, correlation policies.
 
 Pages:
 
@@ -743,7 +774,7 @@ systemd hardening.
 | Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
 | REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions (password, OIDC) with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
 | gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |
-| Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans, central allowlist and jail settings applied |
+| Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans, central allowlist, jail settings and central jail definitions applied |
 | Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI/browser → controller (HTTPS) done; HA, external actions, local socket TODO |
 | Web UI                       | Svelte, embedded: login, overview, bans, agents, address lookup, audit log; live updates; login with local users or OIDC |
 

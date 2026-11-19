@@ -157,6 +157,8 @@ export interface JailView {
   max_bantime_secs: number;
   overridden: string[];
   active_bans: number;
+  origin: 'local' | 'central' | '';
+  error: string;
 }
 
 export interface JailSettings {
@@ -186,4 +188,32 @@ export interface Policies {
   propagate: Propagate;
   jails: JailInfo[];
   groups: string[];
+}
+
+export type SourceDef =
+  | { type: 'file'; paths: string[]; start_at_end: boolean }
+  | { type: 'journald'; matches: string[]; start: string | null };
+
+export interface JailDefinition {
+  name: string;
+  group: string | null;
+  filter: string;
+  sources: SourceDef[];
+  enabled: boolean;
+  maxretry: number;
+  findtime: string;
+  bantime: string;
+  bantime_factor: number;
+  max_bantime: string | null;
+  updated_by: string;
+  updated_at: string;
+  filter_is_central: boolean;
+}
+
+export interface CentralFilter {
+  name: string;
+  toml: string;
+  updated_by: string;
+  updated_at: string;
+  used_by: string[];
 }

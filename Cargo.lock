@@ -626,6 +626,7 @@ dependencies = [
  "chrono",
  "clap",
  "df2b-core",
+ "df2b-matcher",
  "df2b-proto",
  "df2b-tls",
  "humantime",

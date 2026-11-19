@@ -4,7 +4,10 @@
   import { href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
   import { notify } from '../lib/toast.svelte';
-  import type { JailInfo, JailOverride, JailView, Policies, Propagate } from '../lib/types';
+  import type { CentralFilter, JailDefinition, JailInfo, JailOverride, JailView, Policies, Propagate } from '../lib/types';
+  import Dialog from '../components/Dialog.svelte';
+  import FilterDialog from '../components/FilterDialog.svelte';
+  import JailDefDialog from '../components/JailDefDialog.svelte';
   import JailDialog from '../components/JailDialog.svelte';
 
   let data = $state<Policies | null>(null);
@@ -13,6 +16,14 @@
   let saving = $state(false);
   let dialogOpen = $state(false);
   let editing = $state<JailInfo | null>(null);
+  let defs = $state<JailDefinition[]>([]);
+  let filters = $state<CentralFilter[]>([]);
+  let defOpen = $state(false);
+  let editingDef = $state<JailDefinition | null>(null);
+  let filterOpen = $state(false);
+  let editingFilter = $state<CentralFilter | null>(null);
+  let confirmOpen = $state(false);
+  let confirm = $state<{ title: string; text: string; run: () => Promise<void> } | null>(null);
 
   const modes: { id: Propagate; title: string; text: string }[] = [
     { id: 'global', title: 'Everywhere', text: 'A ban on one host is applied on all agents.' },
@@ -22,7 +33,14 @@
 
   async function load() {
     try {
-      data = await get<Policies>('/policies');
+      const [p, d, f] = await Promise.all([
+        get<Policies>('/policies'),
+        get<{ definitions: JailDefinition[] }>('/jail-definitions'),
+        get<{ filters: CentralFilter[] }>('/filters'),
+      ]);
+      data = p;
+      defs = d.definitions;
+      filters = f.filters;
       propagate = data.propagate;
       error = '';
     } catch (e) {
@@ -57,8 +75,50 @@
     return lo === hi ? fmt(lo) : `${fmt(lo)}–${fmt(hi)}`;
   }
 
+  function ask(title: string, text: string, run: () => Promise<void>) {
+    confirm = { title, text, run };
+    confirmOpen = true;
+  }
+
+  async function runConfirm() {
+    if (!confirm) return;
+    try {
+      await confirm.run();
+      confirmOpen = false;
+      load();
+    } catch (e) {
+      notify(e instanceof ApiError ? e.message : String(e), 'error');
+    }
+  }
+
+  function removeDef(d: JailDefinition) {
+    const scope = d.group ? `group ${d.group}` : 'all agents';
+    ask(`Remove jail ${d.name} (${scope})?`, 'The agents stop this jail within seconds; its active bans run out.', async () => {
+      const q = d.group ? `?group=${encodeURIComponent(d.group)}` : '';
+      await api('DELETE', `/jail-definitions/${encodeURIComponent(d.name)}${q}`);
+      notify(`Jail ${d.name} removed`);
+    });
+  }
+
+  function removeFilter(f: CentralFilter) {
+    ask(`Delete filter ${f.name}?`, 'Agents keep jails that use their own filter file of this name.', async () => {
+      await api('DELETE', `/filters/${encodeURIComponent(f.name)}`);
+      notify(`Filter ${f.name} deleted`);
+    });
+  }
+
+  function sourcesText(d: JailDefinition): string {
+    return d.sources
+      .map((s) => (s.type === 'file' ? s.paths.join(', ') : `journal ${s.matches.join(' ') || '(all)'}`))
+      .join('; ');
+  }
+
+  function problems(j: JailInfo) {
+    return j.agents.filter((a) => a.jail.error);
+  }
+
   function effective(j: JailInfo) {
-    const v = j.agents.map((a) => a.jail);
+    const v = j.agents.map((a) => a.jail).filter((x) => !x.error);
     const pick = (f: (x: JailView) => number) => v.map(f);
     return {
       maxretry: range(pick((x) => x.maxretry)),
@@ -139,7 +199,11 @@
               <tr>
                 <td>
                   <strong>{j.name}</strong>
+                  {#if j.agents.some((a) => a.jail.origin === 'central')}<span class="pill plain">central</span>{/if}
                   {#if j.filters.length}<div class="faint small">filter {j.filters.join(', ')}</div>{/if}
+                  {#each problems(j) as p (p.agent)}
+                    <div class="problem small" title={p.jail.error}>⚠ {p.agent}: {p.jail.error}</div>
+                  {/each}
                 </td>
                 <td>
                   {#if j.agents.length}
@@ -170,7 +234,91 @@
   </div>
 {/if}
 
+{#if data}
+  <div class="card section">
+    <div class="row head">
+      <h2>Jail definitions</h2>
+      <span class="spacer"></span>
+      {#if can('admin')}<button onclick={() => { editingDef = null; defOpen = true; }}>Define a jail…</button>{/if}
+    </div>
+    <p class="muted">
+      Jails defined here are created on the agents (for all of them or one group), with their log
+      sources and filter. Agents accept them unless their configuration says otherwise
+      (<code>central_jails</code>, <code>central_paths</code>, <code>central_journald</code>); a local
+      jail with the same name wins. Problems show in the table above.
+    </p>
+    {#if defs.length === 0}
+      <div class="empty">No jails defined centrally.</div>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Jail</th><th>For</th><th>Filter</th><th>Sources</th><th>Limits</th>{#if can('admin')}<th></th>{/if}</tr></thead>
+          <tbody>
+            {#each defs as d (d.name + '|' + (d.group ?? ''))}
+              <tr>
+                <td><strong>{d.name}</strong>{#if !d.enabled} <span class="pill warn">disabled</span>{/if}</td>
+                <td>{d.group ? `group ${d.group}` : 'all agents'}</td>
+                <td>{d.filter} <span class="faint small">{d.filter_is_central ? 'central' : "agents' own"}</span></td>
+                <td class="mono small sources">{sourcesText(d)}</td>
+                <td class="small">{d.maxretry} in {d.findtime} → {d.bantime}{d.bantime_factor > 1 ? ` ×${d.bantime_factor}` : ''}{d.max_bantime ? `, max ${d.max_bantime}` : ''}</td>
+                {#if can('admin')}
+                  <td class="nowrap">
+                    <button class="link" onclick={() => { editingDef = d; defOpen = true; }}>Edit…</button>
+                    · <button class="link danger-link" onclick={() => removeDef(d)}>Remove</button>
+                  </td>
+                {/if}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </div>
+
+  <div class="card section">
+    <div class="row head">
+      <h2>Filters</h2>
+      <span class="spacer"></span>
+      {#if can('admin')}<button onclick={() => { editingFilter = null; filterOpen = true; }}>New filter…</button>{/if}
+    </div>
+    <p class="muted">Sent to the agents together with the jails that use them.</p>
+    {#if filters.length === 0}
+      <div class="empty">No central filters. Jail definitions can also use filters the agents have.</div>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Filter</th><th>Used by</th><th>Changed</th>{#if can('admin')}<th></th>{/if}</tr></thead>
+          <tbody>
+            {#each filters as f (f.name)}
+              <tr>
+                <td><strong>{f.name}</strong></td>
+                <td>{f.used_by.join(', ') || '–'}</td>
+                <td class="muted small">by {f.updated_by}</td>
+                {#if can('admin')}
+                  <td class="nowrap">
+                    <button class="link" onclick={() => { editingFilter = f; filterOpen = true; }}>Edit…</button>
+                    {#if !f.used_by.length}· <button class="link danger-link" onclick={() => removeFilter(f)}>Delete</button>{/if}
+                  </td>
+                {/if}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </div>
+{/if}
+
 <JailDialog bind:open={dialogOpen} jail={editing} groups={data?.groups ?? []} ondone={load} />
+<JailDefDialog bind:open={defOpen} def={editingDef} groups={data?.groups ?? []} filters={filters.map((f) => f.name)} ondone={load} />
+<FilterDialog bind:open={filterOpen} filter={editingFilter} ondone={load} />
+<Dialog bind:open={confirmOpen} title={confirm?.title ?? ''} onsubmit={runConfirm}>
+  <p class="muted confirm-text">{confirm?.text}</p>
+  <div class="actions">
+    <button type="button" onclick={() => (confirmOpen = false)}>Cancel</button>
+    <button type="submit" class="danger solid">Remove</button>
+  </div>
+</Dialog>
 
 <style>
   .section { margin-bottom: 16px; display: grid; gap: 12px; }
@@ -185,4 +333,9 @@
   .head { align-items: center; }
   .spacer { flex: 1; }
   td .pill { margin-left: 6px; }
+  .problem { color: var(--warn); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sources { max-width: 280px; overflow-wrap: anywhere; }
+  .nowrap { white-space: nowrap; }
+  .danger-link { color: var(--bad); }
+  p.confirm-text { margin: 0; }
 </style>
