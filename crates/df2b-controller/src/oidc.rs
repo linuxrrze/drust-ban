@@ -30,6 +30,7 @@
 //! logout is more reliable (no browser involved) and preferred.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -198,6 +199,34 @@ struct Pending {
     /// SHA-256 of the binding cookie
     browser: [u8; 32],
     created: Instant,
+    /// who started it: (client, its network)
+    client: Option<(IpAddr, IpNetwork)>,
+}
+
+/// Logins in progress per client (IPv6: per /64) and per network (/24,
+/// /48): one client must not fill the table for everybody.
+const PENDING_PER_CLIENT: usize = 10;
+const PENDING_PER_NETWORK: usize = 100;
+type IpNetwork = ipnet::IpNet;
+
+/// (client, network) of an address: the /64 and /48 of IPv6, the address
+/// and /24 of IPv4.
+fn client_keys(ip: IpAddr) -> (IpAddr, IpNetwork) {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    let (client, net) = match ip {
+        IpAddr::V4(_) => (ip, 24),
+        IpAddr::V6(_) => (
+            ipnet::IpNet::new(ip, 64).map(|n| n.network()).unwrap_or(ip),
+            48,
+        ),
+    };
+    let net = ipnet::IpNet::new(ip, net)
+        .map(|n| n.trunc())
+        .unwrap_or_else(|_| ip.into());
+    (client, net)
 }
 
 /// A user authenticated by the provider.
@@ -406,7 +435,7 @@ impl Oidc {
     }
 
     /// Starts a login: the provider URL and the binding cookie secret.
-    pub async fn begin(&self) -> anyhow::Result<(String, String)> {
+    pub async fn begin(&self, from: Option<IpAddr>) -> anyhow::Result<(String, String)> {
         let (client, _, _) = self.provider(false).await?;
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
         let mut req = client.authorize_url(
@@ -422,8 +451,29 @@ impl Oidc {
         let now = Instant::now();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|_, p| now.duration_since(p.created) < PENDING_TTL);
+        let keys = from.map(client_keys);
+        if let Some((c, n)) = keys {
+            let same_client = pending
+                .values()
+                .filter(|p| p.client.is_some_and(|k| k.0 == c))
+                .count();
+            let same_net = pending
+                .values()
+                .filter(|p| p.client.is_some_and(|k| k.1 == n))
+                .count();
+            if same_client >= PENDING_PER_CLIENT || same_net >= PENDING_PER_NETWORK {
+                bail!("too many logins in progress from {c}");
+            }
+        }
         if pending.len() >= MAX_PENDING {
-            bail!("too many logins in progress");
+            // full: the oldest goes (a client cannot block everybody)
+            if let Some(k) = pending
+                .iter()
+                .min_by_key(|(_, p)| p.created)
+                .map(|(k, _)| k.clone())
+            {
+                pending.remove(&k);
+            }
         }
         pending.insert(
             state.secret().clone(),
@@ -432,6 +482,7 @@ impl Oidc {
                 verifier,
                 browser: hash(&browser),
                 created: now,
+                client: keys,
             },
         );
         Ok((url.to_string(), browser))

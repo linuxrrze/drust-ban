@@ -1063,3 +1063,36 @@ async fn frontchannel_logout_by_sid() {
         .contains("frame-ancestors 'none'"));
     let _ = std::fs::remove_dir_all(&e.dir);
 }
+
+/// Regression (security review): anyone could fill the table of pending
+/// logins (10 000, kept 10 minutes) and so block single sign-on for
+/// everybody.
+#[tokio::test]
+async fn one_client_cannot_block_logins() {
+    let e = env("pending", |_| {}).await;
+    for _ in 0..10 {
+        e.start().await;
+    }
+    // the 11th from the same client is refused
+    let r = e
+        .http
+        .get(format!("{}/api/v1/oidc/login", e.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.headers()["location"]
+            .to_str()
+            .unwrap()
+            .contains("login-error"),
+        "refused"
+    );
+    // others still get in
+    let o = e.ctl.settings.oidc.as_ref().unwrap();
+    assert!(o.begin(Some("198.51.100.7".parse().unwrap())).await.is_ok());
+    assert!(o
+        .begin(Some("2001:db8:1::5".parse().unwrap()))
+        .await
+        .is_ok());
+    let _ = std::fs::remove_dir_all(&e.dir);
+}

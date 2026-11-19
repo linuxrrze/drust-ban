@@ -109,7 +109,10 @@ pub fn create_token(dir: &Path, group: &str, ttl: Duration) -> anyhow::Result<En
     let file = TokenFile {
         group: group.to_owned(),
         created_at: now,
-        expires_at: now + chrono::Duration::from_std(ttl)?,
+        expires_at: chrono::Duration::from_std(ttl)
+            .ok()
+            .and_then(|d| now.checked_add_signed(d))
+            .context("ttl out of range")?,
     };
     let tdir = token_dir(dir);
     fs::create_dir_all(&tdir)?;
@@ -253,9 +256,13 @@ pub fn create_api_token_by(
         role,
         created_at: now,
         expires_at: ttl
-            .map(chrono::Duration::from_std)
-            .transpose()?
-            .map(|d| now + d),
+            .map(|d| {
+                chrono::Duration::from_std(d)
+                    .ok()
+                    .and_then(|d| now.checked_add_signed(d))
+                    .context("ttl out of range")
+            })
+            .transpose()?,
         created_by: created_by.map(str::to_owned),
     };
     let tdir = dir.join(API_TOKENS);
@@ -678,5 +685,18 @@ mod tests {
         assert!(revoke(&dir, "../x").is_err());
         assert!(is_revoked(&dir, "../x"), "invalid ids are never accepted");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (security review): a huge --ttl on the host CLI
+    /// overflowed the date arithmetic (panic).
+    #[test]
+    fn huge_ttl_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("df2b-files-ttl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        load_or_create_ca(&dir).unwrap();
+        assert!(create_token(&dir, "web", Duration::MAX).is_err());
+        assert!(create_api_token(&dir, "x", Role::Viewer, Some(Duration::MAX)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

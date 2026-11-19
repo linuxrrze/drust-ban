@@ -293,6 +293,16 @@ impl Sessions {
 
     /// The live session for a cookie secret (and marks it used).
     pub fn get(&self, secret: &str) -> Option<Session> {
+        self.lookup(secret, true)
+    }
+
+    /// Like [`Self::get`] without marking it used (an open event stream
+    /// re-checking its session must not keep it alive).
+    pub fn peek(&self, secret: &str) -> Option<Session> {
+        self.lookup(secret, false)
+    }
+
+    fn lookup(&self, secret: &str, touch: bool) -> Option<Session> {
         let now = Instant::now();
         let mut map = Self::lock(&self.sessions);
         let k = key(secret);
@@ -301,8 +311,10 @@ impl Sessions {
             map.remove(&k);
             return None;
         }
-        s.last_used = now;
-        s.last_used_at = Utc::now();
+        if touch {
+            s.last_used = now;
+            s.last_used_at = Utc::now();
+        }
         Some(s.clone())
     }
 
@@ -558,5 +570,25 @@ mod tests {
             assert!(s.login_begin(Some(v4(200_000 + i)), "admin"));
         }
         assert!(!s.login_begin(Some(v4(300_000)), "admin"), "still limited");
+    }
+
+    /// Regression (security review): the event stream's re-checks marked
+    /// the session used, so an open tab kept it alive past its idle limit.
+    #[test]
+    fn peek_does_not_mark_used() {
+        let s = Sessions::default();
+        let (secret, sess) = s.create(
+            "ada",
+            Kind::Oidc {
+                role: Role::Viewer,
+                subject: "s".into(),
+                sid: None,
+            },
+            MAX_AGE,
+            Client::default(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(s.peek(&secret).unwrap().last_used_at, sess.last_used_at);
+        assert!(s.get(&secret).unwrap().last_used_at > sess.last_used_at);
     }
 }

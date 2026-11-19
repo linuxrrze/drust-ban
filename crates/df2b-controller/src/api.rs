@@ -135,7 +135,21 @@ fn session_user(
     ctl: &Controller,
     secret: &str,
 ) -> anyhow::Result<Option<(String, Role, bool, session::Session)>> {
-    let Some(s) = ctl.sessions.get(secret) else {
+    session_user_with(ctl, secret, true)
+}
+
+/// `touch`: counts as use of the session (requests; not re-checks).
+fn session_user_with(
+    ctl: &Controller,
+    secret: &str,
+    touch: bool,
+) -> anyhow::Result<Option<(String, Role, bool, session::Session)>> {
+    let s = if touch {
+        ctl.sessions.get(secret)
+    } else {
+        ctl.sessions.peek(secret)
+    };
+    let Some(s) = s else {
         return Ok(None);
     };
     match &s.kind {
@@ -172,7 +186,9 @@ impl Caller {
     fn still_valid(&self, ctl: &Controller) -> bool {
         match &self.auth {
             Auth::Token(t) => files::lookup_api_token(&ctl.settings.state_dir, t).is_some(),
-            Auth::Session { secret, .. } => matches!(session_user(ctl, secret), Ok(Some(_))),
+            Auth::Session { secret, .. } => {
+                matches!(session_user_with(ctl, secret, false), Ok(Some(_)))
+            }
         }
     }
 
@@ -2273,11 +2289,14 @@ fn login_error(code: &str) -> Response {
 }
 
 /// Starts an OIDC login (a link on the login page).
-async fn oidc_login(State(ctl): State<Arc<Controller>>) -> Response {
+async fn oidc_login(
+    State(ctl): State<Arc<Controller>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
     let Some(o) = &ctl.settings.oidc else {
         return ApiError::not_found("single sign-on is not configured").into_response();
     };
-    match o.begin().await {
+    match o.begin(Some(addr.ip())).await {
         Ok((url, binding)) => redirect(&url, &[crate::oidc::binding_cookie(&binding)]),
         Err(e) => {
             warn!(error = %format!("{e:#}"), "OIDC login could not start");
@@ -2492,11 +2511,53 @@ const STREAM_RECHECK: Duration = Duration::from_secs(30);
 
 /// Server-sent events: `decision` for every new decision, `resync` when the
 /// client fell behind (reload the lists).
+/// Event streams per caller at most.
+const MAX_STREAMS: usize = 10;
+
+/// One of a caller's event streams; frees its place when dropped.
+struct StreamSlot(String);
+
+static STREAMS: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
+
+impl StreamSlot {
+    fn take(caller: &str) -> Option<Self> {
+        let mut m = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m
+            .get_or_insert_with(Default::default)
+            .entry(caller.to_owned())
+            .or_default();
+        if *n >= MAX_STREAMS {
+            return None;
+        }
+        *n += 1;
+        Some(Self(caller.to_owned()))
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut m = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = m.as_mut() {
+            if let Some(n) = map.get_mut(&self.0) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    map.remove(&self.0);
+                }
+            }
+        }
+    }
+}
+
 async fn events(
     caller: Caller,
     State(ctl): State<Arc<Controller>>,
 ) -> ApiResult<Sse<ReceiverStream<Result<Event, Infallible>>>> {
     caller.require(Role::Viewer)?;
+    // a few streams per caller (tabs); each is a task and a receiver
+    let stream_slot = StreamSlot::take(&caller.name).ok_or_else(|| {
+        ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too many open event streams")
+    })?;
     let mut rx = ctl.events();
     let (tx, out) = tokio::sync::mpsc::channel(64);
     let hello = Event::default()
@@ -2506,6 +2567,7 @@ async fn events(
         .map_err(ApiError::internal)?;
     let _ = tx.try_send(Ok(hello));
     tokio::spawn(async move {
+        let _slot = stream_slot;
         let deadline = tokio::time::sleep(STREAM_MAX);
         tokio::pin!(deadline);
         let mut recheck = tokio::time::interval(STREAM_RECHECK);
@@ -3106,6 +3168,11 @@ async fn unban(
 ) -> ApiResult {
     caller.require(Role::Operator)?;
     let net = target(&req.target)?;
+    // lifting everything in a huge range at once is for admins (operators
+    // may not ban that broadly either)
+    if too_broad(&net) {
+        caller.require(Role::Admin)?;
+    }
     let reason = clean_text(req.reason.as_deref().unwrap_or("manual unban"), MAX_REASON);
     let allow_until = match req.allow_for.as_deref() {
         None => None,
@@ -6065,5 +6132,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), S::FORBIDDEN);
+    }
+
+    /// Regression (security review): operators could lift every ban at
+    /// once (unban 0.0.0.0/0), streams per caller were unlimited.
+    #[tokio::test]
+    async fn broad_unban_and_stream_limits() {
+        let env = Env::new("broadunban").await;
+        let (op, admin) = (
+            env.token("olga", Role::Operator),
+            env.token("ada", Role::Admin),
+        );
+        let (st, _) = env
+            .call(
+                "POST",
+                "/api/v1/unban",
+                &op,
+                json!({ "target": "0.0.0.0/0" }),
+            )
+            .await;
+        assert_eq!(st, S::FORBIDDEN);
+        let (st, _) = env
+            .call(
+                "POST",
+                "/api/v1/unban",
+                &admin,
+                json!({ "target": "0.0.0.0/0" }),
+            )
+            .await;
+        assert_ne!(st, S::FORBIDDEN);
+        let viewer = env.token("vic", Role::Viewer);
+        let mut open = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            let r = env
+                .http
+                .get(format!("{}/api/v1/events", env.base))
+                .bearer_auth(&viewer)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), S::OK);
+            open.push(r);
+        }
+        let r = env
+            .http
+            .get(format!("{}/api/v1/events", env.base))
+            .bearer_auth(&viewer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::TOO_MANY_REQUESTS);
+        // others are not affected
+        let other = env.token("val", Role::Viewer);
+        let r = env
+            .http
+            .get(format!("{}/api/v1/events", env.base))
+            .bearer_auth(&other)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
     }
 }
