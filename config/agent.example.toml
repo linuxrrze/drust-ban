@@ -2,9 +2,13 @@
 # Validate with: df2b-agent --config agent.toml --check
 
 [agent]
-# Controller URL; omit for standalone mode.
+# Controller URL; omit for standalone mode. The first start needs a one-time
+# enrollment token (df2b-controller enroll-token --group web):
+#   df2b-agent --enroll-token df2b1.…   (or DF2B_ENROLL_TOKEN)
+# The agent's key and certificate are then kept in <state_dir>/tls/; the
+# group comes from the token. Without a reachable controller the agent keeps
+# working standalone.
 # controller = "https://df2b.example.org:7443"
-group = "default"
 
 # Prefix lengths used to aggregate offenders.
 ipv4_prefix = 32

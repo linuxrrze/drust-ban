@@ -18,16 +18,14 @@ pub struct AgentConfig {
     pub jail: Vec<JailConfig>,
 }
 
-// controller/group/state_dir are used from milestone 2 on
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSection {
-    /// Controller URL; `None` = standalone mode.
+    /// Controller address, `https://host[:port]` (default port 7443);
+    /// `None` = standalone mode. The agent's group is assigned by the
+    /// enrollment token.
     #[serde(default)]
     pub controller: Option<String>,
-    #[serde(default = "default_group")]
-    pub group: String,
     #[serde(default = "default_v4_prefix")]
     pub ipv4_prefix: u8,
     #[serde(default = "default_v6_prefix")]
@@ -131,9 +129,6 @@ pub struct JailConfig {
     pub max_tracked: usize,
 }
 
-fn default_group() -> String {
-    "default".into()
-}
 fn default_v4_prefix() -> u8 {
     32
 }
@@ -173,6 +168,9 @@ impl AgentConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(c) = &self.agent.controller {
+            controller_addr(c)?;
+        }
         if self.agent.ipv4_prefix == 0 || self.agent.ipv4_prefix > 32 {
             bail!("ipv4_prefix must be 1..=32");
         }
@@ -239,5 +237,54 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.validate().is_err());
+    }
+}
+
+/// `https://host[:port]` (or `host[:port]`) → `host:port` for connecting.
+pub fn controller_addr(url: &str) -> anyhow::Result<String> {
+    let rest = match url.split_once("://") {
+        Some(("https", rest)) => rest,
+        Some((scheme, _)) => bail!("controller: unsupported scheme {scheme:?}, use https://"),
+        None => url,
+    };
+    let hostport = rest.trim_end_matches('/');
+    if hostport.is_empty() || hostport.contains('/') || hostport.contains('@') {
+        bail!("controller: expected https://host[:port], got {url:?}");
+    }
+    // "[v6]" or "[v6]:port", "host" or "host:port"
+    let has_port = match hostport.rfind(']') {
+        Some(i) => hostport[i + 1..].starts_with(':'),
+        None => hostport.contains(':'),
+    };
+    if hostport.contains(':') && !hostport.starts_with('[') && hostport.matches(':').count() > 1 {
+        bail!("controller: put IPv6 addresses in brackets, e.g. https://[2001:db8::1]:7443");
+    }
+    Ok(if has_port {
+        hostport.to_owned()
+    } else {
+        format!("{hostport}:7443")
+    })
+}
+
+#[cfg(test)]
+mod addr_tests {
+    use super::controller_addr;
+
+    #[test]
+    fn controller_urls() {
+        assert_eq!(
+            controller_addr("https://ctl.example.org").unwrap(),
+            "ctl.example.org:7443"
+        );
+        assert_eq!(controller_addr("https://ctl:9000/").unwrap(), "ctl:9000");
+        assert_eq!(controller_addr("10.0.0.1").unwrap(), "10.0.0.1:7443");
+        assert_eq!(
+            controller_addr("https://[2001:db8::1]").unwrap(),
+            "[2001:db8::1]:7443"
+        );
+        assert_eq!(controller_addr("https://[::1]:7443").unwrap(), "[::1]:7443");
+        for bad in ["http://ctl", "https://", "https://ctl/path", "2001:db8::1"] {
+            assert!(controller_addr(bad).is_err(), "{bad}");
+        }
     }
 }

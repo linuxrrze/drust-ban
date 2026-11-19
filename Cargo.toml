@@ -14,32 +14,43 @@ df2b-firewall = { path = "crates/df2b-firewall" }
 df2b-matcher = { path = "crates/df2b-matcher" }
 df2b-proto = { path = "crates/df2b-proto" }
 df2b-sources = { path = "crates/df2b-sources" }
+df2b-tls = { path = "crates/df2b-tls" }
 
 # external crates
 aho-corasick = "1"
 anyhow = "1"
 axum = "0.7"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
 humantime-serde = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 libloading = "0.8"
 ipnet = { version = "2", features = ["serde"] }
 memchr = "2"
 prost = "0.13"
 redb = "2"
 protoc-bin-vendored = "3"
+rcgen = { version = "0.13", features = ["x509-parser"] }
 regex = "1"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+time = "0.3"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+tokio-stream = "0.1"
 toml = "0.8"
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
+tower = { version = "0.4", features = ["util"] }
 tonic-build = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+x509-parser = "0.16"
 
 [profile.release]
 lto = "thin"

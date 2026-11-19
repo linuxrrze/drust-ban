@@ -30,7 +30,28 @@ cargo run -p df2b-agent -- --config config/agent.example.toml --check
 # Needs read access to the journal (root, or groups systemd-journal / adm).
 cargo run -p df2b-agent -- --config config/agent.example.toml
 
-# Controller (health endpoint only so far)
-cargo run -p df2b-controller
-curl http://127.0.0.1:7080/api/v1/health
 ```
+
+### Controller and agents
+
+```sh
+# Controller: creates its CA in --state-dir on first start, agents connect on :7443
+cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl
+
+# One-time enrollment token (prints df2b1.<secret>.<ca-fingerprint>)
+cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl enroll-token --group web
+
+# Agent: set `controller = "https://127.0.0.1:7443"` in its config, then start
+# it once with the token; afterwards the certificate in <state_dir>/tls is used.
+cargo run -p df2b-agent -- --config agent.toml --enroll-token df2b1.…
+
+# Overview (read-only, loopback)
+curl http://127.0.0.1:7080/api/v1/agents
+curl http://127.0.0.1:7080/api/v1/decisions
+
+# Revoke an agent
+cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl revoke <agent-id>
+```
+
+With systemd, put `DF2B_ENROLL_TOKEN=df2b1.…` into `/etc/df2b/agent.env` for
+the first start (the unit reads it); the token is useless afterwards.

@@ -227,6 +227,53 @@ Rules:
   clock skew, firewall backend health, **certificate expiry**. These feed the
   "connected clients" view, which flags certificates close to expiry.
 
+#### Implementation (agent ↔ controller, crate `df2b-tls`)
+
+- rustls 0.23 with the *ring* provider, TLS 1.3 only, ALPN `h2`. The TLS
+  layer is done with tokio-rustls in front of tonic (tonic's own TLS options
+  cannot express TLS-1.3-only, optional client auth or CA pinning).
+- The controller creates its CA (`ca.pem`, `ca.key` 0600) on first start and
+  issues a fresh server certificate at every start (key only in memory). The
+  server certificate always carries the name `df2b-controller`, which agents
+  verify regardless of the address they connect to; `--name` adds more.
+  Agent certificates carry EKU *clientAuth* only, so they cannot impersonate
+  the controller; the controller ignores CSR subjects and sets CN = agent id.
+- Client certificates are optional at the TLS layer (Enroll comes first);
+  every other RPC requires one and maps it to an enrolled agent whose record
+  lists the certificate serial.
+- **Tokens**: `df2b-controller enroll-token --group web [--ttl 1h]` (until the
+  authenticated REST API for `df2bctl` exists). Only the SHA-256 of the
+  secret is stored (`enroll-tokens/<hash>.json`); redeeming renames the file,
+  so a token works once even under concurrent use. The CSR is checked before
+  the token is consumed. The agent takes the token from `--enroll-token` or
+  `DF2B_ENROLL_TOKEN` (systemd: `EnvironmentFile`) and stores
+  `<state_dir>/tls/{ca.pem, agent.pem (cert + key, 0600), identity.json}`.
+- **Renewal** after 2/3 of the lifetime, over the authenticated channel with
+  a new key. The controller then accepts the new serial and the one used for
+  the renewal call (a lost response cannot lock the agent out); the one
+  before is rejected. An agent that stays offline past expiry must be
+  re-enrolled with a new token (it says so and re-enrolls automatically when
+  given one).
+- **Revocation**: `df2b-controller revoke <agent-id>` (a file in
+  `revoked/`); checked on every RPC and every 5 s on open decision streams.
+- **Decision stream**: `Subscribe(from_seq)` sends a snapshot of active
+  decisions (first connect, or more than 10 000 behind) or the backlog, then
+  live decisions. Appends are committed before publication, and subscribing
+  takes "current seq + live receiver" atomically, so nothing is lost or
+  duplicated between backlog and live stream. A lagging subscriber is cut off
+  and resumes by seq.
+- **Policy** `propagate_local` (`--propagate global|group|off`): an agent's
+  local ban becomes a decision unless an active ban for the same target and
+  scope lasts at least as long. Rejected: prefixes broader than /24 (v4) or
+  /48 (v6) from a single agent, and anything overlapping the controller
+  allowlist (`--allow`).
+- The agent applies remote bans to the same firewall sets as local ones;
+  a remote ban that disappears is only removed if no local ban or other
+  decision still covers the prefix; an unban decision also lifts local bans
+  (offense history is kept for escalation).
+- Not yet: reports queued only in memory while disconnected (max 10 000),
+  observations without a ban (correlation), per-source stats in heartbeats.
+
 ### 4.5 Abuse safeguards
 
 - Per-agent rate limits on observation reports.
@@ -282,14 +329,18 @@ cloud firewall APIs, webhooks (chat, SIEM).
     remaining time (the nftables table is recreated empty), and escalation
     continues. Records are forgotten `offense_memory` (default 30 days) after
     their ban expired.
-  - later: active decisions, last applied `seq`, queue of unsent observations.
+  - agent identity and certificate in `<state_dir>/tls/` (§4.4).
+  - later: queue of unsent observations. Remote decisions are not stored:
+    after a restart the agent subscribes from 0 and gets a snapshot.
 
   Writes are buffered and committed in **one transaction per second** (one
   fsync), not per batch – at high volume that would mean thousands of fsyncs
   per second – plus a final commit on shutdown. After a crash at most about
   one second of log lines is processed again; bans from that window are
   already kept from double-counting by the offender records that were saved.
-- **Controller**: `sqlx` with SQLite by default, PostgreSQL for HA/large setups.
+- **Controller** (now): `redb` at `<state_dir>/controller.redb` with enrolled
+  agents and the decision log; runtime status (heartbeats, connections) is in
+  memory only. Planned: `sqlx` with SQLite by default, PostgreSQL for HA/large setups.
   Tables: `agents`, `decisions`, `observations_rollup` (per minute, pruned after
   N days), `offense_history`, `users`, `api_tokens`, `audit_log`.
 
@@ -301,8 +352,7 @@ Agent (`/etc/df2b/agent.toml`), see `config/agent.example.toml`:
 
 ```toml
 [agent]
-controller = "https://df2b.example.org:7443"
-group = "web"
+controller = "https://df2b.example.org:7443"   # group comes from the enrollment token
 ipv6_prefix = 64
 firewall = "nftables"          # or "dry-run"
 allowlist = ["127.0.0.0/8", "::1/128"]
@@ -432,9 +482,10 @@ systemd hardening.
 | nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |
 | Agent state (redb)           | source positions + offender records, flushed every 1 s; bans re-applied on start |
 | `df2bctl filter test`        | implemented; other commands are stubs            |
-| Controller                   | health endpoint only                             |
-| gRPC protocol                | `.proto` drafted, codegen wired                  |
-| Encrypted transport (§4.4)   | TODO (milestone 2); scaffold controller serves plain HTTP on loopback only |
+| Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local`; read-only REST (`/agents`, `/decisions`) on loopback |
+| gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |
+| Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans applied |
+| Encrypted transport (§4.4)   | agent ↔ controller done; REST API still plain HTTP, loopback only (enforced) |
 | Web UI                       | placeholder                                      |
 
 ---

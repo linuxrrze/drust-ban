@@ -9,6 +9,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use df2b_core::{escalated_bantime, Allowlist, IpKey, PrefixPolicy};
 use df2b_matcher::{Filter, FilterDef};
 use df2b_sources::LogLine;
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -23,7 +24,9 @@ pub struct BanAction {
     /// 1 for the first ban of this key in this jail.
     pub offense: u32,
     pub until: DateTime<Utc>,
-    #[allow(dead_code)] // reported to the controller (milestone 2)
+    /// Failures that triggered the ban (the jail's maxretry).
+    pub failures: u32,
+    #[allow(dead_code)] // not reported to the controller (privacy) yet
     pub sample: String,
 }
 
@@ -65,9 +68,10 @@ struct Jail {
     /// Keys this jail has banned: offense count and ban expiry. Failures of a
     /// key that is still banned are not counted, so one burst (e.g. catching
     /// up on a log file) cannot produce repeated bans and inflate the count.
-    /// Entries are forgotten `offense_memory` after their ban expired.
-    // TODO: clear / adjust on unban decisions (milestone 2).
+    /// Entries are forgotten `offense_memory` after their ban expired; an
+    /// unban decision ends the ban but keeps the offense count.
     offenders: HashMap<IpKey, Offender>,
+    maxretry: u32,
 }
 
 #[derive(Debug)]
@@ -188,10 +192,55 @@ impl Engine {
                 duration,
                 offense,
                 until,
+                failures: jail.maxretry,
                 sample: line.line.clone(),
             });
         }
         actions
+    }
+
+    /// True if any jail currently bans exactly `net`.
+    pub fn is_banned(&self, net: &IpNet, now: DateTime<Utc>) -> bool {
+        self.jails.iter().any(|j| {
+            j.offenders
+                .iter()
+                .any(|(k, o)| k.net() == *net && o.banned_until > now)
+        })
+    }
+
+    /// Number of (jail, key) bans currently active.
+    pub fn active_bans(&self, now: DateTime<Utc>) -> usize {
+        self.jails
+            .iter()
+            .map(|j| {
+                j.offenders
+                    .values()
+                    .filter(|o| o.banned_until > now)
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Ends local bans of keys inside `net` (an unban decision): failures are
+    /// counted again from now on, the offense history is kept. Returns the
+    /// changed records for the state store.
+    pub fn lift(&mut self, net: &IpNet, now: DateTime<Utc>) -> Vec<OffenderRecord> {
+        let mut changed = Vec::new();
+        for j in &mut self.jails {
+            for (key, o) in j.offenders.iter_mut() {
+                if o.banned_until > now && net.contains(&key.net()) {
+                    o.banned_until = now;
+                    j.tracker.reset(key);
+                    changed.push(OffenderRecord {
+                        jail: j.name.clone(),
+                        key: *key,
+                        offenses: o.offenses,
+                        banned_until: now,
+                    });
+                }
+            }
+        }
+        changed
     }
 
     /// Drops expired tracker entries and forgotten offenders. Returns the
@@ -226,6 +275,7 @@ impl Jail {
             factor: cfg.bantime_factor,
             max_bantime: cfg.max_bantime,
             offenders: HashMap::new(),
+            maxretry: cfg.maxretry,
         }
     }
 }

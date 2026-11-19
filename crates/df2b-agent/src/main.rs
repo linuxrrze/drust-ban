@@ -1,18 +1,21 @@
 //! dist-f2b agent.
 //!
-//! Milestone 1 (standalone): sources → engine → firewall backend, with
-//! source positions and offenders persisted in redb.
-//! TODO: local control socket for `df2bctl --local`, controller connection
-//! (heartbeat, observations, decision stream), reconcile loop.
+//! sources → engine → firewall backend, with source positions and offenders
+//! persisted in redb. With a controller configured: local bans are reported
+//! and the controller's decisions are applied (see link.rs).
+//! TODO: local control socket for `df2bctl --local`, reconcile loop.
 
 mod config;
 mod engine;
+mod link;
+mod remote;
 mod state;
 mod tracker;
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +23,9 @@ use anyhow::Context;
 use chrono::Utc;
 use clap::Parser;
 use df2b_firewall::{BanEntry, DryRun, FirewallBackend, Nftables};
+use df2b_proto::v1;
 use df2b_sources::{FileTailer, Position, SourceBatch};
+use df2b_tls::EnrollToken;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -28,6 +33,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{AgentConfig, FirewallKind, SourceConfig, SourceKind};
 use crate::engine::Engine;
+use crate::link::{FromController, Link, LinkConfig, LinkStats};
+use crate::remote::{Changes, RemoteBans};
 use crate::state::{Pending, State};
 
 /// How often buffered state changes are committed (one fsync each).
@@ -48,6 +55,11 @@ struct Args {
     /// Validate configuration and filters, then exit.
     #[arg(long)]
     check: bool,
+
+    /// One-time token to enroll with the controller (first start only; the
+    /// certificate is then kept in <state_dir>/tls).
+    #[arg(long, env = "DF2B_ENROLL_TOKEN", hide_env_values = true)]
+    enroll_token: Option<String>,
 }
 
 #[tokio::main]
@@ -63,6 +75,12 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cfg = AgentConfig::load(&args.config)?;
     let mut engine = Engine::from_config(&cfg)?;
+    let enroll_token = args
+        .enroll_token
+        .as_deref()
+        .map(str::parse::<EnrollToken>)
+        .transpose()
+        .context("--enroll-token")?;
 
     if args.check {
         println!(
@@ -72,8 +90,8 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    if cfg.agent.controller.is_some() {
-        warn!("controller connection not implemented yet, running standalone");
+    if cfg.agent.controller.is_none() && enroll_token.is_some() {
+        warn!("--enroll-token given but no controller configured; ignoring it");
     }
 
     let state = State::open(&cfg.agent.state_dir)?;
@@ -121,6 +139,21 @@ async fn main() -> anyhow::Result<()> {
     }
     drop(tx);
 
+    let stats = Arc::new(LinkStats::default());
+    let mut link: Option<Link> = match &cfg.agent.controller {
+        Some(url) => Some(link::spawn(
+            LinkConfig {
+                addr: config::controller_addr(url)?,
+                tls_dir: cfg.agent.state_dir.join("tls"),
+                enroll_token,
+                firewall_backend: backend.name(),
+            },
+            stats.clone(),
+        )),
+        None => None,
+    };
+    let mut remote = RemoteBans::default();
+
     let mut pending = Pending::default();
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -149,6 +182,20 @@ async fn main() -> anyhow::Result<()> {
                         );
                         entries.push(BanEntry { net: action.key.net(), timeout: Some(action.duration) });
                         pending.set_offender(action.record());
+                        if let Some(l) = &link {
+                            let obs = v1::Observation {
+                                key: action.key.to_string(),
+                                jail: action.jail.clone(),
+                                count: action.failures,
+                                last_seen_unix_ms: now.timestamp_millis(),
+                                locally_banned: true,
+                                local_ban_expires_unix_ms: action.until.timestamp_millis(),
+                                ..Default::default()
+                            };
+                            if l.reports.try_send(obs).is_err() {
+                                warn!("controller report queue full, dropping report");
+                            }
+                        }
                     }
                 }
                 if let Some(position) = batch.position {
@@ -164,12 +211,33 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
             }
+            ev = next_event(&mut link) => {
+                let Some(ev) = ev else {
+                    // link task gave up (logged); continue standalone
+                    link = None;
+                    continue;
+                };
+                let now = Utc::now();
+                let changes = remote.apply(ev, now, |net| engine.is_banned(net, now));
+                for net in &changes.lift {
+                    for r in engine.lift(net, now) {
+                        info!(jail = %r.jail, target = %r.key, "local ban lifted by controller");
+                        pending.set_offender(r);
+                    }
+                }
+                apply_remote(&backend, changes);
+            }
             _ = flush.tick() => {
+                stats.active_bans.store(
+                    (engine.active_bans(Utc::now()) + remote.len()) as u64,
+                    Ordering::Relaxed,
+                );
                 if let Err(e) = state.flush_async(std::mem::take(&mut pending)).await {
                     error!(error = %format!("{e:#}"), "saving state failed");
                 }
             }
             _ = prune.tick() => {
+                remote.prune(Utc::now());
                 for (jail, key) in engine.prune(Utc::now()) {
                     pending.forget_offender(&jail, &key);
                 }
@@ -183,6 +251,39 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("saving state on shutdown")?;
     Ok(())
+}
+
+async fn next_event(link: &mut Option<Link>) -> Option<FromController> {
+    match link {
+        Some(l) => l.events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Applies controller-driven firewall changes in the background (unbans
+/// first, so a re-ban of the same prefix in one batch wins).
+fn apply_remote(backend: &Arc<dyn FirewallBackend>, c: Changes) {
+    if c.ban.is_empty() && c.unban.is_empty() {
+        return;
+    }
+    info!(
+        ban = c.ban.len(),
+        unban = c.unban.len(),
+        "applying controller decisions"
+    );
+    let b = backend.clone();
+    tokio::task::spawn_blocking(move || {
+        if !c.unban.is_empty() {
+            if let Err(e) = b.unban(&c.unban) {
+                error!(count = c.unban.len(), error = %e, "unban failed");
+            }
+        }
+        if !c.ban.is_empty() {
+            if let Err(e) = b.ban(&c.ban) {
+                error!(count = c.ban.len(), error = %e, "ban failed");
+            }
+        }
+    });
 }
 
 fn spawn_source(
