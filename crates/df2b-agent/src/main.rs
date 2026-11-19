@@ -239,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         &src_tx,
         &loaded.positions,
         &stats.sources,
+        &cfg.agent.central_paths,
     );
 
     if let Ok(mut v) = stats.allowlist_version.lock() {
@@ -402,7 +403,14 @@ async fn main() -> anyhow::Result<()> {
                     // (re)started sources resume from the positions saved up
                     // to now, not those loaded at startup
                     let positions = current_positions(&state, &mut pending, &loaded.positions).await;
-                    central_sources.update(&c, &running, &src_tx, &positions, &stats.sources);
+                    central_sources.update(
+                        &c,
+                        &running,
+                        &src_tx,
+                        &positions,
+                        &stats.sources,
+                        &cfg.agent.central_paths,
+                    );
                     if c.version != central_jails.version {
                         info!(version = %c.version, defined = c.jails.len(), running = running.len(), "central jails applied");
                         let (st, saved) = (state.clone(), c.clone());
@@ -792,6 +800,7 @@ impl<D: PartialEq> RunningSources<D> {
         positions: &HashMap<String, Position>,
         health: &health::SourceHealth,
         what: &str,
+        roots: &[PathBuf],
     ) -> SourceChanges {
         let mut out = SourceChanges::default();
         self.0.retain(|name, (def, tasks)| {
@@ -810,7 +819,7 @@ impl<D: PartialEq> RunningSources<D> {
             if self.0.contains_key(&cfg.name) {
                 continue;
             }
-            match spawn_owned_source(&cfg, tx, positions, health) {
+            match spawn_owned_source(&cfg, tx, positions, health, roots) {
                 Ok(tasks) => {
                     info!(source = %cfg.name, "{what} source started");
                     out.started.push(cfg.name.clone());
@@ -839,7 +848,7 @@ impl LocalSources {
         health: &health::SourceHealth,
     ) -> SourceChanges {
         let wanted = sources.iter().map(|s| (s.clone(), s.clone())).collect();
-        self.sync(wanted, tx, positions, health, "local")
+        self.sync(wanted, tx, positions, health, "local", &[])
     }
 }
 
@@ -854,6 +863,8 @@ impl CentralSources {
         tx: &mpsc::Sender<SourceBatch>,
         positions: &HashMap<String, Position>,
         health: &health::SourceHealth,
+        // files must really be below these (central_paths)
+        roots: &[PathBuf],
     ) -> SourceChanges {
         let mut wanted = Vec::new();
         for j in jails.jails.iter().filter(|j| running.contains(&j.name)) {
@@ -868,7 +879,7 @@ impl CentralSources {
                 }
             }
         }
-        self.sync(wanted, tx, positions, health, "central")
+        self.sync(wanted, tx, positions, health, "central", roots)
     }
 }
 
@@ -879,9 +890,10 @@ fn spawn_owned_source(
     tx: &mpsc::Sender<SourceBatch>,
     positions: &HashMap<String, Position>,
     health: &health::SourceHealth,
+    roots: &[PathBuf],
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let (own_tx, mut own_rx) = mpsc::channel::<SourceBatch>(16);
-    let mut tasks = spawn_source(src, &own_tx, positions, health)?;
+    let mut tasks = spawn_source(src, &own_tx, positions, health, roots)?;
     let tx = tx.clone();
     tasks.push(tokio::spawn(async move {
         while let Some(b) = own_rx.recv().await {
@@ -898,6 +910,8 @@ fn spawn_source(
     tx: &mpsc::Sender<SourceBatch>,
     positions: &HashMap<String, Position>,
     health: &health::SourceHealth,
+    // non-empty: files must really be below these (central sources)
+    roots: &[PathBuf],
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut tasks = Vec::new();
     let name: Arc<str> = Arc::from(src.name.as_str());
@@ -915,6 +929,9 @@ fn spawn_source(
             let mut files = FileSource::new(name.clone(), paths.clone(), *start_at_end)
                 .with_errors(errors.clone())
                 .with_timestamps(*timestamps);
+            if !roots.is_empty() {
+                files = files.with_allowed_roots(roots.to_vec());
+            }
             // saved positions of this source: configured paths and glob matches
             for (key, pos) in positions {
                 if let Position::File {

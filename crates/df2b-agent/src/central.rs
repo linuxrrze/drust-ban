@@ -142,12 +142,26 @@ pub fn split(
     (accepted, rejected)
 }
 
-/// Absolute, no `..`, and below one of `allowed` (component-wise, so
-/// "/var/logx" is not below "/var/log").
+/// Absolute, no `..` - also none a glob could expand to (`.[.]`, `.?`) -
+/// and below one of `allowed` (component-wise, so "/var/logx" is not
+/// below "/var/log"). Where a matched file really is (symlinks) is checked
+/// again when it is opened.
 pub fn path_allowed(p: &Path, allowed: &[PathBuf]) -> bool {
     p.is_absolute()
-        && p.components().all(|c| !matches!(c, Component::ParentDir))
+        && p.components().all(|c| match c {
+            Component::ParentDir | Component::CurDir => false,
+            Component::Normal(n) => !dot_like(&n.to_string_lossy()),
+            _ => true,
+        })
         && allowed.iter().any(|a| p.starts_with(a) && p != a.as_path())
+}
+
+/// A path component that is, or as a glob pattern could match, `.` or `..`.
+pub fn dot_like(c: &str) -> bool {
+    c == "."
+        || c == ".."
+        || (c.contains(['*', '?', '['])
+            && glob::Pattern::new(c).is_ok_and(|g| g.matches(".") || g.matches("..")))
 }
 
 /// Converts the controller's message; implausible jails are dropped.
@@ -210,6 +224,13 @@ mod tests {
             ("/var/log", false),
             ("/var/logx/auth.log", false),
             ("/var/log/../../etc/shadow", false),
+            // regression: glob classes that expand to ".."
+            ("/var/log/.[.]/.[.]/etc/shadow", false),
+            ("/var/log/.?/.?/etc/shadow", false),
+            ("/var/log/[.][.]/etc/shadow", false),
+            ("/var/log/*/../x", false),
+            ("/var/log/nginx/*.log", true),
+            ("/var/log/app-?/[ab]*.log", true),
             ("/etc/shadow", false),
             ("var/log/auth.log", false),
         ] {

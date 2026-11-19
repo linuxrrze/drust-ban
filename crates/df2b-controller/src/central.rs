@@ -97,15 +97,22 @@ pub fn validate_filter(name: &str, toml: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A path the agents could open: absolute, no `..`, no control characters.
+/// A path the agents could open: absolute, no control characters, no
+/// `..` - also none a glob could expand to (`.[.]`, `.?`).
 fn valid_path(p: &str) -> bool {
     let path = std::path::Path::new(p);
     p.len() <= 4096
         && path.is_absolute()
         && !p.chars().any(char::is_control)
-        && path
-            .components()
-            .all(|c| !matches!(c, std::path::Component::ParentDir))
+        && path.components().all(|c| match c {
+            std::path::Component::ParentDir | std::path::Component::CurDir => false,
+            std::path::Component::Normal(n) => {
+                let n = n.to_string_lossy();
+                !(n.contains(['*', '?', '['])
+                    && glob::Pattern::new(&n).is_ok_and(|g| g.matches(".") || g.matches("..")))
+            }
+            _ => true,
+        })
 }
 
 /// A path with `*`, `?` or `[` is a glob (agents expand it); it must parse.
@@ -420,5 +427,27 @@ failregex = ['Failed password for .* from <HOST>']
         assert_ne!(web.version, db.version);
         assert_eq!(cfg.for_group("web"), web, "stable");
         assert_eq!(cfg.users_of("sshd-strict"), ["sshd (group web)"]);
+    }
+
+    /// Regression: glob classes expanding to ".." passed (agents then read
+    /// any file, e.g. /var/log/.[.]/.[.]/etc/shadow).
+    #[test]
+    fn paths_cannot_climb_out() {
+        for p in [
+            "/var/log/.[.]/.[.]/etc/shadow",
+            "/var/log/.?/x",
+            "/var/log/[.][.]/x",
+            "/var/log/../x",
+            "relative.log",
+        ] {
+            assert!(!valid_path(p), "{p}");
+        }
+        for p in [
+            "/var/log/auth.log",
+            "/var/log/nginx/*.log",
+            "/var/log/app-?/[ab]*.log",
+        ] {
+            assert!(valid_path(p), "{p}");
+        }
     }
 }

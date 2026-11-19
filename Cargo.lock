@@ -601,6 +601,7 @@ dependencies = [
  "df2b-proto",
  "df2b-sources",
  "df2b-tls",
+ "glob",
  "humantime",
  "humantime-serde",
  "ipnet",

@@ -84,6 +84,10 @@ pub struct FileTailer {
     grace: Duration,
     exit_when_gone: bool,
     timestamps: bool,
+    /// Canonical directories the opened file must really be in (sources
+    /// the controller defined: symlinks and glob tricks must not lead
+    /// elsewhere).
+    roots: Option<Arc<Vec<PathBuf>>>,
     resume: Option<FileId>,
     resume_offset: u64,
 }
@@ -122,6 +126,7 @@ impl FileTailer {
             grace: ROTATION_GRACE,
             exit_when_gone: false,
             timestamps: true,
+            roots: None,
             resume: None,
             resume_offset: 0,
         }
@@ -164,6 +169,38 @@ impl FileTailer {
     pub fn with_timestamps(mut self, on: bool) -> Self {
         self.timestamps = on;
         self
+    }
+
+    /// Only read files that really are below one of these (canonical)
+    /// directories, wherever the path or its symlinks point.
+    pub fn with_allowed_roots(mut self, roots: Arc<Vec<PathBuf>>) -> Self {
+        self.roots = Some(roots);
+        self
+    }
+
+    /// Opens a regular file without blocking (a FIFO would block until a
+    /// writer comes) and checks where it really is.
+    async fn open_checked(&self, path: &Path) -> Option<(tokio::fs::File, std::fs::Metadata)> {
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .await
+            .map_err(|e| debug!(path = %path.display(), error = %e, "file not available"))
+            .ok()?;
+        let meta = file.metadata().await.ok()?;
+        if !meta.is_file() {
+            warn!(path = %path.display(), "not a regular file, not reading it");
+            return None;
+        }
+        if let Some(roots) = &self.roots {
+            let real = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+            if !under_roots(&real, roots) {
+                warn!(path = %path.display(), real = %real.display(), "file is outside the allowed directories, not reading it");
+                return None;
+            }
+        }
+        Some((file, meta))
     }
 
     /// End once the path is gone (after the grace period) and the last file
@@ -229,9 +266,8 @@ impl FileTailer {
     }
 
     /// Opens `path` if it is still the file `id`; the offset to read from.
-    async fn open_if(path: &Path, id: FileId, offset: u64) -> Option<Open> {
-        let file = tokio::fs::File::open(path).await.ok()?;
-        let meta = file.metadata().await.ok()?;
+    async fn open_if(&self, path: &Path, id: FileId, offset: u64) -> Option<Open> {
+        let (file, meta) = self.open_checked(path).await?;
         (FileId::of(&meta) == id).then(|| Open {
             id,
             file,
@@ -244,11 +280,11 @@ impl FileTailer {
     async fn open_next(&self, first: bool) -> Option<Open> {
         if first {
             if let Some(id) = self.resume {
-                if let Some(o) = Self::open_if(&self.path, id, self.resume_offset).await {
+                if let Some(o) = self.open_if(&self.path, id, self.resume_offset).await {
                     return Some(o);
                 }
                 if let Some(old) = find_by_id(&self.path, id).await {
-                    if let Some(o) = Self::open_if(&old, id, self.resume_offset).await {
+                    if let Some(o) = self.open_if(&old, id, self.resume_offset).await {
                         info!(
                             path = %self.path.display(), rotated = %old.display(),
                             offset = o.offset, "file rotated while stopped, reading the rest first"
@@ -258,20 +294,7 @@ impl FileTailer {
                 }
             }
         }
-        let file = match tokio::fs::File::open(&self.path).await {
-            Ok(f) => f,
-            Err(e) => {
-                debug!(path = %self.path.display(), error = %e, "file not available");
-                return None;
-            }
-        };
-        let meta = match file.metadata().await {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(path = %self.path.display(), error = %e, "cannot stat file");
-                return None;
-            }
-        };
+        let (file, meta) = self.open_checked(&self.path).await?;
         let offset = if first && self.resume.is_none() && self.start_at_end {
             meta.len()
         } else {
@@ -536,6 +559,8 @@ pub struct FileSource {
     rescan: Duration,
     errors: Option<Arc<SourceErrors>>,
     timestamps: bool,
+    /// See [`FileTailer::with_allowed_roots`] (not yet canonical).
+    roots: Option<Vec<PathBuf>>,
 }
 
 impl FileSource {
@@ -550,7 +575,15 @@ impl FileSource {
             rescan: Duration::from_secs(10),
             errors: None,
             timestamps: true,
+            roots: None,
         }
+    }
+
+    /// Only follow files really below these directories (sources the
+    /// controller defined; see [`FileTailer::with_allowed_roots`]).
+    pub fn with_allowed_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.roots = Some(roots);
+        self
     }
 
     /// See [`FileTailer::with_timestamps`].
@@ -588,10 +621,18 @@ impl FileSource {
         self
     }
 
-    fn tailer(&self, path: &Path, start_at_end: bool) -> FileTailer {
+    fn tailer(
+        &self,
+        path: &Path,
+        start_at_end: bool,
+        roots: &Option<Arc<Vec<PathBuf>>>,
+    ) -> FileTailer {
         let mut t = FileTailer::new(self.source.clone(), path.to_path_buf(), start_at_end)
             .with_rotation_grace(self.grace)
             .with_timestamps(self.timestamps);
+        if let Some(r) = roots {
+            t = t.with_allowed_roots(r.clone());
+        }
         if let Some(poll) = self.poll {
             t = t.with_poll_interval(poll);
         }
@@ -612,6 +653,15 @@ impl FileSource {
                 Ok(p.to_string_lossy().into_owned())
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        // canonical, so symlinks in the allowed directories themselves are
+        // fine; a missing one allows nothing
+        let roots: Option<Arc<Vec<PathBuf>>> = self.roots.as_ref().map(|r| {
+            Arc::new(
+                r.iter()
+                    .filter_map(|p| std::fs::canonicalize(p).ok())
+                    .collect(),
+            )
+        });
 
         let mut tasks: JoinSet<PathBuf> = JoinSet::new();
         let mut active: HashSet<PathBuf> = HashSet::new();
@@ -645,7 +695,7 @@ impl FileSource {
         };
         for p in literal {
             if active.insert(p.clone()) {
-                spawn(&mut tasks, self.tailer(p, self.start_at_end));
+                spawn(&mut tasks, self.tailer(p, self.start_at_end, &roots));
             }
         }
 
@@ -654,8 +704,18 @@ impl FileSource {
         loop {
             if !patterns.is_empty() {
                 let found = tokio::task::spawn_blocking({
-                    let patterns = patterns.clone();
-                    move || expand(&patterns)
+                    let (patterns, roots) = (patterns.clone(), roots.clone());
+                    move || {
+                        let mut found = expand(&patterns);
+                        // matches that really are elsewhere are not followed
+                        if let Some(roots) = roots {
+                            found.retain(|p| {
+                                std::fs::canonicalize(p)
+                                    .is_ok_and(|real| under_roots(&real, &roots))
+                            });
+                        }
+                        found
+                    }
                 })
                 .await?;
                 for path in found {
@@ -675,7 +735,7 @@ impl FileSource {
                     // files present at start follow `start_at_end`; files
                     // appearing later are new and read from the start
                     let t = self
-                        .tailer(&path, first && self.start_at_end)
+                        .tailer(&path, first && self.start_at_end, &roots)
                         .exit_when_gone(true);
                     active.insert(path);
                     spawn(&mut tasks, t);
@@ -703,6 +763,13 @@ impl FileSource {
             }
         }
     }
+}
+
+/// Below (not equal to) one of the canonical `roots`.
+fn under_roots(real: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|r| real.starts_with(r) && real != r.as_path())
 }
 
 /// Regular files matching any of `patterns`, sorted, without duplicates.
@@ -1132,6 +1199,68 @@ mod tests {
             "live: {age}"
         );
         h.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: files the controller defined could be reached through
+    /// symlinks (and glob tricks) outside central_paths; a FIFO blocked the
+    /// tailer on open.
+    #[tokio::test]
+    async fn allowed_roots_are_enforced() {
+        let dir = tmpdir("roots");
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let secret = dir.join("secret.txt");
+        std::fs::write(
+            &secret,
+            "Failed password for root from 192.0.2.9 port 1 ssh2\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&secret, logs.join("evil.log")).unwrap();
+        std::fs::write(logs.join("ok.log"), "fine\n").unwrap();
+        let fifo = logs.join("fifo.log");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileSource::new(Arc::from("central:x"), vec![logs.join("*.log")], false)
+                .with_allowed_roots(vec![logs.clone()])
+                .with_poll_interval(Duration::from_millis(10))
+                .with_rescan_interval(Duration::from_millis(50))
+                .run(tx),
+        );
+        let b = recv_batch(&mut rx).await;
+        assert_eq!(b.lines[0].line, "fine");
+        // the literal path of the symlink is refused as well
+        let (tx2, mut rx2) = mpsc::channel(16);
+        let h2 = tokio::spawn(
+            FileSource::new(
+                Arc::from("central:y"),
+                vec![logs.join("evil.log"), fifo.clone()],
+                false,
+            )
+            .with_allowed_roots(vec![logs.clone()])
+            .with_poll_interval(Duration::from_millis(10))
+            .run(tx2),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing from outside or from the FIFO"
+        );
+        assert!(rx2.try_recv().is_err());
+        // a FIFO is refused at once, not waited on
+        let t = FileTailer::new(Arc::from("central:y"), fifo.clone(), false);
+        let opened = tokio::time::timeout(Duration::from_secs(1), t.open_checked(&fifo))
+            .await
+            .expect("open of a FIFO must not block");
+        assert!(opened.is_none());
+        h.abort();
+        h2.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

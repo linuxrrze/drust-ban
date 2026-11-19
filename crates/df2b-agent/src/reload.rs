@@ -211,6 +211,7 @@ pub async fn reload(l: Live<'_>) -> Result<Value, String> {
         l.src_tx,
         &positions,
         &l.stats.sources,
+        &new.agent.central_paths,
     );
 
     *l.cfg = new;
