@@ -2,8 +2,9 @@
 //!
 //! sources → engine → firewall backend, with source positions and offenders
 //! persisted in redb. With a controller configured: local bans are reported
-//! and the controller's decisions are applied (see link.rs).
-//! TODO: local control socket for `df2bctl --local`, reconcile loop.
+//! and the controller's decisions are applied (see link.rs). The firewall
+//! is reconciled with the known bans periodically (reconcile.rs);
+//! `df2bctl --local` talks to the agent over control.rs.
 
 mod central;
 mod config;
@@ -12,6 +13,7 @@ mod engine;
 mod health;
 mod link;
 mod outbox;
+mod reconcile;
 mod remote;
 mod state;
 mod tracker;
@@ -274,6 +276,12 @@ async fn main() -> anyhow::Result<()> {
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut prune = tokio::time::interval(Duration::from_secs(60));
+    let mut reconcile_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + reconcile::INTERVAL,
+        reconcile::INTERVAL,
+    );
+    reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let reconciling = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut control = match cfg.agent.control_socket_path() {
         Some(p) => match control::spawn(&p) {
             Ok(s) => Some(s),
@@ -503,6 +511,30 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let r = control::handle(call.req, &call.peer, cx).await;
                 let _ = call.reply.send(r);
+            }
+            _ = reconcile_tick.tick() => {
+                if reconciling.swap(true, Ordering::AcqRel) {
+                    continue; // the previous round is still running
+                }
+                let now = Utc::now();
+                let mut expected = reconcile::Expected::default();
+                for (_, key, _, until) in engine.bans(now) {
+                    expected.add(key.net(), Some(until));
+                }
+                for m in manual.iter().filter(|m| m.until.map_or(true, |u| u > now)) {
+                    expected.add(m.target, m.until);
+                }
+                for (target, until, _) in remote.list(now) {
+                    expected.add(target, until);
+                }
+                let (b, flag) = (backend.clone(), reconciling.clone());
+                tokio::spawn(async move {
+                    let r = tokio::task::spawn_blocking(move || reconcile::run(&b, &expected, now)).await;
+                    if let Ok(Err(e)) = r {
+                        warn!(error = %format!("{e:#}"), "reconciling the firewall failed");
+                    }
+                    flag.store(false, Ordering::Release);
+                });
             }
             _ = &mut ctrl_c => { info!("interrupted, shutting down"); break; }
             _ = sigterm.recv() => { info!("terminated, shutting down"); break; }

@@ -3,8 +3,11 @@
 //! Bans are elements of `ban_v4` / `ban_v6` sets with kernel-side timeouts,
 //! so they expire even if the agent is down.
 //!
-//! TODO: talk netlink directly (rustables), list set contents for the
-//! reconcile loop, merge overlapping intervals before adding.
+//! Set contents are listed with `nft -j list set` for the agent's
+//! reconcile loop.
+//!
+//! TODO: talk netlink directly (rustables), merge overlapping intervals
+//! before adding.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -160,6 +163,15 @@ impl FirewallBackend for Nftables {
         self.run(&self.ban_script(entries))
     }
 
+    fn list(&self) -> anyhow::Result<Option<Vec<IpNet>>> {
+        let mut out = Vec::new();
+        for set in ["ban_v4", "ban_v6"] {
+            let json = self.query(&["-j", "list", "set", "inet", &self.table, set])?;
+            out.extend(parse_set(&json).with_context(|| format!("reading set {set}"))?);
+        }
+        Ok(Some(out))
+    }
+
     /// The input chain (with its table and sets) must still exist.
     fn check(&self) -> anyhow::Result<()> {
         let out = self.query(&["list", "chain", "inet", &self.table, "input"])?;
@@ -188,6 +200,54 @@ impl FirewallBackend for Nftables {
         }
         Ok(())
     }
+}
+
+/// The elements of a set in `nft -j list set` output: plain addresses,
+/// prefixes and ranges, each possibly wrapped in `{"elem": {"val": …}}`
+/// (elements with a timeout).
+pub fn parse_set(json: &str) -> anyhow::Result<Vec<IpNet>> {
+    use serde_json::Value;
+    fn addr(v: &Value) -> anyhow::Result<std::net::IpAddr> {
+        v.as_str()
+            .and_then(|s| s.parse().ok())
+            .with_context(|| format!("not an address: {v}"))
+    }
+    fn elem(v: &Value, out: &mut Vec<IpNet>) -> anyhow::Result<()> {
+        if let Some(inner) = v.get("elem") {
+            return elem(&inner["val"], out);
+        }
+        if let Some(p) = v.get("prefix") {
+            let len = p["len"].as_u64().context("prefix without len")? as u8;
+            out.push(IpNet::new(addr(&p["addr"])?, len)?.trunc());
+            return Ok(());
+        }
+        if let Some(r) = v.get("range").and_then(Value::as_array) {
+            let (Some(a), Some(b)) = (r.first(), r.get(1)) else {
+                bail!("bad range: {v}");
+            };
+            match (addr(a)?, addr(b)?) {
+                (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                    out.extend(ipnet::Ipv4Subnets::new(a, b, 0).map(IpNet::V4))
+                }
+                (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+                    out.extend(ipnet::Ipv6Subnets::new(a, b, 0).map(IpNet::V6))
+                }
+                _ => bail!("mixed range: {v}"),
+            }
+            return Ok(());
+        }
+        out.push(IpNet::from(addr(v)?));
+        Ok(())
+    }
+    let v: Value = serde_json::from_str(json).context("nft JSON")?;
+    let mut out = Vec::new();
+    for item in v["nftables"].as_array().into_iter().flatten() {
+        let Some(set) = item.get("set") else { continue };
+        for e in set["elem"].as_array().into_iter().flatten() {
+            elem(e, &mut out)?;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -247,5 +307,41 @@ mod tests {
             .to_string();
         assert!(e.contains("No such file"), "{e}");
         assert!(Nftables::new("df2b", "/nonexistent/nft").check().is_err());
+    }
+
+    #[test]
+    fn set_listing() {
+        let json = r#"{"nftables": [
+          {"metainfo": {"version": "1.0.9", "json_schema_version": 1}},
+          {"set": {"family": "inet", "name": "ban_v4", "table": "df2b",
+            "type": "ipv4_addr", "handle": 2, "flags": ["interval", "timeout"],
+            "elem": [
+              {"elem": {"val": "203.0.113.7", "timeout": 3600, "expires": 3412}},
+              {"elem": {"val": {"prefix": {"addr": "198.51.100.0", "len": 24}}, "timeout": 7200, "expires": 7000}},
+              {"prefix": {"addr": "192.0.2.0", "len": 25}},
+              "192.0.2.200",
+              {"range": ["10.0.0.0", "10.0.0.3"]}
+            ]}}]}"#;
+        let got: Vec<String> = parse_set(json)
+            .unwrap()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "203.0.113.7/32",
+                "198.51.100.0/24",
+                "192.0.2.0/25",
+                "192.0.2.200/32",
+                "10.0.0.0/30"
+            ]
+        );
+        let empty = r#"{"nftables": [{"metainfo": {}}, {"set": {"name": "ban_v6", "elem": []}}]}"#;
+        assert!(parse_set(empty).unwrap().is_empty());
+        let v6 = r#"{"nftables": [{"set": {"elem": [{"elem": {"val": {"prefix": {"addr": "2001:db8::", "len": 64}}}}]}}]}"#;
+        assert_eq!(parse_set(v6).unwrap()[0].to_string(), "2001:db8::/64");
+        assert!(parse_set("not json").is_err());
+        assert!(parse_set(r#"{"nftables": [{"set": {"elem": ["nonsense"]}}]}"#).is_err());
     }
 }

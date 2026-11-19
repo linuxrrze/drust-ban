@@ -167,6 +167,10 @@ impl FirewallBackend for Monitored {
         FirewallHealth::set(&self.health.check_error, &r);
         r
     }
+
+    fn list(&self) -> anyhow::Result<Option<Vec<IpNet>>> {
+        self.inner.list()
+    }
 }
 
 #[cfg(test)]

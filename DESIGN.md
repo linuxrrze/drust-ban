@@ -363,9 +363,15 @@ table inet df2b {
   crashes.
 - **Batched updates**: one transaction per batch, not one process per ban;
   100k+ entries are fine.
-- **Reconcile loop**: periodically diff desired state (active decisions) against
-  the actual set contents and repair drift. On agent start the table is
-  recreated and re-populated from persisted state.
+- **Reconcile loop** (every 5 min): the agent lists both sets
+  (`nft -j list set`) and compares them with the bans it knows (jail bans,
+  manual bans, controller bans; longest expiry per prefix): missing
+  prefixes are added again with their remaining time (unless they end
+  within 10 s), prefixes nobody claims are removed – the `df2b` table
+  belongs to the agent. If the sets cannot be listed and the chain check
+  fails too, the table is set up again and everything re-added. Only
+  presence is compared, not remaining timeouts. On agent start the table
+  is recreated and re-populated from persisted state.
 - Further backends behind the `FirewallBackend` trait: iptables + ipset (legacy),
   `exec` hook (custom scripts), `dry-run` (log only; for rollout).
 

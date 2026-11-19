@@ -35,4 +35,10 @@ pub trait FirewallBackend: Send + Sync {
     fn check(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// The prefixes currently banned, for reconciling. `Ok(None)`: the
+    /// backend cannot tell (then nothing is reconciled).
+    fn list(&self) -> anyhow::Result<Option<Vec<IpNet>>> {
+        Ok(None)
+    }
 }
