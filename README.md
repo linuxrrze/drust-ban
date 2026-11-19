@@ -94,7 +94,10 @@ ID, Google, ...): register `https://<controller>:7444/api/v1/oidc/callback`
 as redirect URI, map the provider's groups to roles in a copy of
 [`config/oidc.example.toml`](config/oidc.example.toml) and start the
 controller with `--oidc-config /etc/df2b/oidc.toml`. The login page then
-offers "Sign in with …".
+offers "Sign in with …". Also register
+`https://<controller>:7444/api/v1/oidc/backchannel-logout` as back-channel
+logout URL, so logging out or disabling a user at the provider ends their
+controller sessions at once.
 
 UI development with hot reload against a running controller:
 `DF2B_CONTROLLER=https://127.0.0.1:7444 npm --prefix web run dev`.

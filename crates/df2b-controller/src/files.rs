@@ -175,8 +175,12 @@ pub struct ApiTokenFile {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Audit actor for back-channel logouts; not available as a name.
+pub const RESERVED_NAMES: &[&str] = &["oidc-provider"];
+
 pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
+    !RESERVED_NAMES.contains(&name)
+        && !name.is_empty()
         && name.len() <= 64
         && name
             .chars()

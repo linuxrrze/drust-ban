@@ -16,6 +16,11 @@
 //! The role is taken from the provider at login and kept for the session
 //! (`session_lifetime`, default 8 h): removing someone from a group takes
 //! effect at their next login.
+//!
+//! Back-channel logout (OpenID Connect Back-Channel Logout 1.0): the
+//! provider POSTs a signed `logout_token` to `/api/v1/oidc/backchannel-logout`
+//! when a user logs out there or is disabled; the controller ends the
+//! matching sessions (by `sid`, or all of a `sub`) immediately.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,11 +30,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient};
+use openidconnect::core::{
+    CoreAuthenticationFlow, CoreClient, CoreJsonWebKey, CoreJwsSigningAlgorithm,
+};
 use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
-    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
-    PkceCodeVerifier, ProviderMetadataWithLogout, RedirectUrl, Scope, TokenResponse,
+    EndpointNotSet, EndpointSet, IssuerUrl, JsonWebKey, JsonWebKeySet, JsonWebKeyUse,
+    JwsSigningAlgorithm, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier,
+    ProviderMetadataWithLogout, RedirectUrl, Scope, TokenResponse,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -38,6 +46,17 @@ use tracing::{info, warn};
 use crate::files::{self, Role};
 
 pub const CALLBACK_PATH: &str = "/api/v1/oidc/callback";
+pub const BACKCHANNEL_PATH: &str = "/api/v1/oidc/backchannel-logout";
+const BACKCHANNEL_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
+/// Logout tokens issued longer ago than this are refused.
+const LOGOUT_TOKEN_MAX_AGE: i64 = 600;
+/// Tolerated clock difference to the provider.
+const CLOCK_LEEWAY: i64 = 60;
+/// Seen logout token ids are kept this long (replay protection).
+const JTI_KEEP: Duration = Duration::from_secs((LOGOUT_TOKEN_MAX_AGE + CLOCK_LEEWAY) as u64 + 60);
+/// Metadata is fetched again at most this often on request (unknown keys);
+/// otherwise anybody could make the controller hammer the provider.
+const MIN_REFRESH: Duration = Duration::from_secs(60);
 pub const BINDING_COOKIE: &str = "__Host-df2b_oidc";
 /// How long a user may take at the provider.
 const PENDING_TTL: Duration = Duration::from_secs(600);
@@ -159,6 +178,7 @@ type Client = CoreClient<
 
 struct Provider {
     client: Client,
+    jwks: JsonWebKeySet<CoreJsonWebKey>,
     userinfo: Option<String>,
     end_session: Option<String>,
     fetched: Instant,
@@ -179,6 +199,15 @@ pub struct Identity {
     pub role: Role,
     pub issuer: String,
     pub subject: String,
+    /// Provider session id, for back-channel logout.
+    pub sid: Option<String>,
+}
+
+/// Whose sessions a back-channel logout ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogoutTarget {
+    pub subject: Option<String>,
+    pub sid: Option<String>,
 }
 
 /// Why a login failed; the UI shows a matching message (`code`), details
@@ -224,6 +253,10 @@ pub struct Oidc {
     http: reqwest::Client,
     provider: tokio::sync::Mutex<Option<Provider>>,
     pending: Mutex<HashMap<String, Pending>>,
+    /// logout token ids already used
+    seen_jti: Mutex<HashMap<String, Instant>>,
+    /// MIN_REFRESH (tests use 0)
+    pub(crate) min_refresh: Duration,
 }
 
 fn hash(s: &str) -> [u8; 32] {
@@ -300,6 +333,8 @@ impl Oidc {
             config,
             provider: tokio::sync::Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            seen_jti: Mutex::new(HashMap::new()),
+            min_refresh: MIN_REFRESH,
         })
     }
 
@@ -309,10 +344,20 @@ impl Oidc {
         &self,
         refresh: bool,
     ) -> anyhow::Result<(Client, Option<String>, Option<String>)> {
+        let p = self.provider_state(refresh).await?;
+        let p = p.as_ref().expect("loaded");
+        Ok((p.client.clone(), p.userinfo.clone(), p.end_session.clone()))
+    }
+
+    async fn provider_state(
+        &self,
+        refresh: bool,
+    ) -> anyhow::Result<tokio::sync::MutexGuard<'_, Option<Provider>>> {
         let mut p = self.provider.lock().await;
-        let stale = p
-            .as_ref()
-            .map_or(true, |p| refresh || p.fetched.elapsed() > METADATA_TTL);
+        let stale = p.as_ref().map_or(true, |p| {
+            p.fetched.elapsed() > METADATA_TTL
+                || (refresh && p.fetched.elapsed() >= self.min_refresh)
+        });
         if stale {
             let meta = ProviderMetadataWithLogout::discover_async(self.issuer.clone(), &self.http)
                 .await
@@ -320,6 +365,7 @@ impl Oidc {
                     anyhow::anyhow!("discovery at {}: {}", self.issuer.as_str(), describe(&e))
                 })?;
             let userinfo = meta.userinfo_endpoint().map(|u| u.url().to_string());
+            let jwks = meta.jwks().clone();
             let end_session = meta
                 .additional_metadata()
                 .end_session_endpoint
@@ -334,13 +380,13 @@ impl Oidc {
             info!(issuer = %self.issuer.as_str(), "OIDC provider metadata loaded");
             *p = Some(Provider {
                 client,
+                jwks,
                 userinfo,
                 end_session,
                 fetched: Instant::now(),
             });
         }
-        let p = p.as_ref().expect("set above");
-        Ok((p.client.clone(), p.userinfo.clone(), p.end_session.clone()))
+        Ok(p)
     }
 
     /// Fetches the provider metadata once at startup (failures are retried
@@ -495,12 +541,124 @@ impl Oidc {
             .config
             .role_for(&groups)
             .ok_or_else(|| LoginError::NoRole(name.clone()))?;
+        let sid = claims.get("sid").and_then(Value::as_str).map(str::to_owned);
         Ok(Identity {
             name,
             role,
             issuer: self.issuer.as_str().to_owned(),
             subject,
+            sid,
         })
+    }
+
+    /// Verifies a back-channel logout token (Back-Channel Logout 1.0, 2.6).
+    pub async fn verify_logout_token(&self, token: &str) -> anyhow::Result<LogoutTarget> {
+        let parts: Vec<&str> = token.split('.').collect();
+        let [h, pl, sig] = parts[..] else {
+            bail!("not a signed JWT (encrypted logout tokens are not supported)");
+        };
+        let decode = |s: &str, what: &str| {
+            URL_SAFE_NO_PAD
+                .decode(s)
+                .with_context(|| format!("{what} encoding"))
+        };
+        let header: Value = serde_json::from_slice(&decode(h, "header")?).context("header")?;
+        let alg_name = header
+            .get("alg")
+            .and_then(Value::as_str)
+            .context("no alg")?;
+        let alg: CoreJwsSigningAlgorithm =
+            serde_json::from_value(Value::String(alg_name.to_owned()))
+                .with_context(|| format!("unsupported alg {alg_name}"))?;
+        if alg == CoreJwsSigningAlgorithm::None || alg.uses_shared_secret() {
+            bail!("alg {alg_name} is not accepted (asymmetric signatures only)");
+        }
+        if header.get("crit").is_some() {
+            bail!("critical header fields are not supported");
+        }
+        if let Some(typ) = header.get("typ").and_then(Value::as_str) {
+            let t = typ.to_ascii_lowercase();
+            if !["logout+jwt", "application/logout+jwt", "jwt"].contains(&t.as_str()) {
+                bail!("unexpected typ {typ}");
+            }
+        }
+        let kid = header.get("kid").and_then(Value::as_str);
+        let signature = decode(sig, "signature")?;
+        let message = format!("{h}.{pl}");
+
+        // signature: the provider's current keys; on failure fetched again
+        // once (key rotation, also under the same kid), at most every
+        // min_refresh
+        let mut verified = false;
+        for refresh in [false, true] {
+            let p = self.provider_state(refresh).await?;
+            let keys = &p.as_ref().expect("loaded").jwks;
+            verified = keys.keys().iter().any(|k| {
+                kid.map_or(true, |kid| k.key_id().map(|i| i.as_str()) == Some(kid))
+                    && k.key_use().map_or(true, |u| u.allows_signature())
+                    && alg.key_type().as_ref() == Some(k.key_type())
+                    && k.verify_signature(&alg, message.as_bytes(), &signature)
+                        .is_ok()
+            });
+            if verified {
+                break;
+            }
+        }
+        if !verified {
+            bail!("signature does not verify with the provider's keys");
+        }
+
+        let c: Value = serde_json::from_slice(&decode(pl, "payload")?).context("payload")?;
+        if c.get("iss").and_then(Value::as_str) != Some(self.issuer.as_str()) {
+            bail!("wrong issuer");
+        }
+        let aud_ok = match c.get("aud") {
+            Some(Value::String(a)) => a == self.client_id.as_str(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .any(|x| x.as_str() == Some(self.client_id.as_str())),
+            _ => false,
+        };
+        if !aud_ok {
+            bail!("not addressed to this client");
+        }
+        let now = chrono::Utc::now().timestamp();
+        let iat = c.get("iat").and_then(Value::as_i64).context("no iat")?;
+        if iat > now + CLOCK_LEEWAY || iat < now - LOGOUT_TOKEN_MAX_AGE {
+            bail!("iat out of range");
+        }
+        if let Some(exp) = c.get("exp") {
+            if exp.as_i64().context("exp")? < now - CLOCK_LEEWAY {
+                bail!("expired");
+            }
+        }
+        if !c
+            .get("events")
+            .and_then(|e| e.get(BACKCHANNEL_EVENT))
+            .is_some_and(Value::is_object)
+        {
+            bail!("not a back-channel logout event");
+        }
+        // an ID token must never be accepted as a logout token
+        if c.get("nonce").is_some() {
+            bail!("logout tokens must not contain a nonce");
+        }
+        let get = |k: &str| c.get(k).and_then(Value::as_str).map(str::to_owned);
+        let target = LogoutTarget {
+            subject: get("sub"),
+            sid: get("sid"),
+        };
+        if target.subject.is_none() && target.sid.is_none() {
+            bail!("neither sub nor sid");
+        }
+        let jti = get("jti").filter(|j| !j.is_empty()).context("no jti")?;
+        let mut seen = self.seen_jti.lock().unwrap_or_else(|e| e.into_inner());
+        let t = Instant::now();
+        seen.retain(|_, at| t.duration_since(*at) < JTI_KEEP);
+        if seen.insert(jti, t).is_some() {
+            bail!("logout token replayed");
+        }
+        Ok(target)
     }
 
     /// Drops a login in progress (the provider reported an error).

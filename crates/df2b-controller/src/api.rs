@@ -282,6 +282,7 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/auth-methods", get(auth_methods))
         .route("/api/v1/oidc/login", get(oidc_login))
         .route("/api/v1/oidc/callback", get(oidc_callback))
+        .route(crate::oidc::BACKCHANNEL_PATH, post(oidc_backchannel_logout))
         .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/status", get(status))
         .route("/api/v1/stats", get(stats))
@@ -484,6 +485,52 @@ struct CallbackQuery {
     error_description: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct BackchannelForm {
+    logout_token: String,
+}
+
+/// Called by the provider (not the browser): ends the sessions named in a
+/// signed logout token. 200 also when no session matched; 400 with
+/// `invalid_request` for tokens that do not verify.
+async fn oidc_backchannel_logout(
+    State(ctl): State<Arc<Controller>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    axum::extract::Form(f): axum::extract::Form<BackchannelForm>,
+) -> Response {
+    let Some(o) = ctl.settings.oidc.clone() else {
+        return ApiError::not_found("single sign-on is not configured").into_response();
+    };
+    let target = match o.verify_logout_token(&f.logout_token).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(%addr, error = %format!("{e:#}"), "back-channel logout refused");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_request", "error_description": "invalid logout token" })),
+            )
+                .into_response();
+        }
+    };
+    let ended = ctl
+        .sessions
+        .end_oidc(target.subject.as_deref(), target.sid.as_deref());
+    let c = ctl.clone();
+    let audited = tokio::task::spawn_blocking(move || {
+        c.audit(
+            "oidc-provider",
+            Some(addr.to_string()),
+            "session.backchannel_logout",
+            json!({ "subject": target.subject, "sid": target.sid, "sessions_ended": ended }),
+        )
+    })
+    .await;
+    if !matches!(audited, Ok(Ok(()))) {
+        warn!("back-channel logout: audit log write failed");
+    }
+    StatusCode::OK.into_response()
+}
+
 async fn oidc_callback(
     State(ctl): State<Arc<Controller>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -538,7 +585,11 @@ async fn oidc_callback(
     }
     let (secret, _) = ctl.sessions.create(
         &ident.name,
-        session::Kind::Oidc { role: ident.role },
+        session::Kind::Oidc {
+            role: ident.role,
+            subject: ident.subject.clone(),
+            sid: ident.sid.clone(),
+        },
         o.config.session_lifetime,
     );
     let c = ctl.clone();

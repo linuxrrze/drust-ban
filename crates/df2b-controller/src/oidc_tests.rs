@@ -15,6 +15,7 @@ use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde_json::{json, Value};
 
 use super::*;
+use crate::files::{self, Role};
 use crate::state::{Controller, Propagate, Settings};
 use crate::store::Store;
 use df2b_core::Allowlist;
@@ -134,6 +135,39 @@ async fn token(
     })))
 }
 
+impl Mock {
+    /// A logout token as the provider would send it; `claims` override the
+    /// defaults (null removes a claim), `header` replaces the JOSE header.
+    fn logout_token(&self, claims: Value, header: Option<Value>) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let mut c = json!({
+            "iss": self.base, "aud": CLIENT_ID, "iat": now,
+            "jti": b64(&df2b_tls::random_bytes::<12>()),
+            "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
+        });
+        for (k, v) in claims.as_object().unwrap() {
+            if v.is_null() {
+                c.as_object_mut().unwrap().remove(k);
+            } else {
+                c[k] = v.clone();
+            }
+        }
+        let header = header.unwrap_or(json!({ "alg": "ES256", "typ": "logout+jwt", "kid": "k1" }));
+        let input = format!(
+            "{}.{}",
+            b64(header.to_string().as_bytes()),
+            b64(c.to_string().as_bytes())
+        );
+        let sig = self
+            .key
+            .lock()
+            .unwrap()
+            .sign(&SystemRandom::new(), input.as_bytes())
+            .unwrap();
+        format!("{input}.{}", b64(sig.as_ref()))
+    }
+}
+
 async fn userinfo(State(m): State<Arc<Mock>>) -> Json<Value> {
     Json(m.userinfo.lock().unwrap().clone())
 }
@@ -147,6 +181,14 @@ struct Env {
 }
 
 async fn env(tag: &str, tweak: impl FnOnce(&mut OidcConfig)) -> Env {
+    env_with(tag, tweak, std::time::Duration::ZERO).await
+}
+
+async fn env_with(
+    tag: &str,
+    tweak: impl FnOnce(&mut OidcConfig),
+    min_refresh: std::time::Duration,
+) -> Env {
     let dir = std::env::temp_dir().join(format!("df2b-oidc-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -204,7 +246,11 @@ async fn env(tag: &str, tweak: impl FnOnce(&mut OidcConfig)) -> Env {
         cert_lifetime: std::time::Duration::from_secs(3600),
         propagate: Propagate::Global,
         allowlist: Allowlist::default(),
-        oidc: Some(Arc::new(Oidc::new(cfg).unwrap())),
+        oidc: Some(Arc::new({
+            let mut o = Oidc::new(cfg).unwrap();
+            o.min_refresh = min_refresh;
+            o
+        })),
     };
     let ctl = Arc::new(Controller::open(settings, ca, Store::open(&dir).unwrap()).unwrap());
     let (chain, key) = ctl.ca.issue_server(&[]).unwrap();
@@ -324,6 +370,18 @@ impl Env {
         assert_eq!(r.status(), S::SEE_OTHER);
         let loc = r.headers()["location"].to_str().unwrap().to_owned();
         (loc, cookie_value(&cookies(&r), crate::session::COOKIE))
+    }
+
+    /// The provider calls the back-channel logout endpoint.
+    async fn backchannel(&self, token: &str) -> (S, Value) {
+        let r = self
+            .http
+            .post(format!("{}{BACKCHANNEL_PATH}", self.base))
+            .form(&[("logout_token", token)])
+            .send()
+            .await
+            .unwrap();
+        (r.status(), r.json().await.unwrap_or(Value::Null))
     }
 
     async fn get(&self, path: &str, cookie: &str) -> (S, Value) {
@@ -682,4 +740,239 @@ fn config_validation() {
     )
     .is_err());
     assert!(toml::from_str::<OidcConfig>("issuer = \"https://a\"\nclient_id = \"x\"\nredirect_url = \"https://h/api/v1/oidc/callback\"\ntypo = 1").is_err());
+}
+
+#[tokio::test]
+async fn backchannel_logout_ends_sessions() {
+    let e = env("bcl", |_| {}).await;
+    let user = |sub: &str, sid: &str| json!({ "sub": sub, "sid": sid, "preferred_username": sub, "groups": ["noc"] });
+    let (_, a1) = e.login(user("alice", "s1")).await;
+    let (_, a2) = e.login(user("alice", "s2")).await;
+    let (_, b1) = e.login(user("bob", "s3")).await;
+    let (a1, a2, b1) = (a1.unwrap(), a2.unwrap(), b1.unwrap());
+    files::create_user(&e.dir, "local", Role::Admin, "correct horse battery").unwrap();
+    let r = e
+        .http
+        .post(format!("{}/api/v1/session", e.base))
+        .json(&json!({ "username": "local", "password": "correct horse battery" }))
+        .send()
+        .await
+        .unwrap();
+    let local = cookie_value(&cookies(&r), crate::session::COOKIE).unwrap();
+    let alive = |c: &str| {
+        let c = c.to_owned();
+        let e = &e;
+        async move { e.get("/api/v1/whoami", &c).await.0 == S::OK }
+    };
+
+    // logout of one provider session (sid): only that browser session ends
+    let t = e.mock.logout_token(json!({ "sid": "s1" }), None);
+    assert_eq!(e.backchannel(&t).await.0, S::OK);
+    assert!(!alive(&a1).await && alive(&a2).await && alive(&b1).await);
+    // replay
+    let (st, v) = e.backchannel(&t).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (S::BAD_REQUEST, Some("invalid_request"))
+    );
+
+    // all sessions of a subject (e.g. user disabled at the provider)
+    assert_eq!(
+        e.backchannel(&e.mock.logout_token(json!({ "sub": "alice" }), None))
+            .await
+            .0,
+        S::OK
+    );
+    assert!(!alive(&a2).await && alive(&b1).await && alive(&local).await);
+    // nothing matching is still a success
+    assert_eq!(
+        e.backchannel(&e.mock.logout_token(json!({ "sub": "nobody" }), None))
+            .await
+            .0,
+        S::OK
+    );
+
+    let audit = e.ctl.audit_log(20, u64::MAX).unwrap();
+    let bcl: Vec<_> = audit
+        .iter()
+        .filter(|a| a.action == "session.backchannel_logout")
+        .map(|a| {
+            (
+                a.actor.as_str(),
+                a.details["sessions_ended"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        bcl,
+        [
+            ("oidc-provider", 0),
+            ("oidc-provider", 1),
+            ("oidc-provider", 1)
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&e.dir);
+}
+
+#[tokio::test]
+async fn backchannel_logout_rejects_bad_tokens() {
+    let e = env("bclbad", |_| {}).await;
+    let (_, bob) = e
+        .login(json!({ "sub": "bob", "sid": "s9", "preferred_username": "bob", "groups": ["noc"] }))
+        .await;
+    let bob = bob.unwrap();
+    let m = &e.mock;
+    let now = chrono::Utc::now().timestamp();
+    let target = json!({ "sub": "bob" });
+    let with = |extra: Value| {
+        let mut v = target.clone();
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    let unsigned = {
+        let t = m.logout_token(target.clone(), Some(json!({ "alg": "none" })));
+        format!("{}.", t.rsplit_once('.').unwrap().0)
+    };
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "audience",
+            m.logout_token(with(json!({ "aud": "other-client" })), None),
+        ),
+        (
+            "issuer",
+            m.logout_token(with(json!({ "iss": "https://evil.example" })), None),
+        ),
+        (
+            "nonce (an ID token)",
+            m.logout_token(with(json!({ "nonce": "n" })), None),
+        ),
+        (
+            "no events",
+            m.logout_token(with(json!({ "events": null })), None),
+        ),
+        (
+            "other event",
+            m.logout_token(with(json!({ "events": { "urn:other": {} } })), None),
+        ),
+        (
+            "old",
+            m.logout_token(with(json!({ "iat": now - 3600 })), None),
+        ),
+        (
+            "future",
+            m.logout_token(with(json!({ "iat": now + 3600 })), None),
+        ),
+        (
+            "expired",
+            m.logout_token(with(json!({ "exp": now - 600 })), None),
+        ),
+        ("no jti", m.logout_token(with(json!({ "jti": null })), None)),
+        ("no sub or sid", m.logout_token(json!({}), None)),
+        ("alg none", unsigned),
+        (
+            "HS256",
+            m.logout_token(target.clone(), Some(json!({ "alg": "HS256", "kid": "k1" }))),
+        ),
+        (
+            "typ",
+            m.logout_token(
+                target.clone(),
+                Some(json!({ "alg": "ES256", "kid": "k1", "typ": "at+jwt" })),
+            ),
+        ),
+        (
+            "crit",
+            m.logout_token(
+                target.clone(),
+                Some(json!({ "alg": "ES256", "kid": "k1", "crit": ["x"] })),
+            ),
+        ),
+        ("garbage", "a.b.c".into()),
+        ("JWE", "a.b.c.d.e".into()),
+    ];
+    for (what, t) in cases {
+        assert_eq!(e.backchannel(&t).await.0, S::BAD_REQUEST, "{what}");
+    }
+    // tampered payload (signature over different claims)
+    let t = m.logout_token(json!({ "sub": "alice" }), None);
+    let (head, rest) = t.split_once('.').unwrap();
+    let (_, sig) = rest.split_once('.').unwrap();
+    let forged_payload = b64(
+        json!({ "iss": m.base, "aud": CLIENT_ID, "iat": now, "jti": "x",
+        "events": { "http://schemas.openid.net/event/backchannel-logout": {} }, "sub": "bob" })
+        .to_string()
+        .as_bytes(),
+    );
+    assert_eq!(
+        e.backchannel(&format!("{head}.{forged_payload}.{sig}"))
+            .await
+            .0,
+        S::BAD_REQUEST,
+        "tampered"
+    );
+    // signed by a key the provider does not publish
+    let real = std::mem::replace(&mut *m.key.lock().unwrap(), new_key());
+    assert_eq!(
+        e.backchannel(&m.logout_token(target.clone(), None)).await.0,
+        S::BAD_REQUEST,
+        "foreign key"
+    );
+    *m.key.lock().unwrap() = real;
+    // the ID token-shaped JSON body is not a form
+    let r = e
+        .http
+        .post(format!("{}{BACKCHANNEL_PATH}", e.base))
+        .json(&json!({ "logout_token": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error());
+
+    assert_eq!(
+        e.get("/api/v1/whoami", &bob).await.0,
+        S::OK,
+        "bob survived all of that"
+    );
+
+    // key rotation at the provider: the new key (new kid) is fetched
+    let k = new_key();
+    *m.jwks_key.lock().unwrap() = k.public_key().as_ref().to_vec();
+    *m.key.lock().unwrap() = k;
+    assert_eq!(
+        e.backchannel(&m.logout_token(target.clone(), None)).await.0,
+        S::OK
+    );
+    assert_eq!(e.get("/api/v1/whoami", &bob).await.0, S::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(&e.dir);
+}
+
+#[tokio::test]
+async fn junk_tokens_do_not_hammer_the_provider() {
+    // production throttle: at most one metadata fetch per minute on request
+    let e = env_with("throttle", |_| {}, MIN_REFRESH).await;
+    let m = &e.mock;
+    let forged = |i: u8| {
+        let real = std::mem::replace(&mut *m.key.lock().unwrap(), new_key());
+        let t = m.logout_token(json!({ "sub": format!("x{i}") }), None);
+        *m.key.lock().unwrap() = real;
+        t
+    };
+    for i in 0..20 {
+        assert_eq!(e.backchannel(&forged(i)).await.0, S::BAD_REQUEST);
+    }
+    assert_eq!(
+        *m.discoveries.lock().unwrap(),
+        1,
+        "only the initial discovery"
+    );
+    // valid tokens still work
+    assert_eq!(
+        e.backchannel(&m.logout_token(json!({ "sub": "y" }), None))
+            .await
+            .0,
+        S::OK
+    );
+    let _ = std::fs::remove_dir_all(&e.dir);
 }

@@ -39,8 +39,13 @@ const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 pub enum Kind {
     /// Local user; the user's `password_changed_at` at login.
     Password { password_changed_at: DateTime<Utc> },
-    /// OpenID Connect; role as mapped at login.
-    Oidc { role: Role },
+    /// OpenID Connect; role as mapped at login; subject and provider
+    /// session id for back-channel logout.
+    Oidc {
+        role: Role,
+        subject: String,
+        sid: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +193,30 @@ impl Sessions {
         Self::lock(&self.sessions).remove(&key(secret));
     }
 
+    /// Back-channel logout: ends the OIDC sessions with this provider
+    /// session id (if given) or else all of this subject. Returns how many.
+    pub fn end_oidc(&self, subject: Option<&str>, sid: Option<&str>) -> usize {
+        let mut map = Self::lock(&self.sessions);
+        let before = map.len();
+        map.retain(|_, s| match &s.kind {
+            Kind::Oidc {
+                subject: sub,
+                sid: ssid,
+                ..
+            } => {
+                let hit = match (sid, subject) {
+                    (Some(want), Some(who)) => ssid.as_deref() == Some(want) && sub == who,
+                    (Some(want), None) => ssid.as_deref() == Some(want),
+                    (None, Some(who)) => sub == who,
+                    (None, None) => false,
+                };
+                !hit
+            }
+            Kind::Password { .. } => true,
+        });
+        before - map.len()
+    }
+
     /// Drops expired sessions and old failure counters.
     pub fn prune(&self) {
         let now = Instant::now();
@@ -248,6 +277,32 @@ mod tests {
         assert!(s.get(&secret).is_none());
         assert!(s.get(&other).is_some());
         assert_eq!(s.count(), 1);
+    }
+
+    #[test]
+    fn backchannel_matching() {
+        let s = Sessions::default();
+        let oidc = |sub: &str, sid: Option<&str>| Kind::Oidc {
+            role: Role::Viewer,
+            subject: sub.into(),
+            sid: sid.map(Into::into),
+        };
+        let (a1, _) = s.create("alice", oidc("u-a", Some("s1")), MAX_AGE);
+        let (a2, _) = s.create("alice", oidc("u-a", Some("s2")), MAX_AGE);
+        let (a3, _) = s.create("alice", oidc("u-a", None), MAX_AGE);
+        let (b, _) = s.create("bob", oidc("u-b", Some("s1")), MAX_AGE);
+        let (local, _) = s.create("u-a", pw(), MAX_AGE);
+        assert_eq!(s.end_oidc(Some("u-a"), Some("s1")), 1);
+        assert!(
+            s.get(&a1).is_none() && s.get(&b).is_some(),
+            "sid of another subject"
+        );
+        assert_eq!(s.end_oidc(None, Some("s2")), 1);
+        assert!(s.get(&a2).is_none());
+        assert_eq!(s.end_oidc(Some("u-a"), None), 1);
+        assert!(s.get(&a3).is_none());
+        assert!(s.get(&local).is_some(), "local sessions are never touched");
+        assert_eq!(s.end_oidc(None, None), 0);
     }
 
     #[test]

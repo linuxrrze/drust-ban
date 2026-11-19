@@ -517,13 +517,27 @@ df2bctl config check | reload
   8 h; idle limit 4 h), audited with method, issuer, subject and role.
   Logout returns the provider's `end_session_endpoint` (RP-initiated logout)
   for the UI to open. `disable_password_login` leaves only SSO in the UI.
+- **Back-channel logout** (OIDC Back-Channel Logout 1.0): the provider
+  POSTs `logout_token` to `/api/v1/oidc/backchannel-logout` when a user logs
+  out there or is disabled. The token's signature is checked with the
+  provider's JWKS (asymmetric algorithms only; keys fetched again once on
+  failure, at most once a minute, so junk tokens cannot make the controller
+  hammer the provider); then `iss`, `aud`, `iat` (at most 10 min old, 1 min
+  clock leeway), `exp` if present, the back-channel `events` claim, no
+  `nonce` (so an ID token is never accepted), `sub` or `sid`, `typ` if
+  present, and `jti` (each accepted once). Sessions store the subject and
+  the ID token's `sid`: a token with `sid` ends that provider session's
+  browser sessions, one with only `sub` all of the subject's. Local sessions
+  are never affected. Answer 200 (also when nothing matched) or 400
+  `invalid_request`; audited as actor `oidc-provider` (a reserved name). Open
+  SSE streams notice within 30 s and the UI returns to the login page.
   Failures send the browser to `/#/login-error/<code>` (expired, cancelled,
   denied, conflict, unavailable, failed); details go to the log only.
 - Dependencies pinned to exact versions at least two weeks old; `npm` runs
   with `ignore-scripts`. The built UI is ~90 KB of JavaScript (31 KB gzip).
-- Not yet: back-channel logout and ending OIDC sessions from the
-  controller (removal at the provider takes effect at the next login), user
-  management and own password change in the UI,
+- Not yet: ending sessions from the controller itself (listing and killing
+  sessions), front-channel logout, user management and own password change
+  in the UI,
   observation timelines and sample log lines (needs observation reporting),
   ASN/GeoIP, "allow for X" after unban, policies/jails and allowlist editing,
   changing an agent's group.

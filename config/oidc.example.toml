@@ -4,6 +4,8 @@
 # Register a confidential client ("web application") at the provider with
 #   redirect URI:      https://<controller>:7444/api/v1/oidc/callback
 #   post-logout URI:   https://<controller>:7444/            (optional)
+#   back-channel logout URL (optional, recommended; the provider must be
+#   able to reach it):  https://<controller>:7444/api/v1/oidc/backchannel-logout
 #   grant type:        authorization code (PKCE S256 is always used)
 # and make the provider put the user's groups into the ID token or userinfo.
 
