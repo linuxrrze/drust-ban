@@ -21,6 +21,7 @@ humantime-serde.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 ipnet.workspace = true
+libc.workspace = true
 openidconnect.workspace = true
 reqwest.workspace = true
 redb.workspace = true

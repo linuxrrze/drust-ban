@@ -2706,7 +2706,13 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         "redaction_version": ctl.redaction_version(),
         "sessions": ctl.sessions.count(),
         "geoip": ctl.geo.databases(),
-        "actions": ctl.actions.snapshot(),
+        // error texts (a program's stderr) are for admins
+        "actions": ctl.actions.snapshot().into_iter().map(|mut a| {
+            if caller.role < Role::Admin {
+                a.last_error = None;
+            }
+            a
+        }).collect::<Vec<_>>(),
     })))
 }
 

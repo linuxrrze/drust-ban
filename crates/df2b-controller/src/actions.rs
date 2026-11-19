@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -307,6 +308,12 @@ impl ActionsConfig {
             if w.secret.is_some() && w.secret_file.is_some() {
                 bail!("webhook {}: set secret or secret_file, not both", w.name);
             }
+            if w.secret.as_ref().is_some_and(|s| s.len() < 16) {
+                bail!(
+                    "webhook {}: the secret must have at least 16 characters",
+                    w.name
+                );
+            }
             for (k, v) in &w.headers {
                 reqwest::header::HeaderName::from_bytes(k.as_bytes())
                     .with_context(|| format!("webhook {}: header {k:?}", w.name))?;
@@ -353,6 +360,9 @@ impl Webhook {
             ),
             _ => None,
         };
+        if secret.as_ref().is_some_and(|s| s.len() < 16) {
+            bail!("the secret must have at least 16 characters");
+        }
         let trust = match &c.ca_file {
             Some(p) => df2b_tls::transport::Trust::CaCerts(df2b_tls::pki::certs_from_pem(
                 &std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
@@ -396,7 +406,13 @@ impl Webhook {
         if let Some(secret) = &self.secret {
             req = req.header("x-df2b-signature", signature(secret, &ts, &body));
         }
-        let r = req.body(body).send().await?;
+        // reqwest errors name the URL, and many webhook URLs are secrets
+        // (tokens in the path or query): never let it reach logs or the API
+        let r = req
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.without_url()))?;
         if !r.status().is_success() {
             bail!("HTTP {}", r.status());
         }
@@ -434,6 +450,9 @@ impl Exec {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            // its own process group: on timeout the whole group is killed,
+            // including what it started
+            .process_group(0)
             .kill_on_drop(true);
         if let Event::Decision {
             decision,
@@ -456,17 +475,26 @@ impl Exec {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("starting {}", self.command[0]))?;
+        let pgid = child.id();
         let body = serde_json::to_vec(&e.body())?;
         let mut stdin = child.stdin.take().expect("piped");
-        let run = async {
-            // a program that does not read stdin must not block us
+        // written while its output is read: a program that writes much to
+        // stderr before reading stdin must not deadlock
+        let writer = tokio::spawn(async move {
             let _ = stdin.write_all(&body).await;
-            drop(stdin);
-            child.wait_with_output().await
+        });
+        let res = tokio::time::timeout(self.timeout, child.wait_with_output()).await;
+        writer.abort();
+        let out = match res {
+            Ok(out) => out?,
+            Err(_) => {
+                if let Some(pgid) = pgid.and_then(|p| i32::try_from(p).ok()) {
+                    // SAFETY: plain syscall; a negative pid is the group
+                    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                }
+                bail!("timed out after {:?}", self.timeout);
+            }
         };
-        let out = tokio::time::timeout(self.timeout, run)
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out after {:?}", self.timeout))??;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             bail!(
@@ -492,6 +520,8 @@ struct Action {
     sync_interval: Option<Duration>,
     /// exec: an event was dropped, send a sync when possible
     needs_sync: bool,
+    /// a sync is queued and not yet handled (no second one meanwhile)
+    sync_waiting: Arc<AtomicBool>,
 }
 
 /// Starts the actions. Returns once the workers run.
@@ -535,13 +565,22 @@ pub fn spawn(ctl: Arc<Controller>, cfg: ActionsConfig) -> anyhow::Result<()> {
     for (i, (name, kind, filter, sync, sink)) in sinks.into_iter().enumerate() {
         let (tx, rx) = mpsc::channel(QUEUE);
         info!(action = %name, kind, "external action configured");
-        tokio::spawn(worker(ctl.clone(), i, name.clone(), sink, rx));
+        let sync_waiting = Arc::new(AtomicBool::new(false));
+        tokio::spawn(worker(
+            ctl.clone(),
+            i,
+            name.clone(),
+            sink,
+            rx,
+            sync_waiting.clone(),
+        ));
         actions.push(Action {
             name,
             filter,
             tx,
             sync_interval: sync,
             needs_sync: true, // exec: start with a full sync
+            sync_waiting,
         });
     }
     tokio::spawn(dispatch(ctl, actions));
@@ -554,8 +593,13 @@ async fn worker(
     name: String,
     sink: Sink,
     mut rx: mpsc::Receiver<Event>,
+    sync_waiting: Arc<AtomicBool>,
 ) {
     while let Some(e) = rx.recv().await {
+        if matches!(e, Event::Sync(_)) {
+            // taken: the next one may be queued (it carries newer state)
+            sync_waiting.store(false, Ordering::Release);
+        }
         let mut result = Ok(());
         for (attempt, wait) in std::iter::once(Duration::ZERO).chain(RETRIES).enumerate() {
             tokio::time::sleep(wait).await;
@@ -588,15 +632,35 @@ async fn worker(
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Due(std::cmp::Reverse<DateTime<Utc>>, Uuid);
 
+/// Active bans by target, as the dispatcher saw them come and go.
+type Live = std::collections::HashMap<ipnet::IpNet, Vec<Arc<Decision>>>;
+
+fn forget(live: &mut Live, target: &ipnet::IpNet, id: Uuid) {
+    if let Some(v) = live.get_mut(target) {
+        v.retain(|d| d.id != id);
+        if v.is_empty() {
+            live.remove(target);
+        }
+    }
+}
+
 async fn dispatch(ctl: Arc<Controller>, mut actions: Vec<Action>) {
     let mut events = ctl.events();
     let mut due: BinaryHeap<Due> = BinaryHeap::new();
     let mut pending: std::collections::HashMap<Uuid, Arc<Decision>> = Default::default();
+    // cheap "still banned?" per event: no scan of all active bans
+    let mut live: Live = Default::default();
+    let now = Utc::now();
     for d in ctl.active_decisions() {
+        if !d.is_active(now) {
+            continue;
+        }
+        let d = Arc::new(d);
         if let Some(t) = d.expires_at {
             due.push(Due(std::cmp::Reverse(t), d.id));
-            pending.insert(d.id, Arc::new(d));
+            pending.insert(d.id, d.clone());
         }
+        live.entry(d.target).or_default().push(d);
     }
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last_sync: Vec<tokio::time::Instant> = vec![tokio::time::Instant::now(); actions.len()];
@@ -604,25 +668,32 @@ async fn dispatch(ctl: Arc<Controller>, mut actions: Vec<Action>) {
         tokio::select! {
             r = events.recv() => match r {
                 Ok(d) => {
-                    let (kind, still) = match d.kind {
+                    let kind = match d.kind {
                         DecisionKind::Ban => {
                             if let Some(t) = d.expires_at {
                                 due.push(Due(std::cmp::Reverse(t), d.id));
                                 pending.insert(d.id, d.clone());
                             }
-                            (EventKind::Ban, true)
+                            live.entry(d.target).or_default().push(d.clone());
+                            EventKind::Ban
                         }
                         DecisionKind::Unban { revokes } => {
                             pending.remove(&revokes);
-                            (EventKind::Unban, still_banned(&ctl, &d.target))
+                            forget(&mut live, &d.target, revokes);
+                            EventKind::Unban
                         }
                         DecisionKind::Allow => continue,
                     };
-                    let e = Event::Decision { kind, decision: d.clone(), still_banned: still };
-                    deliver(&mut actions, &ctl, &e, &d, kind);
+                    deliver(&mut actions, &ctl, &live, &d, kind);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(missed = n, "external actions fell behind; exec actions get a sync");
+                    // the index may have missed changes too
+                    let now = Utc::now();
+                    live.clear();
+                    for d in ctl.active_decisions().into_iter().filter(|d| d.is_active(now)) {
+                        live.entry(d.target).or_default().push(Arc::new(d));
+                    }
                     for a in actions.iter_mut() {
                         a.needs_sync = a.sync_interval.is_some();
                     }
@@ -635,41 +706,26 @@ async fn dispatch(ctl: Arc<Controller>, mut actions: Vec<Action>) {
                     let Due(_, id) = due.pop().expect("peeked");
                     // unbanned meanwhile: no expiry
                     let Some(d) = pending.remove(&id) else { continue };
-                    let e = Event::Decision {
-                        kind: EventKind::Expire,
-                        decision: d.clone(),
-                        still_banned: still_banned(&ctl, &d.target),
-                    };
-                    deliver(&mut actions, &ctl, &e, &d, EventKind::Expire);
+                    forget(&mut live, &d.target, d.id);
+                    deliver(&mut actions, &ctl, &live, &d, EventKind::Expire);
                 }
-                // periodic and catch-up syncs (exec actions)
-                let mut bans: Option<Arc<Vec<Decision>>> = None;
+                // periodic and catch-up syncs (exec actions), at most one
+                // waiting per action
                 for (i, a) in actions.iter_mut().enumerate() {
                     let Some(every) = a.sync_interval else { continue };
                     let periodic = !every.is_zero() && last_sync[i].elapsed() >= every;
-                    if !(a.needs_sync || periodic) {
+                    if !(a.needs_sync || periodic) || a.sync_waiting.load(Ordering::Acquire) {
                         continue;
                     }
-                    // all active bans once per tick, then per action's filter
-                    let list = bans
-                        .get_or_insert_with(|| {
-                            let now = Utc::now();
-                            let mut v: Vec<Decision> = ctl
-                                .active_decisions()
-                                .into_iter()
-                                .filter(|d| d.is_active(now))
-                                .collect();
-                            v.sort_by_key(|d| d.seq);
-                            Arc::new(v)
-                        })
-                        .clone();
-                    let list = Arc::new(
-                        list.iter()
-                            .filter(|d| a.filter.wants(EventKind::Ban, d))
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    );
-                    if a.tx.try_send(Event::Sync(list)).is_ok() {
+                    let mut list: Vec<Decision> = live
+                        .values()
+                        .flatten()
+                        .filter(|d| d.is_active(now) && a.filter.wants(EventKind::Ban, d))
+                        .map(|d| (**d).clone())
+                        .collect();
+                    list.sort_by_key(|d| d.seq);
+                    if a.tx.try_send(Event::Sync(Arc::new(list))).is_ok() {
+                        a.sync_waiting.store(true, Ordering::Release);
                         a.needs_sync = false;
                         last_sync[i] = tokio::time::Instant::now();
                     }
@@ -679,20 +735,32 @@ async fn dispatch(ctl: Arc<Controller>, mut actions: Vec<Action>) {
     }
 }
 
-/// Whether an active ban still covers exactly this target.
-fn still_banned(ctl: &Controller, target: &ipnet::IpNet) -> bool {
+/// Queues the event for every action that wants it. `still_banned` is per
+/// action: whether another active ban for the same target remains that
+/// this action would act on (scope, origin filters).
+fn deliver(
+    actions: &mut [Action],
+    ctl: &Controller,
+    live: &Live,
+    d: &Arc<Decision>,
+    kind: EventKind,
+) {
     let now = Utc::now();
-    ctl.active_decisions()
-        .iter()
-        .any(|d| d.target == *target && d.is_active(now))
-}
-
-fn deliver(actions: &mut [Action], ctl: &Controller, e: &Event, d: &Decision, kind: EventKind) {
     for (i, a) in actions.iter_mut().enumerate() {
         if !a.filter.wants(kind, d) {
             continue;
         }
-        if a.tx.try_send(e.clone()).is_err() {
+        let still_banned = kind == EventKind::Ban
+            || live.get(&d.target).is_some_and(|v| {
+                v.iter()
+                    .any(|x| x.id != d.id && x.is_active(now) && a.filter.wants(EventKind::Ban, x))
+            });
+        let e = Event::Decision {
+            kind,
+            decision: d.clone(),
+            still_banned,
+        };
+        if a.tx.try_send(e).is_err() {
             if a.sync_interval.is_some() {
                 a.needs_sync = true;
             }
@@ -753,7 +821,7 @@ mod tests {
             [[webhook]]
             name = "chat"
             url = "https://hooks.example/x"
-            secret = "s"
+            secret = "0123456789abcdef"
             headers = { authorization = "Bearer x" }
             [[exec]]
             name = "rtbh"
@@ -765,6 +833,10 @@ mod tests {
             r#"[[webhook]]
                name = "a"
                url = "http://hooks.example/x""#,
+            r#"[[webhook]]
+               name = "a"
+               url = "https://hooks.example/x"
+               secret = "short""#,
             r#"[[webhook]]
                name = "a"
                url = "file:///etc/passwd"
@@ -867,7 +939,7 @@ mod tests {
             name = "hook"
             url = "{url}"
             allow_http = true
-            secret = "s3cret"
+            secret = "s3cret-s3cret-s3cret"
             [[exec]]
             name = "script"
             command = ["{}"]
@@ -910,7 +982,7 @@ mod tests {
                 let ts = h["x-df2b-timestamp"].to_str().unwrap();
                 assert_eq!(
                     h["x-df2b-signature"].to_str().unwrap(),
-                    signature(b"s3cret", ts, b)
+                    signature(b"s3cret-s3cret-s3cret", ts, b)
                 );
                 assert_eq!(
                     h["x-df2b-event"].to_str().unwrap(),
@@ -952,6 +1024,82 @@ mod tests {
         );
         let stats = ctl.actions.snapshot();
         assert_eq!((stats[0].delivered, stats[1].delivered), (4, 5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: reqwest errors carried the URL (often a secret), which
+    /// went into the logs and the status API.
+    #[tokio::test]
+    async fn webhook_errors_do_not_show_the_url() {
+        let cfg: ActionsConfig = toml::from_str(
+            r#"
+            [[webhook]]
+            name = "hook"
+            url = "http://127.0.0.1:9/services/T000/SECRETTOKEN?key=abc"
+            allow_http = true
+            timeout = "1s"
+            "#,
+        )
+        .unwrap();
+        let w = Webhook::new(&cfg.webhook[0]).unwrap();
+        let e = w.send(&Event::Sync(Arc::new(vec![]))).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(
+            !msg.contains("SECRETTOKEN") && !msg.contains("key=abc"),
+            "{msg}"
+        );
+    }
+
+    /// Regression: still_banned counted bans of any scope, so an action
+    /// for global bans kept a route while only a group ban remained.
+    #[test]
+    fn still_banned_follows_the_action_filter() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut actions = vec![Action {
+            name: "global".into(),
+            filter: Filter::new(&all_events(), &["global".into()], &[]).unwrap(),
+            tx,
+            sync_interval: None,
+            needs_sync: false,
+            sync_waiting: Arc::default(),
+        }];
+        let global = Arc::new(decision(Scope::Global, Origin::User("ada".into())));
+        let group = Arc::new(decision(
+            Scope::Group("web".into()),
+            Origin::User("ada".into()),
+        ));
+        let mut live: Live = Default::default();
+        live.entry(group.target).or_default().push(group.clone());
+        let dir = std::env::temp_dir().join(format!("df2b-actions-still-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = Controller::open(
+            crate::state::Settings {
+                state_dir: dir.clone(),
+                cert_lifetime: Duration::from_secs(3600),
+                propagate: crate::state::Propagate::Global,
+                allowlist: df2b_core::Allowlist::default(),
+                oidc: None,
+                https_internal_ca: true,
+            },
+            df2b_tls::pki::Ca::generate("t").unwrap(),
+            crate::store::Store::open(&dir).unwrap(),
+        )
+        .unwrap();
+        // the global ban expired; only a group ban remains
+        deliver(&mut actions, &ctl, &live, &global, EventKind::Expire);
+        let Event::Decision { still_banned, .. } = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert!(!still_banned, "the group ban is not this action's business");
+        // another global ban remains
+        let other = Arc::new(decision(Scope::Global, Origin::User("ada".into())));
+        live.entry(other.target).or_default().push(other);
+        deliver(&mut actions, &ctl, &live, &global, EventKind::Expire);
+        let Event::Decision { still_banned, .. } = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert!(still_banned);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

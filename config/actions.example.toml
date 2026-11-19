@@ -28,5 +28,8 @@ origins = ["correlation", "user"]
 name = "rtbh"
 command = ["/usr/local/bin/rtbh-gobgp.sh", "/var/lib/df2b-controller/rtbh.announced", "192.0.2.1"]
 scopes = ["global"]
+# not agents' own bans: one compromised host must not blackhole anything
+# network-wide; correlation (several agents) and people decide
+origins = ["correlation", "user"]
 sync_interval = "1h"
 timeout = "10s"
