@@ -108,6 +108,11 @@ fn valid_path(p: &str) -> bool {
             .all(|c| !matches!(c, std::path::Component::ParentDir))
 }
 
+/// A path with `*`, `?` or `[` is a glob (agents expand it); it must parse.
+fn valid_glob(p: &str) -> bool {
+    !p.contains(['*', '?', '[']) || glob::Pattern::new(p).is_ok()
+}
+
 /// `FIELD=value` (journalctl syntax) or "+" (OR).
 fn valid_match(m: &str) -> bool {
     m == "+"
@@ -141,6 +146,9 @@ pub fn validate_def(d: &JailDef) -> Result<(), String> {
                 }
                 if let Some(p) = paths.iter().find(|p| !valid_path(p)) {
                     return Err(format!("invalid path {p:?} (absolute, without \"..\")"));
+                }
+                if let Some(p) = paths.iter().find(|p| !valid_glob(p)) {
+                    return Err(format!("invalid glob pattern {p:?}"));
                 }
             }
             SourceDef::Journald { matches, start } => {
@@ -308,6 +316,12 @@ failregex = ['Failed password for .* from <HOST>']
     #[test]
     fn definitions_are_validated() {
         assert!(validate_def(&def("sshd", None, "sshd")).is_ok());
+        let mut globbed = def("sshd", None, "sshd");
+        globbed.sources = vec![SourceDef::File {
+            paths: vec!["/var/log/nginx/*.access.log".into()],
+            start_at_end: true,
+        }];
+        assert!(validate_def(&globbed).is_ok());
         let with = |f: fn(&mut JailDef)| {
             let mut d = def("sshd", None, "sshd");
             f(&mut d);
@@ -319,6 +333,15 @@ failregex = ['Failed password for .* from <HOST>']
                 with(|d| {
                     d.sources = vec![SourceDef::File {
                         paths: vec!["auth.log".into()],
+                        start_at_end: false,
+                    }]
+                }),
+            ),
+            (
+                "bad glob",
+                with(|d| {
+                    d.sources = vec![SourceDef::File {
+                        paths: vec!["/var/log/[nginx/*.log".into()],
                         start_at_end: false,
                     }]
                 }),

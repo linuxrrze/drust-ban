@@ -1,25 +1,55 @@
-//! Polling file tailer with rotation and truncation detection.
+//! File sources: a polling tailer per file, and glob paths on top.
 //!
-//! TODO (milestone 1):
-//! - inotify-driven wakeups instead of polling,
-//! - glob paths,
-//! - drain the remainder of a rotated-away file before switching inodes,
-//! - per-source timestamp extraction.
+//! [`FileTailer`] follows one path. It keeps the file it reads open, so a
+//! rotation by rename + create does not lose the lines written to the old
+//! file after the last poll: it reads the old file to its end before
+//! switching to the new one, and waits up to the rotation grace period while
+//! the new file is still empty (the writer may not have reopened its log
+//! yet). Truncation (copytruncate) restarts at 0. Resuming after a restart
+//! finds a file rotated while the agent was down in the same directory (by
+//! device and inode, whatever it is called now) and reads its remainder first.
+//!
+//! [`FileSource`] takes the configured paths; those with glob characters
+//! (`*`, `?`, `[`) are expanded again periodically, and new matches get their
+//! own tailer (from the start: they are new files). The tailer of a matched
+//! file ends once the file is gone and read to its end.
+//!
+//! TODO: inotify-driven wakeups instead of polling; per-source timestamps.
 
+use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tokio::task::JoinSet;
+use tracing::{debug, error, info, warn};
 
 use crate::{LogLine, Position, SourceBatch, BATCH_MAX, MAX_LINE};
 
 /// Maximum bytes read per poll iteration (bounds memory per tailer).
 const MAX_READ: u64 = 4 * 1024 * 1024;
+/// How long a rotated-away file is kept open while its replacement is empty.
+const ROTATION_GRACE: Duration = Duration::from_secs(30);
+/// Files followed per source at most (glob matches beyond are ignored).
+pub const MAX_FILES: usize = 1024;
+
+/// True if `path` contains glob characters and is expanded by [`FileSource`].
+pub fn is_glob(path: &Path) -> bool {
+    path.to_string_lossy().contains(['*', '?', '['])
+}
+
+/// Checks a configured path: a glob must be a valid pattern.
+pub fn check_path(path: &Path) -> anyhow::Result<()> {
+    if is_glob(path) {
+        glob::Pattern::new(&path.to_string_lossy())
+            .map_err(|e| anyhow::anyhow!("{}: invalid glob: {e}", path.display()))?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct FileTailer {
@@ -27,6 +57,8 @@ pub struct FileTailer {
     path: PathBuf,
     start_at_end: bool,
     poll: Duration,
+    grace: Duration,
+    exit_when_gone: bool,
     resume: Option<FileId>,
     resume_offset: u64,
 }
@@ -37,6 +69,23 @@ struct FileId {
     ino: u64,
 }
 
+impl FileId {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
+/// The file being read, kept open across rotations.
+struct Open {
+    id: FileId,
+    file: tokio::fs::File,
+    /// Next byte to read; bytes of an incomplete last line precede it.
+    offset: u64,
+}
+
 impl FileTailer {
     pub fn new(source: Arc<str>, path: PathBuf, start_at_end: bool) -> Self {
         Self {
@@ -44,6 +93,8 @@ impl FileTailer {
             path,
             start_at_end,
             poll: Duration::from_millis(250),
+            grace: ROTATION_GRACE,
+            exit_when_gone: false,
             resume: None,
             resume_offset: 0,
         }
@@ -53,8 +104,9 @@ impl FileTailer {
     ///
     /// If the file at `path` is still the same inode, reading continues at
     /// `offset` (or at 0 if it was truncated meanwhile). If it was replaced
-    /// (rotated while the agent was down), the new file is read from 0.
-    // TODO: also drain the rotated-away file (e.g. `<path>.1`) from `offset`.
+    /// (rotated while the agent was down), the old file is looked up in the
+    /// same directory and read from `offset` first; then the new file is
+    /// read from 0.
     pub fn with_position(mut self, dev: u64, ino: u64, offset: u64) -> Self {
         self.resume = Some(FileId { dev, ino });
         self.resume_offset = offset;
@@ -63,6 +115,19 @@ impl FileTailer {
 
     pub fn with_poll_interval(mut self, poll: Duration) -> Self {
         self.poll = poll;
+        self
+    }
+
+    /// How long a rotated-away file stays open while the new one is empty.
+    pub fn with_rotation_grace(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
+    }
+
+    /// End once the path is gone (after the grace period) and the last file
+    /// is read to its end, instead of waiting for it to come back.
+    pub fn exit_when_gone(mut self, exit: bool) -> Self {
+        self.exit_when_gone = exit;
         self
     }
 
@@ -90,97 +155,361 @@ impl FileTailer {
         .is_ok()
     }
 
-    /// Runs until the receiver is dropped.
+    fn line(&self, raw: &[u8]) -> LogLine {
+        LogLine {
+            source: self.source.clone(),
+            ts: None,
+            line: String::from_utf8_lossy(&raw[..raw.len().min(MAX_LINE)]).into_owned(),
+        }
+    }
+
+    /// Opens `path` if it is still the file `id`; the offset to read from.
+    async fn open_if(path: &Path, id: FileId, offset: u64) -> Option<Open> {
+        let file = tokio::fs::File::open(path).await.ok()?;
+        let meta = file.metadata().await.ok()?;
+        (FileId::of(&meta) == id).then(|| Open {
+            id,
+            file,
+            offset: if meta.len() < offset { 0 } else { offset },
+        })
+    }
+
+    /// The file to read next: on the first call the saved position (also a
+    /// file rotated away meanwhile), else the file now at `path`.
+    async fn open_next(&self, first: bool) -> Option<Open> {
+        if first {
+            if let Some(id) = self.resume {
+                if let Some(o) = Self::open_if(&self.path, id, self.resume_offset).await {
+                    return Some(o);
+                }
+                if let Some(old) = find_by_id(&self.path, id).await {
+                    if let Some(o) = Self::open_if(&old, id, self.resume_offset).await {
+                        info!(
+                            path = %self.path.display(), rotated = %old.display(),
+                            offset = o.offset, "file rotated while stopped, reading the rest first"
+                        );
+                        return Some(o);
+                    }
+                }
+            }
+        }
+        let file = match tokio::fs::File::open(&self.path).await {
+            Ok(f) => f,
+            Err(e) => {
+                debug!(path = %self.path.display(), error = %e, "file not available");
+                return None;
+            }
+        };
+        let meta = match file.metadata().await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(path = %self.path.display(), error = %e, "cannot stat file");
+                return None;
+            }
+        };
+        let offset = if first && self.resume.is_none() && self.start_at_end {
+            meta.len()
+        } else {
+            0
+        };
+        Some(Open {
+            id: FileId::of(&meta),
+            file,
+            offset,
+        })
+    }
+
+    /// Runs until the receiver is dropped (or, with [`Self::exit_when_gone`],
+    /// the file is gone).
     pub async fn run(self, tx: mpsc::Sender<SourceBatch>) -> anyhow::Result<()> {
         info!(source = %self.source, path = %self.path.display(), "tailing file");
-        let mut current: Option<(FileId, u64)> = self.resume.map(|id| (id, self.resume_offset));
+        let mut open: Option<Open> = None;
+        let mut first = true;
         // Bytes of an incomplete last line; they precede `offset` in the file.
         let mut pending: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut batch: Vec<LogLine> = Vec::new();
+        // Since when `path` is no longer the open file.
+        let mut rotated_since: Option<Instant> = None;
+        // Read the open file to its end once more, then switch.
+        let mut finishing = false;
 
         loop {
-            let meta = match tokio::fs::metadata(&self.path).await {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!(path = %self.path.display(), error = %e, "file not available");
-                    tokio::time::sleep(self.poll).await;
-                    continue;
-                }
-            };
-            let id = FileId {
-                dev: meta.dev(),
-                ino: meta.ino(),
-            };
-            let offset = match current {
-                Some((cur, off)) if cur == id => {
-                    if meta.len() < off {
-                        info!(path = %self.path.display(), "file truncated, restarting at 0");
-                        pending.clear();
-                        0
-                    } else {
-                        off
+            if tx.is_closed() {
+                return Ok(());
+            }
+            let Some(cur) = open.as_mut() else {
+                match self.open_next(first).await {
+                    Some(o) => {
+                        first = false;
+                        open = Some(o);
                     }
+                    None if self.exit_when_gone => return Ok(()),
+                    None => tokio::time::sleep(self.poll).await,
                 }
-                Some(_) => {
-                    info!(path = %self.path.display(), "file rotated, switching to new inode");
-                    pending.clear();
-                    0
-                }
-                None if self.start_at_end => meta.len(),
-                None => 0,
+                continue;
             };
 
-            if meta.len() == offset {
-                current = Some((id, offset));
-                tokio::time::sleep(self.poll).await;
+            let len = cur.file.metadata().await?.len();
+            if len < cur.offset {
+                info!(path = %self.path.display(), "file truncated, restarting at 0");
+                pending.clear();
+                cur.offset = 0;
+            }
+            let mut n = 0;
+            if len > cur.offset {
+                cur.file.seek(SeekFrom::Start(cur.offset)).await?;
+                let mut chunk = Vec::new();
+                n = (&mut cur.file)
+                    .take(MAX_READ)
+                    .read_to_end(&mut chunk)
+                    .await? as u64;
+                // file offset of pending[0]
+                let base = cur.offset - pending.len() as u64;
+                cur.offset += n;
+                pending.extend_from_slice(&chunk);
+                let mut start = 0;
+                for pos in memchr::memchr_iter(b'\n', &pending) {
+                    batch.push(self.line(&pending[start..pos]));
+                    start = pos + 1;
+                    if batch.len() >= BATCH_MAX
+                        && !self
+                            .send(&tx, &mut batch, cur.id, base + start as u64)
+                            .await
+                    {
+                        return Ok(()); // receiver gone: shutting down
+                    }
+                }
+                if !batch.is_empty()
+                    && !self
+                        .send(&tx, &mut batch, cur.id, base + start as u64)
+                        .await
+                {
+                    return Ok(());
+                }
+                pending.drain(..start);
+                if pending.len() > MAX_LINE {
+                    warn!(path = %self.path.display(), "discarding over-long partial line");
+                    pending.clear();
+                }
+            }
+            if n == MAX_READ {
+                continue; // more to read right away
+            }
+
+            if finishing {
+                // The rotated-away file is read to its end: nobody will
+                // complete its last line any more.
+                if !pending.is_empty() {
+                    batch.push(self.line(&pending));
+                    pending.clear();
+                    if !self.send(&tx, &mut batch, cur.id, cur.offset).await {
+                        return Ok(());
+                    }
+                }
+                open = None;
+                finishing = false;
+                rotated_since = None;
                 continue;
             }
 
-            let mut file = match tokio::fs::File::open(&self.path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!(path = %self.path.display(), error = %e, "cannot open file");
-                    tokio::time::sleep(self.poll).await;
-                    continue;
-                }
-            };
-            file.seek(SeekFrom::Start(offset)).await?;
-            let mut chunk = Vec::new();
-            let n = file.take(MAX_READ).read_to_end(&mut chunk).await? as u64;
-            current = Some((id, offset + n));
-
-            // file offset of pending[0]
-            let base = offset - pending.len() as u64;
-            pending.extend_from_slice(&chunk);
-            let mut start = 0;
-            for pos in memchr::memchr_iter(b'\n', &pending) {
-                let raw = &pending[start..pos.min(start + MAX_LINE)];
-                start = pos + 1;
-                batch.push(LogLine {
-                    source: self.source.clone(),
-                    ts: None,
-                    line: String::from_utf8_lossy(raw).into_owned(),
-                });
-                if batch.len() >= BATCH_MAX
-                    && !self.send(&tx, &mut batch, id, base + start as u64).await
-                {
-                    return Ok(()); // receiver gone: shutting down
+            // At the end of the open file: is `path` still this file?
+            match tokio::fs::metadata(&self.path).await {
+                Ok(m) if FileId::of(&m) == cur.id => rotated_since = None,
+                now => {
+                    let since = *rotated_since.get_or_insert_with(Instant::now);
+                    let replaced = now.as_ref().ok();
+                    let new_has_data = replaced.is_some_and(|m| m.len() > 0);
+                    let waited = since.elapsed() >= self.grace;
+                    if new_has_data || (waited && (replaced.is_some() || self.exit_when_gone)) {
+                        if replaced.is_some() {
+                            info!(path = %self.path.display(), "file rotated, switching to new inode");
+                        } else {
+                            info!(path = %self.path.display(), "file gone");
+                        }
+                        finishing = true;
+                        continue;
+                    }
                 }
             }
-            if !batch.is_empty() && !self.send(&tx, &mut batch, id, base + start as u64).await {
+            tokio::time::sleep(self.poll).await;
+        }
+    }
+}
+
+/// A file in the directory of `path` that is the file `id` (a rotated-away
+/// log under its new name).
+async fn find_by_id(path: &Path, id: FileId) -> Option<PathBuf> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    tokio::task::spawn_blocking(move || {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_file() && FileId::of(&meta) == id {
+                return Some(entry.path());
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// The configured paths of one file source, glob paths expanded.
+#[derive(Debug, Clone)]
+pub struct FileSource {
+    source: Arc<str>,
+    paths: Vec<PathBuf>,
+    start_at_end: bool,
+    positions: HashMap<PathBuf, (u64, u64, u64)>,
+    poll: Duration,
+    grace: Duration,
+    rescan: Duration,
+}
+
+impl FileSource {
+    pub fn new(source: Arc<str>, paths: Vec<PathBuf>, start_at_end: bool) -> Self {
+        Self {
+            source,
+            paths,
+            start_at_end,
+            positions: HashMap::new(),
+            poll: Duration::from_millis(250),
+            grace: ROTATION_GRACE,
+            rescan: Duration::from_secs(10),
+        }
+    }
+
+    /// The saved position of the file at `path` (a configured path or a
+    /// glob match).
+    pub fn with_position(mut self, path: PathBuf, dev: u64, ino: u64, offset: u64) -> Self {
+        self.positions.insert(path, (dev, ino, offset));
+        self
+    }
+
+    pub fn with_poll_interval(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
+    pub fn with_rotation_grace(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
+    }
+
+    /// How often glob paths are expanded again.
+    pub fn with_rescan_interval(mut self, rescan: Duration) -> Self {
+        self.rescan = rescan;
+        self
+    }
+
+    fn tailer(&self, path: &Path, start_at_end: bool) -> FileTailer {
+        let mut t = FileTailer::new(self.source.clone(), path.to_path_buf(), start_at_end)
+            .with_poll_interval(self.poll)
+            .with_rotation_grace(self.grace);
+        if let Some(&(dev, ino, offset)) = self.positions.get(path) {
+            info!(source = %self.source, path = %path.display(), offset, "resuming file");
+            t = t.with_position(dev, ino, offset);
+        }
+        t
+    }
+
+    /// Runs until the receiver is dropped; ends the tailers when it ends.
+    pub async fn run(self, tx: mpsc::Sender<SourceBatch>) -> anyhow::Result<()> {
+        let (globs, literal): (Vec<_>, Vec<_>) = self.paths.iter().partition(|p| is_glob(p));
+        let patterns = globs
+            .iter()
+            .map(|p| {
+                check_path(p)?;
+                Ok(p.to_string_lossy().into_owned())
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut tasks: JoinSet<PathBuf> = JoinSet::new();
+        let mut active: HashSet<PathBuf> = HashSet::new();
+        let spawn = |tasks: &mut JoinSet<PathBuf>, t: FileTailer| {
+            let (path, source, tx) = (t.path.clone(), self.source.clone(), tx.clone());
+            tasks.spawn(async move {
+                if let Err(e) = t.run(tx).await {
+                    error!(%source, path = %path.display(), error = %e, "file source failed");
+                }
+                path
+            });
+        };
+        for p in literal {
+            if active.insert(p.clone()) {
+                spawn(&mut tasks, self.tailer(p, self.start_at_end));
+            }
+        }
+
+        let mut first = true;
+        let mut warned = false;
+        loop {
+            if !patterns.is_empty() {
+                let found = tokio::task::spawn_blocking({
+                    let patterns = patterns.clone();
+                    move || expand(&patterns)
+                })
+                .await?;
+                for path in found {
+                    if active.contains(&path) {
+                        continue;
+                    }
+                    if active.len() >= MAX_FILES {
+                        if !warned {
+                            warn!(source = %self.source, max = MAX_FILES, "too many files, ignoring further matches");
+                            warned = true;
+                        }
+                        break;
+                    }
+                    if !first {
+                        info!(source = %self.source, path = %path.display(), "new file");
+                    }
+                    // files present at start follow `start_at_end`; files
+                    // appearing later are new and read from the start
+                    let t = self
+                        .tailer(&path, first && self.start_at_end)
+                        .exit_when_gone(true);
+                    active.insert(path);
+                    spawn(&mut tasks, t);
+                }
+            } else if tasks.is_empty() {
                 return Ok(());
             }
-            pending.drain(..start);
-            if pending.len() > MAX_LINE {
-                warn!(path = %self.path.display(), "discarding over-long partial line");
-                pending.clear();
-            }
+            first = false;
 
-            if n < MAX_READ {
-                tokio::time::sleep(self.poll).await;
+            let rescan = tokio::time::sleep(self.rescan);
+            tokio::pin!(rescan);
+            loop {
+                tokio::select! {
+                    Some(done) = tasks.join_next() => {
+                        if let Ok(path) = done {
+                            active.remove(&path);
+                        }
+                        if tx.is_closed() {
+                            return Ok(());
+                        }
+                    }
+                    _ = &mut rescan => break,
+                    _ = tx.closed() => return Ok(()),
+                }
             }
         }
     }
+}
+
+/// Regular files matching any of `patterns`, sorted, without duplicates.
+fn expand(patterns: &[String]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for p in patterns {
+        let Ok(paths) = glob::glob(p) else { continue };
+        found.extend(paths.flatten().filter(|p| p.is_file()));
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 #[cfg(test)]
@@ -310,5 +639,180 @@ mod tests {
         drop(rx);
         handle.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("df2b-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn append(path: &Path, s: &str) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .unwrap()
+            .write_all(s.as_bytes())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotation_reads_the_old_file_to_its_end() {
+        let dir = tmpdir("rotate");
+        let path = dir.join("app.log");
+        std::fs::write(&path, "a\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileTailer::new(Arc::from("t"), path.clone(), false)
+                .with_poll_interval(Duration::from_millis(10))
+                .run(tx),
+        );
+        let mut buf = VecDeque::new();
+        assert_eq!(next_line(&mut rx, &mut buf).await, "a");
+
+        // rename + create; the writer still writes to the old file, which
+        // ends in an incomplete line
+        let old = dir.join("app.log.1");
+        std::fs::rename(&path, &old).unwrap();
+        append(&old, "b\nc");
+        std::fs::write(&path, "d\n").unwrap();
+        assert_eq!(next_line(&mut rx, &mut buf).await, "b");
+        assert_eq!(next_line(&mut rx, &mut buf).await, "c");
+        assert_eq!(next_line(&mut rx, &mut buf).await, "d");
+
+        drop(rx);
+        h.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rotation_waits_while_the_new_file_is_empty() {
+        let dir = tmpdir("grace");
+        let path = dir.join("app.log");
+        std::fs::write(&path, "a\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileTailer::new(Arc::from("t"), path.clone(), false)
+                .with_poll_interval(Duration::from_millis(10))
+                .run(tx),
+        );
+        let mut buf = VecDeque::new();
+        assert_eq!(next_line(&mut rx, &mut buf).await, "a");
+
+        let old = dir.join("app.log.1");
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::write(&path, "").unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        append(&old, "late\n"); // the writer has not reopened yet
+        assert_eq!(next_line(&mut rx, &mut buf).await, "late");
+        append(&path, "new\n");
+        assert_eq!(next_line(&mut rx, &mut buf).await, "new");
+        let b = recv_batch_or_none(&mut rx).await;
+        assert!(b.is_none(), "nothing more expected");
+
+        drop(rx);
+        h.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn recv_batch_or_none(rx: &mut mpsc::Receiver<SourceBatch>) -> Option<SourceBatch> {
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn resume_reads_a_file_rotated_while_stopped() {
+        let dir = tmpdir("resume-rotated");
+        let path = dir.join("r.log");
+        std::fs::write(&path, "old1\nold2\n").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        // stopped after "old1\n"; then rotated, more written to the old file
+        let old = dir.join("r.log-20261119");
+        std::fs::rename(&path, &old).unwrap();
+        append(&old, "old3\n");
+        std::fs::write(&path, "new1\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileTailer::new(Arc::from("t"), path.clone(), true)
+                .with_poll_interval(Duration::from_millis(10))
+                .with_position(meta.dev(), meta.ino(), 5)
+                .run(tx),
+        );
+        let b = recv_batch(&mut rx).await;
+        let lines: Vec<_> = b.lines.iter().map(|l| l.line.as_str()).collect();
+        assert_eq!(lines, ["old2", "old3"]);
+        // the position names the configured path and the old inode
+        assert_eq!(
+            b.position,
+            Some(Position::File {
+                path: path.clone(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                offset: 15
+            })
+        );
+        let mut buf = VecDeque::new();
+        assert_eq!(next_line(&mut rx, &mut buf).await, "new1");
+
+        drop(rx);
+        h.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn glob_paths_pick_up_new_files() {
+        let dir = tmpdir("glob");
+        let a = dir.join("a.log");
+        std::fs::write(&a, "a-old\n").unwrap();
+        std::fs::write(dir.join("ignored.txt"), "x\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileSource::new(Arc::from("t"), vec![dir.join("*.log")], true)
+                .with_poll_interval(Duration::from_millis(10))
+                .with_rescan_interval(Duration::from_millis(20))
+                .with_rotation_grace(Duration::from_millis(20))
+                .run(tx),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut buf = VecDeque::new();
+        append(&a, "a1\n"); // existing file: from its end
+        assert_eq!(next_line(&mut rx, &mut buf).await, "a1");
+
+        let b = dir.join("b.log");
+        std::fs::write(&b, "b1\n").unwrap(); // new file: from the start
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(batch.lines[0].line, "b1");
+        assert!(matches!(&batch.position, Some(Position::File { path, .. }) if path == &b));
+
+        // removed, then created again: a new tailer reads it
+        std::fs::remove_file(&b).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        std::fs::write(&b, "b2\n").unwrap();
+        assert_eq!(next_line(&mut rx, &mut buf).await, "b2");
+
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .expect("source ends with the receiver")
+            .unwrap()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_detection_and_check() {
+        assert!(is_glob(Path::new("/var/log/nginx/*.log")));
+        assert!(is_glob(Path::new("/var/log/app?.log")));
+        assert!(!is_glob(Path::new("/var/log/auth.log")));
+        assert!(check_path(Path::new("/var/log/[a.log")).is_err());
+        assert!(check_path(Path::new("/var/log/*/access.log")).is_ok());
     }
 }

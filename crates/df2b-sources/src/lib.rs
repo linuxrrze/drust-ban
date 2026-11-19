@@ -14,7 +14,7 @@ pub mod file;
 #[cfg(feature = "journald")]
 pub mod journald;
 
-pub use file::FileTailer;
+pub use file::{FileSource, FileTailer};
 #[cfg(feature = "journald")]
 pub use journald::JournaldSource;
 

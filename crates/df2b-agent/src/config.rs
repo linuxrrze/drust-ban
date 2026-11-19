@@ -219,6 +219,15 @@ impl AgentConfig {
                     s.name
                 );
             }
+            if let SourceKind::File { paths, .. } = &s.kind {
+                if paths.is_empty() {
+                    bail!("source '{}': no paths", s.name);
+                }
+                for p in paths {
+                    df2b_sources::file::check_path(p)
+                        .map_err(|e| anyhow::anyhow!("source '{}': {e}", s.name))?;
+                }
+            }
         }
         let mut jails = HashSet::new();
         for j in &self.jail {
@@ -317,6 +326,20 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn file_source_paths_checked() {
+        let with = |paths: &str| {
+            let cfg: AgentConfig = toml::from_str(&format!(
+                "[agent]\n[[source]]\nname = \"f\"\ntype = \"file\"\npaths = {paths}"
+            ))
+            .unwrap();
+            cfg.validate()
+        };
+        assert!(with(r#"["/var/log/nginx/*.access.log", "/var/log/auth.log"]"#).is_ok());
+        assert!(with(r#"["/var/log/[nginx/*.log"]"#).is_err());
+        assert!(with("[]").is_err());
     }
 }
 

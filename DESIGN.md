@@ -75,12 +75,26 @@ Why not peer-to-peer gossip:
 
 ### 2.2 Files
 
-- Watch with inotify (`notify` crate); track `(dev, inode, offset)` per file.
+- Poll every 250 ms (inotify wakeups later); track `(dev, inode, offset)` per
+  file. The tailer keeps the file it reads open.
 - Rotation handling:
-  - **rename + create**: finish reading the old inode, then switch to the new one;
-  - **copytruncate**: `size < offset` means truncated, restart at 0.
+  - **rename + create**: finish reading the old inode (through the open file),
+    then switch to the new one, flushing an incomplete last line. While the new
+    file is still empty the old one stays open for up to 30 s (the writer may
+    not have reopened its log yet);
+  - **copytruncate**: `size < offset` means truncated, restart at 0;
+  - **rotated while stopped**: if the saved inode is no longer at the path, the
+    file with that device and inode is looked up in the same directory
+    (`auth.log.1`, `auth.log-20261119`, …) and read from the saved offset
+    first; positions keep naming the configured path.
 - Read in large buffers, split lines with `memchr`, persist offsets periodically.
-- Glob paths (`/var/log/nginx/*.access.log`); newly appearing files are picked up.
+- Glob paths (`/var/log/nginx/*.access.log`; `*`, `?`, `[…]`): expanded at
+  start and every 10 s; matches present at start follow `start_at_end`, files
+  appearing later are read from the start. Each match has its own tailer and
+  position; it ends once the file is gone and read to its end. At most 1024
+  files per source. A pattern must not match rotated names (`*.log`, not
+  `*.log*`), or rotated files are read twice. Central jails may use globs too
+  (still below `central_paths`; the controller checks the pattern).
 - Configurable timestamp extraction per source. During catch-up, lines older
   than `findtime` are counted but never trigger a ban.
 
@@ -892,7 +906,7 @@ systemd hardening.
 |------------------------------|--------------------------------------------------|
 | `IpKey`, decisions, ban time | implemented + tests                              |
 | Matcher (prefilter/RegexSet) | implemented + tests                              |
-| File tailer                  | polling implementation, resumes from saved offset; inotify, globs TODO |
+| File tailer                  | polling, resumes from saved offset (also across rotation), drains rotated files, glob paths; inotify TODO |
 | journald                     | implemented (dlopen, dedicated thread, batches, resumes from saved cursor) |
 | Tracker / engine             | implemented + tests; one firewall transaction per batch |
 | nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |

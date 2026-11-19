@@ -12,6 +12,7 @@ journald = ["dep:libloading"]
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+glob.workspace = true
 libloading = { workspace = true, optional = true }
 memchr.workspace = true
 serde.workspace = true

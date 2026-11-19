@@ -25,7 +25,7 @@ use chrono::Utc;
 use clap::Parser;
 use df2b_firewall::{BanEntry, DryRun, FirewallBackend, Nftables};
 use df2b_proto::v1;
-use df2b_sources::{FileTailer, Position, SourceBatch};
+use df2b_sources::{FileSource, Position, SourceBatch};
 use df2b_tls::EnrollToken;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
@@ -598,23 +598,30 @@ fn spawn_source(
             paths,
             start_at_end,
         } => {
-            for path in paths {
-                let mut tailer = FileTailer::new(name.clone(), path.clone(), *start_at_end);
-                if let Some(Position::File {
-                    dev, ino, offset, ..
-                }) = positions.get(&state::file_position_key(&src.name, path))
-                {
-                    info!(source = %src.name, path = %path.display(), offset, "resuming file");
-                    tailer = tailer.with_position(*dev, *ino, *offset);
-                }
-                let tx = tx.clone();
-                let n = name.clone();
-                tasks.push(tokio::spawn(async move {
-                    if let Err(e) = tailer.run(tx).await {
-                        error!(source = %n, error = %e, "file source failed");
-                    }
-                }));
+            for p in paths {
+                df2b_sources::file::check_path(p)?;
             }
+            let mut files = FileSource::new(name.clone(), paths.clone(), *start_at_end);
+            // saved positions of this source: configured paths and glob matches
+            for (key, pos) in positions {
+                if let Position::File {
+                    path,
+                    dev,
+                    ino,
+                    offset,
+                } = pos
+                {
+                    if *key == state::file_position_key(&src.name, path) {
+                        files = files.with_position(path.clone(), *dev, *ino, *offset);
+                    }
+                }
+            }
+            let (n, tx) = (name.clone(), tx.clone());
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = files.run(tx).await {
+                    error!(source = %n, error = %e, "file source failed");
+                }
+            }));
         }
         SourceKind::Journald {
             matches,

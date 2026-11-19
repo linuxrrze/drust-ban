@@ -98,6 +98,7 @@ impl CentralJail {
             match s {
                 CentralSource::File { paths, .. } => {
                     for p in paths {
+                        df2b_sources::file::check_path(p).map_err(|e| e.to_string())?;
                         if !path_allowed(p, &agent.central_paths) {
                             return Err(format!(
                                 "{} is outside the allowed directories (central_paths)",

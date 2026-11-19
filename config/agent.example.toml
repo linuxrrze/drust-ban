@@ -65,6 +65,8 @@ start = "10m"
 name = "auth-log"
 type = "file"
 paths = ["/var/log/auth.log"]
+# Globs (*, ? and [...]) are expanded again every 10 s, e.g.
+# "/var/log/nginx/*.access.log"; keep rotated names (*.log.1) out of the match.
 start_at_end = true
 
 [[jail]]

@@ -142,7 +142,7 @@
       </div>
     {/each}
     <button type="button" class="link" onclick={() => sources.push({ type: 'file', lines: '', start_at_end: true, start: '' })}>+ add a source</button>
-    <p class="faint small">Agents read central file sources only below their <code>central_paths</code> (default /var/log).</p>
+    <p class="faint small">Agents read central file sources only below their <code>central_paths</code> (default /var/log). Paths may be globs such as <code>/var/log/nginx/*.access.log</code>.</p>
   </fieldset>
 
   <div class="limits">
