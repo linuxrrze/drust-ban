@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 pub mod file;
 #[cfg(feature = "journald")]
@@ -32,7 +33,7 @@ pub struct LogLine {
 }
 
 /// Where a source stands after a batch; persist it to resume exactly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Position {
     JournalCursor(String),
     File {
@@ -45,6 +46,8 @@ pub enum Position {
 
 #[derive(Debug)]
 pub struct SourceBatch {
+    /// Name of the configured source.
+    pub source: Arc<str>,
     pub lines: Vec<LogLine>,
     /// Position after the last line of this batch.
     pub position: Option<Position>,

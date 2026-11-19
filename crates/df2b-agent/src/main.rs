@@ -1,14 +1,16 @@
 //! dist-f2b agent.
 //!
-//! Milestone 1 (standalone): sources → engine → firewall backend.
-//! TODO: redb state, local control socket for `df2bctl --local`,
-//! controller connection (heartbeat, observations, decision stream),
-//! reconcile loop.
+//! Milestone 1 (standalone): sources → engine → firewall backend, with
+//! source positions and offenders persisted in redb.
+//! TODO: local control socket for `df2bctl --local`, controller connection
+//! (heartbeat, observations, decision stream), reconcile loop.
 
 mod config;
 mod engine;
+mod state;
 mod tracker;
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +20,7 @@ use anyhow::Context;
 use chrono::Utc;
 use clap::Parser;
 use df2b_firewall::{BanEntry, DryRun, FirewallBackend, Nftables};
-use df2b_sources::{FileTailer, SourceBatch};
+use df2b_sources::{FileTailer, Position, SourceBatch};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -26,6 +28,10 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{AgentConfig, FirewallKind, SourceConfig, SourceKind};
 use crate::engine::Engine;
+use crate::state::{Pending, State};
+
+/// How often buffered state changes are committed (one fsync each).
+const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "dist-f2b agent")]
@@ -70,6 +76,16 @@ async fn main() -> anyhow::Result<()> {
         warn!("controller connection not implemented yet, running standalone");
     }
 
+    let state = State::open(&cfg.agent.state_dir)?;
+    let loaded = state.load()?;
+    let restored = engine.restore(loaded.offenders, Utc::now());
+    info!(
+        path = %state.path().display(),
+        positions = loaded.positions.len(),
+        active_bans = restored.len(),
+        "state loaded"
+    );
+
     let backend: Arc<dyn FirewallBackend> = match cfg.agent.firewall {
         FirewallKind::Nftables => Arc::new(Nftables::default()),
         FirewallKind::DryRun => Arc::new(DryRun),
@@ -81,15 +97,33 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("setting up firewall backend '{}'", backend.name()))?;
     }
     info!(backend = backend.name(), "firewall ready");
+    // ensure_setup starts from an empty table: re-apply still-active bans
+    if !restored.is_empty() {
+        let entries: Vec<_> = restored
+            .iter()
+            .map(|(key, remaining)| BanEntry {
+                net: key.net(),
+                timeout: Some(*remaining),
+            })
+            .collect();
+        let b = backend.clone();
+        tokio::task::spawn_blocking(move || b.ban(&entries))
+            .await?
+            .context("re-applying saved bans")?;
+        info!(count = restored.len(), "re-applied saved bans");
+    }
 
     // Bounded in batches (each up to BATCH_MAX lines): a slow engine throttles
     // the sources instead of buffering without limit.
     let (tx, mut rx) = mpsc::channel::<SourceBatch>(64);
     for src in &cfg.source {
-        spawn_source(src, &tx)?;
+        spawn_source(src, &tx, &loaded.positions)?;
     }
     drop(tx);
 
+    let mut pending = Pending::default();
+    let mut flush = tokio::time::interval(FLUSH_INTERVAL);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut prune = tokio::time::interval(Duration::from_secs(60));
     let mut sigterm = signal(SignalKind::terminate())?;
     let ctrl_c = tokio::signal::ctrl_c();
@@ -114,9 +148,12 @@ async fn main() -> anyhow::Result<()> {
                             "ban"
                         );
                         entries.push(BanEntry { net: action.key.net(), timeout: Some(action.duration) });
+                        pending.set_offender(action.record());
                     }
                 }
-                // TODO(redb): persist batch.position (journal cursor / file offset)
+                if let Some(position) = batch.position {
+                    pending.set_position(&batch.source, position);
+                }
                 if !entries.is_empty() {
                     // one firewall transaction per batch
                     let b = backend.clone();
@@ -127,15 +164,32 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
             }
-            _ = prune.tick() => engine.prune(Utc::now()),
+            _ = flush.tick() => {
+                if let Err(e) = state.flush_async(std::mem::take(&mut pending)).await {
+                    error!(error = %format!("{e:#}"), "saving state failed");
+                }
+            }
+            _ = prune.tick() => {
+                for (jail, key) in engine.prune(Utc::now()) {
+                    pending.forget_offender(&jail, &key);
+                }
+            }
             _ = &mut ctrl_c => { info!("interrupted, shutting down"); break; }
             _ = sigterm.recv() => { info!("terminated, shutting down"); break; }
         }
     }
+    state
+        .flush_async(pending)
+        .await
+        .context("saving state on shutdown")?;
     Ok(())
 }
 
-fn spawn_source(src: &SourceConfig, tx: &mpsc::Sender<SourceBatch>) -> anyhow::Result<()> {
+fn spawn_source(
+    src: &SourceConfig,
+    tx: &mpsc::Sender<SourceBatch>,
+    positions: &HashMap<String, Position>,
+) -> anyhow::Result<()> {
     let name: Arc<str> = Arc::from(src.name.as_str());
     match &src.kind {
         SourceKind::File {
@@ -143,7 +197,14 @@ fn spawn_source(src: &SourceConfig, tx: &mpsc::Sender<SourceBatch>) -> anyhow::R
             start_at_end,
         } => {
             for path in paths {
-                let tailer = FileTailer::new(name.clone(), path.clone(), *start_at_end);
+                let mut tailer = FileTailer::new(name.clone(), path.clone(), *start_at_end);
+                if let Some(Position::File {
+                    dev, ino, offset, ..
+                }) = positions.get(&state::file_position_key(&src.name, path))
+                {
+                    info!(source = %src.name, path = %path.display(), offset, "resuming file");
+                    tailer = tailer.with_position(*dev, *ino, *offset);
+                }
                 let tx = tx.clone();
                 let n = name.clone();
                 tokio::spawn(async move {
@@ -167,16 +228,23 @@ fn spawn_source(src: &SourceConfig, tx: &mpsc::Sender<SourceBatch>) -> anyhow::R
                     JournalStart::Head => Start::Head,
                     JournalStart::Since(d) => Start::Since(d),
                 };
-                // TODO(redb): .with_cursor(saved cursor)
+                let cursor = match positions.get(&state::journald_position_key(&src.name)) {
+                    Some(Position::JournalCursor(c)) => {
+                        info!(source = %src.name, "resuming journal from saved cursor");
+                        Some(c.clone())
+                    }
+                    _ => None,
+                };
                 df2b_sources::JournaldSource::new(name, matches.clone())
                     .with_directory(directory.clone())
                     .with_start(start)
+                    .with_cursor(cursor)
                     .spawn(tx.clone())
                     .with_context(|| format!("source '{}'", src.name))?;
             }
             #[cfg(not(feature = "journald"))]
             {
-                let _ = (matches, directory, start);
+                let _ = (matches, directory, start, positions);
                 anyhow::bail!(
                     "source '{}': this build has no journald support (enable feature `journald`)",
                     src.name

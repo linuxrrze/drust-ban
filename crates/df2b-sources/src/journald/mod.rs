@@ -231,7 +231,12 @@ impl JournaldSource {
             }
         };
         let lines = std::mem::replace(batch, Vec::with_capacity(BATCH_MAX));
-        tx.blocking_send(SourceBatch { lines, position }).is_ok()
+        tx.blocking_send(SourceBatch {
+            source: self.source.clone(),
+            lines,
+            position,
+        })
+        .is_ok()
     }
 }
 

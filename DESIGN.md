@@ -271,8 +271,24 @@ cloud firewall APIs, webhooks (chat, SIEM).
 
 ## 6. Storage
 
-- **Agent**: `redb` (embedded, pure Rust): journal cursors, file offsets, active
-  decisions, last applied `seq`, queue of unsent observations.
+- **Agent**: `redb` (embedded, pure Rust) at `<state_dir>/agent.redb`:
+  - **source positions** – journal cursor per journald source, `(dev, inode,
+    offset)` per file. Every log line is read and processed once, also across
+    restarts. A file replaced while the agent was down (same path, new inode)
+    is read from the start; the remainder of the rotated-away file is not
+    drained yet.
+  - **offender records** – offense count and ban expiry per (jail, key). On
+    startup, still-active bans are re-applied to the firewall with their
+    remaining time (the nftables table is recreated empty), and escalation
+    continues. Records are forgotten `offense_memory` (default 30 days) after
+    their ban expired.
+  - later: active decisions, last applied `seq`, queue of unsent observations.
+
+  Writes are buffered and committed in **one transaction per second** (one
+  fsync), not per batch – at high volume that would mean thousands of fsyncs
+  per second – plus a final commit on shutdown. After a crash at most about
+  one second of log lines is processed again; bans from that window are
+  already kept from double-counting by the offender records that were saved.
 - **Controller**: `sqlx` with SQLite by default, PostgreSQL for HA/large setups.
   Tables: `agents`, `decisions`, `observations_rollup` (per minute, pruned after
   N days), `offense_history`, `users`, `api_tokens`, `audit_log`.
@@ -410,11 +426,11 @@ systemd hardening.
 |------------------------------|--------------------------------------------------|
 | `IpKey`, decisions, ban time | implemented + tests                              |
 | Matcher (prefilter/RegexSet) | implemented + tests                              |
-| File tailer                  | polling implementation; inotify, globs, persisted offsets TODO |
-| journald                     | implemented (dlopen, dedicated thread, batches, cursors); cursor persistence TODO |
+| File tailer                  | polling implementation, resumes from saved offset; inotify, globs TODO |
+| journald                     | implemented (dlopen, dedicated thread, batches, resumes from saved cursor) |
 | Tracker / engine             | implemented + tests; one firewall transaction per batch |
 | nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |
-| Agent state (redb)           | TODO                                             |
+| Agent state (redb)           | source positions + offender records, flushed every 1 s; bans re-applied on start |
 | `df2bctl filter test`        | implemented; other commands are stubs            |
 | Controller                   | health endpoint only                             |
 | gRPC protocol                | `.proto` drafted, codegen wired                  |

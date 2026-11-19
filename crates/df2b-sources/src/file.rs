@@ -3,7 +3,6 @@
 //! TODO (milestone 1):
 //! - inotify-driven wakeups instead of polling,
 //! - glob paths,
-//! - resume from a persisted [`Position`] (redb),
 //! - drain the remainder of a rotated-away file before switching inodes,
 //! - per-source timestamp extraction.
 
@@ -28,6 +27,8 @@ pub struct FileTailer {
     path: PathBuf,
     start_at_end: bool,
     poll: Duration,
+    resume: Option<FileId>,
+    resume_offset: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +44,21 @@ impl FileTailer {
             path,
             start_at_end,
             poll: Duration::from_millis(250),
+            resume: None,
+            resume_offset: 0,
         }
+    }
+
+    /// Resume from a saved position (overrides `start_at_end`).
+    ///
+    /// If the file at `path` is still the same inode, reading continues at
+    /// `offset` (or at 0 if it was truncated meanwhile). If it was replaced
+    /// (rotated while the agent was down), the new file is read from 0.
+    // TODO: also drain the rotated-away file (e.g. `<path>.1`) from `offset`.
+    pub fn with_position(mut self, dev: u64, ino: u64, offset: u64) -> Self {
+        self.resume = Some(FileId { dev, ino });
+        self.resume_offset = offset;
+        self
     }
 
     pub fn with_poll_interval(mut self, poll: Duration) -> Self {
@@ -66,13 +81,19 @@ impl FileTailer {
             ino: id.ino,
             offset,
         });
-        tx.send(SourceBatch { lines, position }).await.is_ok()
+        tx.send(SourceBatch {
+            source: self.source.clone(),
+            lines,
+            position,
+        })
+        .await
+        .is_ok()
     }
 
     /// Runs until the receiver is dropped.
     pub async fn run(self, tx: mpsc::Sender<SourceBatch>) -> anyhow::Result<()> {
         info!(source = %self.source, path = %self.path.display(), "tailing file");
-        let mut current: Option<(FileId, u64)> = None;
+        let mut current: Option<(FileId, u64)> = self.resume.map(|id| (id, self.resume_offset));
         // Bytes of an incomplete last line; they precede `offset` in the file.
         let mut pending: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut batch: Vec<LogLine> = Vec::new();
@@ -213,6 +234,46 @@ mod tests {
 
         drop(rx);
         handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resumes_from_saved_position() {
+        let dir = std::env::temp_dir().join(format!("df2b-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.log");
+        std::fs::write(&path, "old1\nold2\nnew1\n").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+
+        // same inode: continue after "old1\nold2\n"
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileTailer::new(Arc::from("t"), path.clone(), false)
+                .with_poll_interval(Duration::from_millis(10))
+                .with_position(meta.dev(), meta.ino(), 10)
+                .run(tx),
+        );
+        let lines: Vec<_> = recv_batch(&mut rx)
+            .await
+            .lines
+            .into_iter()
+            .map(|l| l.line)
+            .collect();
+        assert_eq!(lines, ["new1"]);
+        drop(rx);
+        h.abort();
+
+        // different inode (rotated while down): read the new file from 0
+        let (tx, mut rx) = mpsc::channel(16);
+        let h = tokio::spawn(
+            FileTailer::new(Arc::from("t"), path.clone(), true)
+                .with_poll_interval(Duration::from_millis(10))
+                .with_position(meta.dev(), meta.ino() + 1, 10)
+                .run(tx),
+        );
+        assert_eq!(recv_batch(&mut rx).await.lines[0].line, "old1");
+        drop(rx);
+        h.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

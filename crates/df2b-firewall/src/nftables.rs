@@ -32,6 +32,9 @@ impl Default for Nftables {
     }
 }
 
+/// Timeouts at or above this are applied as permanent bans.
+const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 365 * 24 * 3600);
+
 fn set_name(net: &IpNet) -> &'static str {
     match net {
         IpNet::V4(_) => "ban_v4",
@@ -76,7 +79,8 @@ impl Nftables {
                 set_name(&e.net),
                 e.net
             );
-            if let Some(t) = e.timeout {
+            // very long (e.g. uncapped escalation) = permanent
+            if let Some(t) = e.timeout.filter(|t| *t < MAX_TIMEOUT) {
                 let _ = write!(s, " timeout {}s", t.as_secs().max(1));
             }
             s.push_str(" }\n");

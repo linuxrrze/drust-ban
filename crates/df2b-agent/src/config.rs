@@ -38,6 +38,10 @@ pub struct AgentSection {
     pub state_dir: PathBuf,
     #[serde(default)]
     pub firewall: FirewallKind,
+    /// How long offense history is kept after a ban expired (drives ban-time
+    /// escalation for repeat offenders).
+    #[serde(default = "default_offense_memory", with = "humantime_serde")]
+    pub offense_memory: Duration,
     /// Networks that are never banned (CIDR notation, e.g. "10.0.0.0/8").
     #[serde(default)]
     pub allowlist: Vec<IpNet>,
@@ -141,6 +145,9 @@ fn default_filter_dir() -> PathBuf {
 }
 fn default_state_dir() -> PathBuf {
     "/var/lib/df2b".into()
+}
+fn default_offense_memory() -> Duration {
+    Duration::from_secs(30 * 24 * 3600)
 }
 fn default_factor() -> f64 {
     1.0

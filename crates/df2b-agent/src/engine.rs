@@ -9,7 +9,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 use df2b_core::{escalated_bantime, Allowlist, IpKey, PrefixPolicy};
 use df2b_matcher::{Filter, FilterDef};
 use df2b_sources::LogLine;
-use tracing::debug;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 use crate::config::{AgentConfig, JailConfig};
 use crate::tracker::Tracker;
@@ -21,8 +22,35 @@ pub struct BanAction {
     pub duration: Duration,
     /// 1 for the first ban of this key in this jail.
     pub offense: u32,
+    pub until: DateTime<Utc>,
     #[allow(dead_code)] // reported to the controller (milestone 2)
     pub sample: String,
+}
+
+impl BanAction {
+    pub fn record(&self) -> OffenderRecord {
+        OffenderRecord {
+            jail: self.jail.clone(),
+            key: self.key,
+            offenses: self.offense,
+            banned_until: self.until,
+        }
+    }
+}
+
+/// Persisted per (jail, key): drives ban escalation and restores active bans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffenderRecord {
+    pub jail: String,
+    pub key: IpKey,
+    pub offenses: u32,
+    pub banned_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Offender {
+    offenses: u32,
+    banned_until: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -34,11 +62,12 @@ struct Jail {
     bantime: Duration,
     factor: f64,
     max_bantime: Option<Duration>,
-    /// Keys this jail has banned, with their expiry. Failures of a banned key
-    /// are not counted, so one burst (e.g. catching up on a log file) cannot
-    /// produce repeated bans and inflate the offense count.
-    // TODO: fill from persisted state on startup; clear on unban decisions.
-    banned: HashMap<IpKey, DateTime<Utc>>,
+    /// Keys this jail has banned: offense count and ban expiry. Failures of a
+    /// key that is still banned are not counted, so one burst (e.g. catching
+    /// up on a log file) cannot produce repeated bans and inflate the count.
+    /// Entries are forgotten `offense_memory` after their ban expired.
+    // TODO: clear / adjust on unban decisions (milestone 2).
+    offenders: HashMap<IpKey, Offender>,
 }
 
 #[derive(Debug)]
@@ -46,8 +75,7 @@ pub struct Engine {
     jails: Vec<Jail>,
     allowlist: Allowlist,
     prefix: PrefixPolicy,
-    // TODO: persist (redb) and expire old offense history
-    offenses: HashMap<(usize, IpKey), u32>,
+    offense_memory: TimeDelta,
 }
 
 impl Engine {
@@ -75,8 +103,41 @@ impl Engine {
                 v4: cfg.agent.ipv4_prefix,
                 v6: cfg.agent.ipv6_prefix,
             },
-            offenses: HashMap::new(),
+            offense_memory: TimeDelta::from_std(cfg.agent.offense_memory).unwrap_or(TimeDelta::MAX),
         })
+    }
+
+    /// Restores persisted offenders. Returns the bans that are still active,
+    /// with their remaining time, so the caller can re-apply them to the
+    /// firewall. Records of unknown jails and forgotten offenders are skipped.
+    pub fn restore(
+        &mut self,
+        records: impl IntoIterator<Item = OffenderRecord>,
+        now: DateTime<Utc>,
+    ) -> Vec<(IpKey, Duration)> {
+        let forget_before = now.checked_sub_signed(self.offense_memory);
+        let mut active = Vec::new();
+        for r in records {
+            let Some(jail) = self.jails.iter_mut().find(|j| j.name == r.jail) else {
+                warn!(jail = %r.jail, key = %r.key, "saved offender for unknown jail, ignoring");
+                continue;
+            };
+            if forget_before.is_some_and(|t| r.banned_until < t) {
+                continue;
+            }
+            jail.offenders.insert(
+                r.key,
+                Offender {
+                    offenses: r.offenses,
+                    banned_until: r.banned_until,
+                },
+            );
+            if r.banned_until > now {
+                let remaining = (r.banned_until - now).to_std().unwrap_or(Duration::MAX);
+                active.push((r.key, remaining));
+            }
+        }
+        active
     }
 
     pub fn jail_count(&self) -> usize {
@@ -86,7 +147,7 @@ impl Engine {
     pub fn process(&mut self, line: &LogLine, now: DateTime<Utc>) -> Vec<BanAction> {
         let ts = line.ts.unwrap_or(now);
         let mut actions = Vec::new();
-        for (idx, jail) in self.jails.iter_mut().enumerate() {
+        for jail in &mut self.jails {
             if !jail.sources.iter().any(|s| s.as_str() == &*line.source) {
                 continue;
             }
@@ -94,7 +155,11 @@ impl Engine {
                 continue;
             };
             let key = IpKey::from_addr(m.ip, self.prefix);
-            if jail.banned.get(&key).is_some_and(|until| *until > now) {
+            if jail
+                .offenders
+                .get(&key)
+                .is_some_and(|o| o.banned_until > now)
+            {
                 continue;
             }
             if self.allowlist.contains_addr(&m.ip) || self.allowlist.overlaps(&key.net()) {
@@ -104,30 +169,49 @@ impl Engine {
             if !jail.tracker.record(key, ts, now) {
                 continue;
             }
-            let offense = self.offenses.entry((idx, key)).or_insert(0);
-            *offense += 1;
-            let duration = escalated_bantime(jail.bantime, jail.factor, jail.max_bantime, *offense);
+            let offense = jail.offenders.get(&key).map_or(0, |o| o.offenses) + 1;
+            let duration = escalated_bantime(jail.bantime, jail.factor, jail.max_bantime, offense);
             let until = TimeDelta::from_std(duration)
                 .ok()
                 .and_then(|d| now.checked_add_signed(d))
                 .unwrap_or(DateTime::<Utc>::MAX_UTC);
-            jail.banned.insert(key, until);
+            jail.offenders.insert(
+                key,
+                Offender {
+                    offenses: offense,
+                    banned_until: until,
+                },
+            );
             actions.push(BanAction {
                 jail: jail.name.clone(),
                 key,
                 duration,
-                offense: *offense,
+                offense,
+                until,
                 sample: line.line.clone(),
             });
         }
         actions
     }
 
-    pub fn prune(&mut self, now: DateTime<Utc>) {
+    /// Drops expired tracker entries and forgotten offenders. Returns the
+    /// forgotten (jail, key) pairs so they can be removed from the state store.
+    pub fn prune(&mut self, now: DateTime<Utc>) -> Vec<(String, IpKey)> {
+        let forget_before = now.checked_sub_signed(self.offense_memory);
+        let mut forgotten = Vec::new();
         for j in &mut self.jails {
             j.tracker.prune(now);
-            j.banned.retain(|_, until| *until > now);
+            if let Some(t) = forget_before {
+                j.offenders.retain(|key, o| {
+                    let keep = o.banned_until >= t;
+                    if !keep {
+                        forgotten.push((j.name.clone(), *key));
+                    }
+                    keep
+                });
+            }
         }
+        forgotten
     }
 }
 
@@ -141,7 +225,7 @@ impl Jail {
             bantime: cfg.bantime,
             factor: cfg.bantime_factor,
             max_bantime: cfg.max_bantime,
-            banned: HashMap::new(),
+            offenders: HashMap::new(),
         }
     }
 }
@@ -215,8 +299,62 @@ mod tests {
         let almost = now + TimeDelta::minutes(59);
         assert!(e.process(&line("auth", "203.0.113.7"), almost).is_empty());
         assert!(e.process(&line("auth", "203.0.113.7"), almost).is_empty());
-        e.prune(now + TimeDelta::minutes(61));
-        assert!(e.jails[0].banned.is_empty(), "expired bans are pruned");
+        let after = now + TimeDelta::minutes(61);
+        assert!(e.prune(after).is_empty(), "offense history is kept");
+        e.process(&line("auth", "203.0.113.7"), after);
+        let a = e.process(&line("auth", "203.0.113.7"), after);
+        assert_eq!(a[0].offense, 2, "counting resumes after expiry");
+    }
+
+    #[test]
+    fn offense_history_is_forgotten_after_offense_memory() {
+        let mut e = engine();
+        let now = Utc::now();
+        e.process(&line("auth", "203.0.113.7"), now);
+        e.process(&line("auth", "203.0.113.7"), now);
+        // ban (1h) expired + default offense_memory (30d) passed
+        let later = now + TimeDelta::days(31);
+        let forgotten = e.prune(later);
+        assert_eq!(forgotten.len(), 1);
+        assert_eq!(forgotten[0].0, "sshd");
+        e.process(&line("auth", "203.0.113.7"), later);
+        let a = e.process(&line("auth", "203.0.113.7"), later);
+        assert_eq!(a[0].offense, 1, "escalation starts over");
+    }
+
+    #[test]
+    fn restore_reapplies_active_bans_and_continues_escalation() {
+        let now = Utc::now();
+        let mut first = engine();
+        first.process(&line("auth", "203.0.113.7"), now);
+        let rec = first.process(&line("auth", "203.0.113.7"), now)[0].record();
+        let expired = OffenderRecord {
+            key: IpKey::from_addr("198.51.100.1".parse().unwrap(), PrefixPolicy::default()),
+            banned_until: now - TimeDelta::minutes(5),
+            ..rec.clone()
+        };
+        let unknown = OffenderRecord {
+            jail: "gone".into(),
+            ..rec.clone()
+        };
+
+        // "restart" 10 minutes later
+        let later = now + TimeDelta::minutes(10);
+        let mut e = engine();
+        let active = e.restore([rec, expired, unknown], later);
+        assert_eq!(active.len(), 1, "only the still-active ban is re-applied");
+        assert_eq!(active[0].0.to_string(), "203.0.113.7/32");
+        assert_eq!(active[0].1, Duration::from_secs(50 * 60));
+
+        // still banned: no new ban
+        for _ in 0..3 {
+            assert!(e.process(&line("auth", "203.0.113.7"), later).is_empty());
+        }
+        // the expired offender escalates to offense 2
+        e.process(&line("auth", "198.51.100.1"), later);
+        let a = e.process(&line("auth", "198.51.100.1"), later);
+        assert_eq!(a[0].offense, 2);
+        assert_eq!(a[0].duration, Duration::from_secs(7200));
     }
 
     #[test]

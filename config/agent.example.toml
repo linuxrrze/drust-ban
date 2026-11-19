@@ -12,7 +12,10 @@ ipv6_prefix = 64
 
 # Relative paths are resolved against this file's directory.
 filter_dir = "../filters"
-state_dir = "/var/lib/df2b"
+state_dir = "/var/lib/df2b"          # agent.redb: positions, offenders
+
+# Keep offense history this long after a ban expired (ban-time escalation).
+offense_memory = "30d"
 
 # "nftables" or "dry-run"
 firewall = "dry-run"
