@@ -9,15 +9,19 @@
 literals = [
   "Failed password",
   "Failed publickey",
+  "Failed keyboard-interactive",
+  "Disconnected from authenticating user",
   "Invalid user",
   "Connection closed by authenticating user",
   "maximum authentication attempts exceeded",
 ]
 
 failregex = [
-  'Failed (?:password|publickey) for .* from <HOST> port \d+(?: ssh2)?$',
+  'Failed (?:password|publickey|keyboard-interactive/pam) for .* from <HOST> port \d+(?: ssh2)?$',
   'Invalid user .* from <HOST> port \d+$',
   'Connection closed by authenticating user .* <HOST> port \d+ \[preauth\]$',
+  # a client giving up after a failed attempt (instead of the line above)
+  'Disconnected from authenticating user .* <HOST> port \d+ \[preauth\]$',
   'maximum authentication attempts exceeded for .* from <HOST> port \d+ ssh2 \[preauth\]$',
 ]
 

@@ -1,0 +1,32 @@
+# OpenSSH authentication failures in syslog files (/var/log/auth.log,
+# /var/log/secure).
+#
+# Unlike sshd.toml (meant for journald, where _SYSTEMD_UNIT says who sent a
+# message) these patterns are anchored at the start of the line and require
+# the program to be sshd: otherwise any local user could write a matching
+# line with `logger` and get any address banned. A user can still claim to
+# be sshd (`logger -t sshd`): prefer the journald source where there is one.
+#
+# Lines: "Nov 19 05:52:01 host sshd[123]: ..." or with an ISO 8601 time
+# stamp (rsyslog's default on current distributions); sshd-session is
+# OpenSSH 9.8's per-connection process.
+
+literals = [
+  "Failed password",
+  "Failed publickey",
+  "Failed keyboard-interactive",
+  "Disconnected from authenticating user",
+  "Invalid user",
+  "Connection closed by authenticating user",
+  "maximum authentication attempts exceeded",
+]
+
+failregex = [
+  '^(?:[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) \S+ sshd(?:-session)?\[\d+\]: Failed (?:password|publickey|keyboard-interactive/pam) for .* from <HOST> port \d+(?: ssh2)?$',
+  '^(?:[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) \S+ sshd(?:-session)?\[\d+\]: Invalid user .* from <HOST> port \d+$',
+  '^(?:[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) \S+ sshd(?:-session)?\[\d+\]: Connection closed by authenticating user .* <HOST> port \d+ \[preauth\]$',
+  '^(?:[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) \S+ sshd(?:-session)?\[\d+\]: Disconnected from authenticating user .* <HOST> port \d+ \[preauth\]$',
+  '^(?:[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) \S+ sshd(?:-session)?\[\d+\]: maximum authentication attempts exceeded for .* from <HOST> port \d+ ssh2 \[preauth\]$',
+]
+
+ignoreregex = []

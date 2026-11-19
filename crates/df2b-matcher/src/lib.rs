@@ -298,4 +298,58 @@ mod tests {
         );
         assert!(Filter::compile("f", &ok).is_ok());
     }
+
+    const SSHD_SYSLOG: &str = include_str!("../../../filters/sshd-syslog.toml");
+
+    /// Regression (security review): in syslog files the sshd patterns
+    /// matched any program's line, so `logger "Failed password for root
+    /// from <victim> port 22 ssh2"` banned anyone. The syslog variant only
+    /// takes sshd's lines.
+    #[test]
+    fn syslog_variant_only_takes_sshd() {
+        let f =
+            Filter::compile("sshd-syslog", &FilterDef::from_toml(SSHD_SYSLOG).unwrap()).unwrap();
+        for line in [
+            "Nov 19 05:52:01 host sshd[123]: Failed password for root from 192.0.2.50 port 22 ssh2",
+            "Nov  9 05:52:01 host sshd-session[9]: Failed keyboard-interactive/pam for root from 192.0.2.50 port 22 ssh2",
+            "2026-11-19T05:52:01.123456+01:00 host sshd[123]: Invalid user bob from 192.0.2.50 port 4022",
+        ] {
+            assert_eq!(ip(&f, line).as_deref(), Some("192.0.2.50"), "{line}");
+        }
+        for line in [
+            "Nov 19 05:52:01 host mallory: Failed password for root from 192.0.2.50 port 22 ssh2",
+            "Nov 19 05:52:01 host webapp[9]: Failed password for root from 192.0.2.50 port 22 ssh2",
+            "Nov 19 05:52:01 host app[1]: x sshd[1]: Failed password for root from 192.0.2.50 port 22 ssh2",
+            "Failed password for root from 192.0.2.50 port 22 ssh2",
+        ] {
+            assert_eq!(ip(&f, line), None, "{line}");
+        }
+    }
+
+    /// Regression (security review): PAM/2FA failures and graceful
+    /// disconnects after a failure were not counted.
+    #[test]
+    fn more_sshd_failures() {
+        let f = sshd();
+        assert_eq!(
+            ip(
+                &f,
+                "Failed keyboard-interactive/pam for root from 192.0.2.9 port 22 ssh2"
+            )
+            .as_deref(),
+            Some("192.0.2.9")
+        );
+        assert_eq!(
+            ip(
+                &f,
+                "Disconnected from authenticating user root 192.0.2.9 port 22 [preauth]"
+            )
+            .as_deref(),
+            Some("192.0.2.9")
+        );
+        assert_eq!(
+            ip(&f, "Failed none for root from 192.0.2.9 port 22 ssh2"),
+            None
+        );
+    }
 }

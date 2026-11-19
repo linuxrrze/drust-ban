@@ -304,7 +304,29 @@ mod tests {
                 ..
             } if d == Duration::from_secs(600)
         ));
+        assert_eq!(cfg.jail[0].sources, ["sshd-journal"], "journald only");
+        // the commented file variant works too
+        let mut out = String::new();
+        let mut inside = false;
+        for line in text.lines() {
+            if line.starts_with("# --- file variant") {
+                inside = true;
+            } else if line.starts_with("# --- end of file variant") {
+                inside = false;
+            } else if inside && line.starts_with("# ") {
+                out += &line[2..];
+            } else {
+                out += line;
+            }
+            out.push('\n');
+        }
+        let mut cfg: AgentConfig = toml::from_str(&out).unwrap();
+        cfg.validate().unwrap();
         assert!(matches!(cfg.source[1].kind, SourceKind::File { .. }));
+        assert_eq!(cfg.jail[1].filter, "sshd-syslog");
+        // and its filter exists and compiles
+        cfg.agent.filter_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../filters").into();
+        crate::engine::Engine::from_config(&cfg).unwrap();
     }
 
     #[test]
