@@ -1,21 +1,27 @@
 //! REST API (`/api/v1`), served over HTTPS only (see https.rs).
 //!
-//! Authentication: `Authorization: Bearer df2bapi1.<secret>`. Tokens are
-//! created with `df2b-controller api-token create --name <n> --role <r>`;
-//! roles are `viewer` < `operator` (ban/unban) < `admin` (agents, enrollment
-//! tokens, audit log). Every change is written to the audit log with the
-//! token name and client address.
+//! Authentication, either
+//! - `Authorization: Bearer df2bapi1.<secret>` (CLI, scripts). Tokens are
+//!   created with `df2b-controller api-token create --name <n> --role <r>`;
+//! - or a session cookie from `POST /api/v1/session` (web UI, users created
+//!   with `df2b-controller user add`); see session.rs for CSRF protection.
 //!
-//! TODO: browser sessions (users, argon2/OIDC) for the web UI, OpenAPI
-//! (utoipa), SSE live updates.
+//! Roles are `viewer` < `operator` (ban/unban) < `admin` (agents, enrollment
+//! tokens, audit log). Every change is written to the audit log with the
+//! token or user name and client address.
+//!
+//! TODO: OIDC, OpenAPI (utoipa).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::convert::Infallible;
+
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
-use axum::http::{header, StatusCode};
+use axum::http::{header, Method, StatusCode, Uri};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{async_trait, Json, Router};
@@ -25,9 +31,12 @@ use df2b_tls::ApiToken;
 use ipnet::IpNet;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::broadcast::error::RecvError;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use crate::files::{self, Role};
+use crate::session;
 use crate::state::{Controller, NewDecision};
 
 /// Longest enrollment token lifetime accepted over the API.
@@ -78,12 +87,43 @@ type ApiResult<T = Json<Value>> = Result<T, ApiError>;
 
 // ----------------------------------------------------------- authentication
 
+/// How a caller authenticated.
+#[derive(Debug, Clone)]
+pub enum Auth {
+    Token(ApiToken),
+    Session { secret: String, csrf: String },
+}
+
 /// The authenticated caller of a request.
 #[derive(Debug, Clone)]
 pub struct Caller {
+    /// API token name or user name (one namespace).
     pub name: String,
     pub role: Role,
     pub addr: Option<SocketAddr>,
+    pub auth: Auth,
+}
+
+fn unauthorized(m: &str) -> ApiError {
+    ApiError::new(StatusCode::UNAUTHORIZED, m)
+}
+
+/// The user behind a session, if the session is still valid. Blocking.
+fn session_user(
+    ctl: &Controller,
+    secret: &str,
+) -> anyhow::Result<Option<(files::UserFile, session::Session)>> {
+    let Some(s) = ctl.sessions.get(secret) else {
+        return Ok(None);
+    };
+    match files::load_user(&ctl.settings.state_dir, &s.user)? {
+        Some(u) if u.password_changed_at == s.password_changed_at => Ok(Some((u, s))),
+        _ => {
+            // user deleted or password changed
+            ctl.sessions.remove(secret);
+            Ok(None)
+        }
+    }
 }
 
 impl Caller {
@@ -93,8 +133,17 @@ impl Caller {
         } else {
             Err(ApiError::new(
                 StatusCode::FORBIDDEN,
-                format!("requires role {role:?}, token has {:?}", self.role).to_lowercase(),
+                format!("requires role {role:?} (you have {:?})", self.role).to_lowercase(),
             ))
+        }
+    }
+
+    /// Whether the token / session is still valid (long-lived streams).
+    /// Blocking.
+    fn still_valid(&self, ctl: &Controller) -> bool {
+        match &self.auth {
+            Auth::Token(t) => files::lookup_api_token(&ctl.settings.state_dir, t).is_some(),
+            Auth::Session { secret, .. } => matches!(session_user(ctl, secret), Ok(Some(_))),
         }
     }
 
@@ -119,36 +168,83 @@ impl FromRequestParts<Arc<Controller>> for Caller {
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
-        let token = parts
+        let bearer = parts
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .and_then(|t| t.parse::<ApiToken>().ok());
-        let Some(token) = token else {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "missing or malformed bearer token",
+            .map(|v| {
+                v.strip_prefix("Bearer ")
+                    .and_then(|t| t.parse::<ApiToken>().ok())
+            });
+        let cookie = parts
+            .headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(session::from_cookie_header)
+            .map(str::to_owned);
+
+        // a bearer token wins over a cookie
+        if let Some(token) = bearer {
+            let Some(token) = token else {
+                return Err(unauthorized("malformed bearer token"));
+            };
+            let dir = ctl.settings.state_dir.clone();
+            let t = token.clone();
+            let file = tokio::task::spawn_blocking(move || files::lookup_api_token(&dir, &t))
+                .await
+                .map_err(ApiError::internal)?;
+            return match file {
+                Some(f) => Ok(Caller {
+                    name: f.name,
+                    role: f.role,
+                    addr,
+                    auth: Auth::Token(token),
+                }),
+                None => {
+                    warn!(?addr, "rejected API request with unknown or expired token");
+                    Err(unauthorized("invalid or expired API token"))
+                }
+            };
+        }
+
+        let Some(secret) = cookie else {
+            return Err(unauthorized(
+                "not logged in (session cookie or bearer token required)",
             ));
         };
-        let dir = ctl.settings.state_dir.clone();
-        let file = tokio::task::spawn_blocking(move || files::lookup_api_token(&dir, &token))
+        let c = ctl.clone();
+        let sec = secret.clone();
+        let found = tokio::task::spawn_blocking(move || session_user(&c, &sec))
             .await
+            .map_err(ApiError::internal)?
             .map_err(ApiError::internal)?;
-        match file {
-            Some(f) => Ok(Caller {
-                name: f.name,
-                role: f.role,
-                addr,
-            }),
-            None => {
-                warn!(?addr, "rejected API request with unknown or expired token");
-                Err(ApiError::new(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid or expired API token",
-                ))
+        let Some((user, sess)) = found else {
+            return Err(unauthorized("session expired, please log in again"));
+        };
+        // cookies are sent by the browser automatically; the CSRF token
+        // proves that the request comes from the UI itself
+        if !matches!(parts.method, Method::GET | Method::HEAD) {
+            let ok = parts
+                .headers
+                .get(session::CSRF_HEADER)
+                .is_some_and(|v| session::constant_time_eq(v.as_bytes(), sess.csrf.as_bytes()));
+            if !ok {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "missing or invalid CSRF token",
+                ));
             }
         }
+        Ok(Caller {
+            name: user.name,
+            role: user.role,
+            addr,
+            auth: Auth::Session {
+                secret,
+                csrf: sess.csrf,
+            },
+        })
     }
 }
 
@@ -164,11 +260,16 @@ async fn blocking<T: Send + 'static>(
 
 // ------------------------------------------------------------------- routes
 
+/// The REST API plus the web UI (everything outside `/api/`).
 pub fn router(ctl: Arc<Controller>) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/session", post(login).delete(logout))
         .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/stats", get(stats))
+        .route("/api/v1/events", get(events))
+        .route("/api/v1/history", get(history))
         .route("/api/v1/agents", get(agents))
         .route("/api/v1/agents/:id", get(agent))
         .route("/api/v1/agents/:id/revoke", post(revoke_agent))
@@ -177,7 +278,14 @@ pub fn router(ctl: Arc<Controller>) -> Router {
         .route("/api/v1/bans", post(ban))
         .route("/api/v1/unban", post(unban))
         .route("/api/v1/audit", get(audit))
-        .fallback(|| async { ApiError::not_found("no such endpoint") })
+        .fallback(|uri: Uri| async move {
+            if uri.path().starts_with("/api/") {
+                ApiError::not_found("no such endpoint").into_response()
+            } else {
+                crate::ui::serve(uri).await
+            }
+        })
+        .layer(axum::middleware::map_response(crate::ui::security_headers))
         .with_state(ctl)
 }
 
@@ -187,7 +295,225 @@ async fn health() -> Json<Value> {
 }
 
 async fn whoami(caller: Caller) -> Json<Value> {
-    Json(json!({ "name": caller.name, "role": caller.role }))
+    let (auth, csrf) = match &caller.auth {
+        Auth::Token(_) => ("token", None),
+        Auth::Session { csrf, .. } => ("session", Some(csrf)),
+    };
+    Json(json!({ "name": caller.name, "role": caller.role, "auth": auth, "csrf_token": csrf }))
+}
+
+// ----------------------------------------------------------------- sessions
+
+/// At most this many password checks (argon2: ~20 MiB, tens of ms) at once.
+static LOGIN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn login(
+    State(ctl): State<Arc<Controller>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    let ip = Some(addr.ip());
+    if req.username.len() > 64 || req.password.len() > 1024 {
+        return Err(unauthorized("invalid user name or password"));
+    }
+    if !ctl.sessions.login_allowed(ip, &req.username) {
+        warn!(%addr, user = %req.username, "login rate limit reached");
+        let mut r = ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed logins, try again in 15 minutes",
+        )
+        .into_response();
+        r.headers_mut().insert(
+            header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("900"),
+        );
+        return Ok(r);
+    }
+    let _slot = LOGIN_SLOTS.acquire().await.map_err(ApiError::internal)?;
+    let c = ctl.clone();
+    let name = req.username.clone();
+    let user = blocking(move || {
+        let user = files::load_user(&c.settings.state_dir, &name)?;
+        let ok = files::verify_password(
+            user.as_ref().map(|u| u.password_hash.as_str()),
+            &req.password,
+        );
+        Ok(user.filter(|_| ok))
+    })
+    .await?;
+    let Some(user) = user else {
+        ctl.sessions.login_failed(ip, &req.username);
+        warn!(%addr, user = %req.username, "failed login");
+        return Err(unauthorized("invalid user name or password"));
+    };
+    let (secret, sess) = ctl.sessions.create(&user.name, user.password_changed_at);
+    let c = ctl.clone();
+    let name = user.name.clone();
+    blocking(move || c.audit(&name, Some(addr.to_string()), "session.login", json!({}))).await?;
+    Ok((
+        [(header::SET_COOKIE, session::set_cookie(&secret))],
+        Json(json!({ "name": user.name, "role": user.role, "auth": "session", "csrf_token": sess.csrf })),
+    )
+        .into_response())
+}
+
+async fn logout(caller: Caller, State(ctl): State<Arc<Controller>>) -> Response {
+    if let Auth::Session { secret, .. } = &caller.auth {
+        ctl.sessions.remove(secret);
+    }
+    (
+        [(header::SET_COOKIE, session::clear_cookie())],
+        Json(json!({ "logged_out": true })),
+    )
+        .into_response()
+}
+
+// ------------------------------------------------------------ live updates
+
+/// Streams are closed after this and the browser reconnects (EventSource),
+/// so an idle tab does not hold a connection forever.
+const STREAM_MAX: Duration = Duration::from_secs(3600);
+/// How often an open stream re-checks its token / session.
+const STREAM_RECHECK: Duration = Duration::from_secs(30);
+
+/// Server-sent events: `decision` for every new decision, `resync` when the
+/// client fell behind (reload the lists).
+async fn events(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+) -> ApiResult<Sse<ReceiverStream<Result<Event, Infallible>>>> {
+    caller.require(Role::Viewer)?;
+    let mut rx = ctl.events();
+    let (tx, out) = tokio::sync::mpsc::channel(64);
+    let hello = Event::default()
+        .event("hello")
+        .retry(Duration::from_secs(3))
+        .json_data(json!({ "last_seq": ctl.last_seq() }))
+        .map_err(ApiError::internal)?;
+    let _ = tx.try_send(Ok(hello));
+    tokio::spawn(async move {
+        let deadline = tokio::time::sleep(STREAM_MAX);
+        tokio::pin!(deadline);
+        let mut recheck = tokio::time::interval(STREAM_RECHECK);
+        recheck.tick().await;
+        loop {
+            let ev = tokio::select! {
+                r = rx.recv() => match r {
+                    Ok(d) => Event::default().event("decision").json_data(&*d),
+                    Err(RecvError::Lagged(_)) => Ok(Event::default().event("resync").data("{}")),
+                    Err(RecvError::Closed) => return,
+                },
+                _ = recheck.tick() => {
+                    let (c, who) = (ctl.clone(), caller.clone());
+                    let valid = tokio::task::spawn_blocking(move || who.still_valid(&c))
+                        .await
+                        .unwrap_or(false);
+                    if !valid {
+                        let _ = tx.send(Ok(Event::default().event("logout").data("{}"))).await;
+                        return;
+                    }
+                    continue;
+                }
+                () = &mut deadline => return,
+                () = tx.closed() => return,
+            };
+            match ev {
+                Ok(ev) => {
+                    if tx.send(Ok(ev)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => warn!(error = %e, "encoding event"),
+            }
+        }
+    });
+    Ok(Sse::new(ReceiverStream::new(out)).keep_alive(KeepAlive::default()))
+}
+
+// -------------------------------------------------------------- dashboard
+
+/// IPv4 /16 or IPv6 /32 containing `net` (dashboard grouping).
+fn coarse(net: &IpNet) -> IpNet {
+    let len = match net {
+        IpNet::V4(_) => 16,
+        IpNet::V6(_) => 32,
+    };
+    IpNet::new(net.addr(), len.min(net.prefix_len()))
+        .map(|n| n.trunc())
+        .unwrap_or(*net)
+}
+
+fn top<K: Ord + Clone + serde::Serialize>(items: impl Iterator<Item = K>, n: usize) -> Vec<Value> {
+    let mut counts = std::collections::BTreeMap::<K, u64>::new();
+    for k in items {
+        *counts.entry(k).or_default() += 1;
+    }
+    let mut v: Vec<(K, u64)> = counts.into_iter().collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    v.into_iter()
+        .take(n)
+        .map(|(k, c)| json!({ "key": k, "count": c }))
+        .collect()
+}
+
+async fn stats(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    let active = ctl.active_decisions();
+    let v4 = active.iter().filter(|d| d.target.addr().is_ipv4()).count();
+    let hourly: Vec<Value> = ctl
+        .bans_per_hour(48)
+        .into_iter()
+        .map(|(h, c)| json!({ "hour": h, "count": c }))
+        .collect();
+    Ok(Json(json!({
+        "bans_per_hour": hourly,
+        "active": {
+            "total": active.len(),
+            "ipv4": v4,
+            "ipv6": active.len() - v4,
+            "permanent": active.iter().filter(|d| d.expires_at.is_none()).count(),
+        },
+        "top_jails": top(active.iter().map(|d| d.jail.clone().unwrap_or_else(|| "(manual)".into())), 8),
+        "top_prefixes": top(active.iter().map(|d| coarse(&d.target).to_string()), 8),
+        "top_origins": top(active.iter().map(|d| df2b_proto::origin_string(&d.origin)), 8),
+    })))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    target: String,
+    limit: Option<usize>,
+}
+
+/// Everything known about an address or prefix.
+async fn history(
+    caller: Caller,
+    State(ctl): State<Arc<Controller>>,
+    Query(q): Query<HistoryQuery>,
+) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    let net = target(&q.target)?;
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let active: Vec<_> = ctl
+        .active_decisions()
+        .into_iter()
+        .filter(|d| d.target.contains(&net) || net.contains(&d.target))
+        .collect();
+    let c = ctl.clone();
+    let history = blocking(move || c.history(net, limit)).await?;
+    Ok(Json(json!({
+        "target": net,
+        "allowlisted": ctl.settings.allowlist.overlaps(&net),
+        "active": active,
+        "history": history,
+    })))
 }
 
 async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
@@ -203,6 +529,8 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         "active_decisions": ctl.active_decisions().len(),
         "last_seq": ctl.last_seq(),
         "propagate": ctl.settings.propagate,
+        "allowlist": ctl.settings.allowlist.iter().collect::<Vec<_>>(),
+        "sessions": ctl.sessions.count(),
     })))
 }
 
@@ -696,6 +1024,278 @@ mod tests {
             .send()
             .await;
         assert!(r.is_err());
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    /// A logged-in browser: session cookie + CSRF token.
+    async fn login(env: &Env, user: &str, pw: &str) -> (S, String, Value) {
+        let r = env
+            .http
+            .post(format!("{}/api/v1/session", env.base))
+            .json(&json!({ "username": user, "password": pw }))
+            .send()
+            .await
+            .unwrap();
+        let st = r.status();
+        let cookie = r
+            .headers()
+            .get("set-cookie")
+            .map(|c| c.to_str().unwrap().split(';').next().unwrap().to_owned())
+            .unwrap_or_default();
+        (st, cookie, r.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn with_cookie(
+        env: &Env,
+        method: &str,
+        path: &str,
+        cookie: &str,
+        csrf: Option<&str>,
+        body: Value,
+    ) -> (S, Value) {
+        let url = format!("{}{path}", env.base);
+        let mut req = match method {
+            "GET" => env.http.get(url),
+            "DELETE" => env.http.delete(url),
+            _ => env.http.post(url).json(&body),
+        }
+        .header("cookie", cookie);
+        if let Some(c) = csrf {
+            req = req.header("x-csrf-token", c);
+        }
+        let r = req.send().await.unwrap();
+        let st = r.status();
+        (st, r.json().await.unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn sessions_csrf_and_live_updates() {
+        let env = Env::new("sess").await;
+        files::create_user(&env.dir, "olga", Role::Operator, "correct horse battery").unwrap();
+
+        let (st, cookie, _) = login(&env, "olga", "wrong horse battery").await;
+        assert_eq!((st, cookie.as_str()), (S::UNAUTHORIZED, ""));
+        let (st, _, _) = login(&env, "nobody", "correct horse battery").await;
+        assert_eq!(st, S::UNAUTHORIZED);
+
+        let (st, cookie, v) = login(&env, "olga", "correct horse battery").await;
+        assert_eq!(st, S::OK, "{v}");
+        assert!(cookie.starts_with("__Host-df2b_session="));
+        let csrf = v["csrf_token"].as_str().unwrap().to_owned();
+        let (st, v) = with_cookie(&env, "GET", "/api/v1/whoami", &cookie, None, json!({})).await;
+        assert_eq!(st, S::OK);
+        assert_eq!(
+            (
+                v["name"].as_str(),
+                v["auth"].as_str(),
+                v["csrf_token"].as_str()
+            ),
+            (Some("olga"), Some("session"), Some(csrf.as_str()))
+        );
+
+        // live updates: subscribe before banning
+        let mut sse = env
+            .http
+            .get(format!("{}/api/v1/events", env.base))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), S::OK);
+        assert_eq!(sse.headers()["content-type"], "text/event-stream");
+        let mut seen = String::new();
+        while !seen.contains("event: hello") {
+            seen += &String::from_utf8_lossy(&sse.chunk().await.unwrap().unwrap());
+        }
+
+        // changes need the CSRF token
+        let ban = json!({ "target": "198.51.100.7", "duration": "1h" });
+        let (st, v) = with_cookie(&env, "POST", "/api/v1/bans", &cookie, None, ban.clone()).await;
+        assert_eq!(st, S::FORBIDDEN, "{v}");
+        let (st, _) = with_cookie(
+            &env,
+            "POST",
+            "/api/v1/bans",
+            &cookie,
+            Some("forged"),
+            ban.clone(),
+        )
+        .await;
+        assert_eq!(st, S::FORBIDDEN);
+        let (st, v) = with_cookie(
+            &env,
+            "POST",
+            "/api/v1/bans",
+            &cookie,
+            Some(&csrf),
+            ban.clone(),
+        )
+        .await;
+        assert_eq!(st, S::CREATED, "{v}");
+        assert_eq!(v["decision"]["origin"]["value"], "olga");
+
+        while !seen.contains("event: decision") {
+            seen += &String::from_utf8_lossy(&sse.chunk().await.unwrap().unwrap());
+        }
+        assert!(seen.contains("198.51.100.7/32"), "{seen}");
+        drop(sse);
+
+        // dashboard and IP detail
+        let (st, v) = with_cookie(&env, "GET", "/api/v1/stats", &cookie, None, json!({})).await;
+        assert_eq!(st, S::OK);
+        assert_eq!(v["bans_per_hour"].as_array().unwrap().len(), 48);
+        assert_eq!(v["bans_per_hour"][47]["count"], 1);
+        assert_eq!(v["active"]["ipv4"], 1);
+        assert_eq!(v["top_prefixes"][0]["key"], "198.51.0.0/16");
+        let (_, v) = with_cookie(
+            &env,
+            "POST",
+            "/api/v1/unban",
+            &cookie,
+            Some(&csrf),
+            json!({ "target": "198.51.100.7" }),
+        )
+        .await;
+        assert_eq!(v["unbans"].as_array().unwrap().len(), 1);
+        let (st, v) = with_cookie(
+            &env,
+            "GET",
+            "/api/v1/history?target=198.51.100.0/24",
+            &cookie,
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, S::OK);
+        let kinds: Vec<_> = v["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["kind"]["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["unban", "ban"]);
+        assert_eq!(v["active"].as_array().unwrap().len(), 0);
+        let (_, v) = with_cookie(
+            &env,
+            "GET",
+            "/api/v1/history?target=10.1.1.1",
+            &cookie,
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(v["allowlisted"], true);
+
+        // a viewer session cannot ban; a role change applies immediately
+        files::update_user(&env.dir, "olga", Some(Role::Viewer), None).unwrap();
+        let (st, _) = with_cookie(
+            &env,
+            "POST",
+            "/api/v1/bans",
+            &cookie,
+            Some(&csrf),
+            ban.clone(),
+        )
+        .await;
+        assert_eq!(st, S::FORBIDDEN);
+
+        // a new password ends the session
+        files::update_user(&env.dir, "olga", None, Some("a brand new password")).unwrap();
+        let (st, _) = with_cookie(&env, "GET", "/api/v1/whoami", &cookie, None, json!({})).await;
+        assert_eq!(st, S::UNAUTHORIZED);
+
+        // logout
+        let (_, cookie, v) = login(&env, "olga", "a brand new password").await;
+        let csrf = v["csrf_token"].as_str().unwrap().to_owned();
+        let (st, _) =
+            with_cookie(&env, "DELETE", "/api/v1/session", &cookie, None, json!({})).await;
+        assert_eq!(st, S::FORBIDDEN, "logout needs CSRF too");
+        let (st, _) = with_cookie(
+            &env,
+            "DELETE",
+            "/api/v1/session",
+            &cookie,
+            Some(&csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, S::OK);
+        let (st, _) = with_cookie(&env, "GET", "/api/v1/whoami", &cookie, None, json!({})).await;
+        assert_eq!(st, S::UNAUTHORIZED);
+
+        // deleting the user ends their sessions
+        let (_, cookie, _) = login(&env, "olga", "a brand new password").await;
+        files::delete_user(&env.dir, "olga").unwrap();
+        let (st, _) = with_cookie(&env, "GET", "/api/v1/whoami", &cookie, None, json!({})).await;
+        assert_eq!(st, S::UNAUTHORIZED);
+
+        // the audit log names the user
+        let admin = env.token("ada", Role::Admin);
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let actions: Vec<_> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}",
+                    e["actor"].as_str().unwrap(),
+                    e["action"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "olga:session.login",
+                "olga:session.login",
+                "olga:unban",
+                "olga:ban",
+                "olga:session.login"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn login_rate_limit_and_ui_headers() {
+        let env = Env::new("limit").await;
+        files::create_user(&env.dir, "ada", Role::Admin, "correct horse battery").unwrap();
+        for _ in 0..10 {
+            assert_eq!(
+                login(&env, "ada", "wrong password!!").await.0,
+                S::UNAUTHORIZED
+            );
+        }
+        // the right password does not help any more
+        let (st, cookie, _) = login(&env, "ada", "correct horse battery").await;
+        assert_eq!((st, cookie.as_str()), (S::TOO_MANY_REQUESTS, ""));
+
+        // UI and security headers
+        let r = env.http.get(format!("{}/", env.base)).send().await.unwrap();
+        assert_eq!(r.status(), S::OK);
+        assert!(r.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        let csp = r.headers()["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'"));
+        assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+        let r = env
+            .http
+            .get(format!("{}/api/v1/nope", env.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::NOT_FOUND);
+        assert_eq!(r.headers()["cache-control"], "no-store");
+        let r = env
+            .http
+            .get(format!("{}/assets/missing.js", env.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&env.dir);
     }
 

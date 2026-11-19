@@ -7,7 +7,7 @@
 //! atomically, so no decision falls between the initial snapshot/backlog and
 //! the live stream.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -22,10 +22,13 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::files;
+use crate::session::Sessions;
 use crate::store::{AgentRecord, AuditEntry, Store};
 
 /// A resuming subscriber further behind than this gets a snapshot instead.
 const MAX_BACKLOG: u64 = 10_000;
+/// How long the hourly ban counts are kept (dashboard).
+const HOURLY_KEEP: i64 = 7 * 24;
 
 /// What happens to an agent's local ban (DESIGN.md §4.2 `propagate_local`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
@@ -105,6 +108,19 @@ struct Inner {
     active: HashMap<Uuid, Decision>,
     agents: HashMap<String, AgentRecord>,
     status: HashMap<String, AgentStatus>,
+    /// New bans per hour (unix time / 3600), for the dashboard.
+    hourly: BTreeMap<i64, u32>,
+}
+
+impl Inner {
+    fn count(&mut self, d: &Decision) {
+        if matches!(d.kind, DecisionKind::Ban) {
+            *self
+                .hourly
+                .entry(d.created_at.timestamp().div_euclid(3600))
+                .or_default() += 1;
+        }
+    }
 }
 
 pub struct Controller {
@@ -113,6 +129,7 @@ pub struct Controller {
     store: Store,
     inner: Mutex<Inner>,
     events: broadcast::Sender<Arc<Decision>>,
+    pub sessions: Sessions,
 }
 
 fn apply(active: &mut HashMap<Uuid, Decision>, d: &Decision, now: DateTime<Utc>) {
@@ -134,6 +151,7 @@ impl Controller {
         store.for_each(|d| {
             inner.last_seq = inner.last_seq.max(d.seq);
             apply(&mut inner.active, &d, now);
+            inner.count(&d);
         })?;
         for a in store.agents()? {
             inner.agents.insert(a.id.clone(), a);
@@ -150,6 +168,7 @@ impl Controller {
             store,
             inner: Mutex::new(inner),
             events: broadcast::channel(4096).0,
+            sessions: Sessions::default(),
         })
     }
 
@@ -237,6 +256,7 @@ impl Controller {
         let mut published = Vec::with_capacity(out.len());
         for d in out {
             apply(&mut inner.active, &d, now);
+            inner.count(&d);
             let d = Arc::new(d);
             // no receivers is fine
             let _ = self.events.send(d.clone());
@@ -294,7 +314,41 @@ impl Controller {
     /// Drops expired bans from the active set.
     pub fn prune(&self) {
         let now = Utc::now();
-        self.lock().active.retain(|_, d| d.is_active(now));
+        let mut inner = self.lock();
+        inner.active.retain(|_, d| d.is_active(now));
+        let oldest = now.timestamp().div_euclid(3600) - HOURLY_KEEP;
+        inner.hourly.retain(|h, _| *h >= oldest);
+        drop(inner);
+        self.sessions.prune();
+    }
+
+    /// Live decisions (for the UI); the receiver lags rather than blocks.
+    pub fn events(&self) -> broadcast::Receiver<Arc<Decision>> {
+        self.events.subscribe()
+    }
+
+    /// New bans per hour for the last `hours` hours (oldest first), as
+    /// (hour start, count).
+    pub fn bans_per_hour(&self, hours: i64) -> Vec<(DateTime<Utc>, u32)> {
+        let now = Utc::now().timestamp().div_euclid(3600);
+        let inner = self.lock();
+        (now - hours + 1..=now)
+            .map(|h| {
+                (
+                    DateTime::from_timestamp(h * 3600, 0).unwrap_or_default(),
+                    inner.hourly.get(&h).copied().unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
+    /// Decisions (bans and unbans, active or not) whose target overlaps
+    /// `target`, newest first. Blocking: scans the log.
+    pub fn history(&self, target: IpNet, limit: usize) -> anyhow::Result<Vec<Decision>> {
+        self.store.history(
+            |d| d.target.contains(&target) || target.contains(&d.target),
+            limit,
+        )
     }
 
     pub fn agents(&self) -> Vec<AgentView> {

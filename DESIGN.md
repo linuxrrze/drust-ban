@@ -193,7 +193,7 @@ accepted from an unauthenticated peer.
 | Link                                  | Protection                                                      |
 |---------------------------------------|-----------------------------------------------------------------|
 | agent ↔ controller (gRPC)             | TLS 1.3, **mutual** auth: agent client cert + controller server cert, both from the internal CA |
-| `df2bctl` / browser → controller      | TLS 1.3 (HTTPS); users authenticate with session/OIDC, CLI with API tokens; optional client certs |
+| `df2bctl` / browser → controller      | TLS 1.3 (HTTPS); users authenticate with a session (OIDC later), CLI with API tokens; optional client certs |
 | controller ↔ controller (HA)          | TLS 1.3 with mutual auth; PostgreSQL connections with `sslmode=verify-full` |
 | controller → external actions         | TLS with system trust store (cloud APIs, webhooks); BGP sessions with TCP-AO/MD5 where the peer supports it |
 | `df2bctl --local` → agent             | Unix socket only (no network), access by file permissions / `SO_PEERCRED` |
@@ -298,8 +298,8 @@ Rules:
   the name `df2b-controller`, so any address works), by a CA file, or by
   Mozilla's roots. Settings: flags, `DF2B_*` environment, or
   `~/.config/df2b/df2bctl.toml` (warns if readable by others).
-- Not yet: browser sessions (users with argon2, OIDC) for the web UI,
-  OpenAPI, SSE, request rate limiting, certificate hot reload.
+- Not yet: OIDC, OpenAPI, rate limiting beyond logins, certificate hot
+  reload.
 
 ### 4.5 Abuse safeguards
 
@@ -444,14 +444,66 @@ df2bctl config check | reload
 
 ## 9. Web frontend
 
-- Backend: `axum` REST API, OpenAPI spec generated with `utoipa`, Server-Sent
-  Events for live updates.
-- Frontend: SvelteKit SPA (static build), TypeScript client generated from the
-  OpenAPI spec, embedded into the controller binary with `rust-embed`
-  (single-binary deployment).
+- Backend: `axum` REST API on the HTTPS port, Server-Sent Events for live
+  updates; OpenAPI spec (`utoipa`) later.
+- Frontend: Svelte 5 + TypeScript, built with Vite into static files and
+  embedded into the controller binary with `rust-embed` (single-binary
+  deployment). Plain Vite rather than SvelteKit: SvelteKit's static output
+  needs an inline bootstrap script, which a strict CSP forbids. Hash routing
+  (`#/bans`), so the controller only serves real files.
 - Auth: local users (argon2) and optional OIDC. Roles: `viewer`, `operator`
   (ban/unban), `admin` (agents, policies, users). The same roles already apply
   to API tokens (§4.4).
+
+### Implementation
+
+- **Users**: `df2b-controller user add|passwd|set-role|list|delete` on the
+  controller host; `<state_dir>/users/<name>.json` (0600, directory 0700)
+  with an argon2id hash (RustCrypto defaults: 19 MiB, t=2). Users and API
+  tokens share one name space, so the audit log is unambiguous. Passwords
+  have at least 12 characters.
+- **Sessions**: `POST /api/v1/session` sets `__Host-df2b_session` (Secure,
+  HttpOnly, SameSite=Strict, Path=/). Only the SHA-256 of the session secret
+  is kept, in memory (a controller restart logs everybody out). Sessions end
+  after 4 h idle, 24 h in total, on logout (`DELETE /api/v1/session`), and
+  on the next request after the user is deleted or the password changed (the
+  user file is read on every request; role changes apply the same way).
+- **CSRF**: every request with a session cookie other than GET/HEAD must
+  send the session's token in `X-CSRF-Token` (returned by login and
+  `whoami`, kept in memory by the UI). A bearer token takes precedence over a
+  cookie and needs no CSRF token.
+- **Login limits**: 10 failures per 15 min per client (IPv6: per /64), 30
+  per user name (this lets an attacker lock a user out for 15 min, a
+  deliberate trade-off against password spraying); at most 4 password checks
+  run at once. Unknown names cost the same as wrong passwords (dummy hash).
+  Successful logins are audited, failures logged.
+- **Headers** on every response: CSP `default-src 'none'; script-src 'self';
+  style-src 'self'; connect-src 'self'; frame-ancestors 'none'; …` (the UI
+  sets no inline styles or scripts; charts use SVG attributes), HSTS,
+  `nosniff`, `no-referrer`, `X-Frame-Options: DENY`, COOP/CORP same-origin;
+  API responses `Cache-Control: no-store`, hashed assets cached immutably.
+- **Live updates**: `GET /api/v1/events` (SSE): `hello`, `decision` for
+  every new decision, `resync` when the client lagged, `logout` when the
+  token/session became invalid (re-checked every 30 s). Streams end after 1 h
+  and the browser reconnects; pages reload their data after each (re)connect.
+- **Dashboard data**: `GET /api/v1/stats` (new bans per hour for 48 h from an
+  in-memory histogram rebuilt from the log at start, active bans by family,
+  top jails, /16 and /32 networks, origins); `GET /api/v1/history?target=`
+  (all decisions overlapping an address or prefix, newest first; scans the
+  log).
+- **Pages**: overview (tiles, bans per hour, top lists, latest bans, agents
+  needing attention: offline, firewall error, certificate expiring within 3
+  days), bans (search, filter by jail and family, sort, ban dialog, single
+  and bulk unban), agents (state, details, revoke, enrollment token dialog),
+  address lookup (active bans, decision timeline, ban/unban), audit log
+  (admin, paged). Operator/admin actions are hidden for lower roles; the API
+  enforces them regardless.
+- Dependencies pinned to exact versions at least two weeks old; `npm` runs
+  with `ignore-scripts`. The built UI is ~90 KB of JavaScript (31 KB gzip).
+- Not yet: OIDC, user management and own password change in the UI,
+  observation timelines and sample log lines (needs observation reporting),
+  ASN/GeoIP, "allow for X" after unban, policies/jails and allowlist editing,
+  changing an agent's group.
 
 Pages:
 
@@ -484,7 +536,7 @@ crates/
   df2b-agent/       agent binary (config, tracker, engine)
   df2b-controller/  controller binary (axum + tonic + sqlx + embedded UI)
   df2bctl/          CLI binary (clap)
-web/                SvelteKit frontend
+web/                Svelte + Vite frontend (built into web/dist, embedded)
 config/             example configuration
 filters/            bundled filters
 packaging/          systemd units, later deb/rpm
@@ -519,11 +571,11 @@ systemd hardening.
 | Agent state (redb)           | source positions + offender records, flushed every 1 s; bans re-applied on start |
 | `df2bctl`                    | `filter test` + controller commands; `--local`, ip, allowlist, jails, config TODO |
 | Controller                   | CA, enrollment, AgentService over mTLS, decision log (redb), `propagate_local` |
-| REST API                     | HTTPS (TLS 1.3), API tokens with roles, agents, enrollment tokens, bans, unban, audit log; browser sessions TODO |
+| REST API                     | HTTPS (TLS 1.3), API tokens and browser sessions with roles, agents, enrollment tokens, bans, unban, audit log, stats, IP history, SSE |
 | gRPC protocol                | Enroll, Renew, Heartbeat, Report, Subscribe implemented |
 | Agent ↔ controller link      | enrollment with CA pinning, renewal, reconnect with backoff, remote bans applied |
-| Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI → controller (HTTPS) done; HA, external actions, local socket TODO |
-| Web UI                       | placeholder                                      |
+| Encrypted transport (§4.4)   | agent ↔ controller (mTLS) and CLI/browser → controller (HTTPS) done; HA, external actions, local socket TODO |
+| Web UI                       | Svelte, embedded: login, overview, bans, agents, address lookup, audit log; live updates; OIDC TODO |
 
 ---
 
@@ -534,7 +586,7 @@ These defaults are assumed until decided otherwise:
 1. **Scale** – SQLite on the controller; observations aggregated per 5 s per agent.
    Revisit if > ~200 agents or very high event rates.
 2. **Firewall backends** – nftables first; iptables/ipset and edge (BGP) later.
-3. **Frontend stack** – SvelteKit SPA embedded in the controller (alternatives:
-   Leptos for an all-Rust stack, or server-rendered htmx).
+3. **Frontend stack** – decided: Svelte 5 + Vite SPA embedded in the controller
+   (§9; not SvelteKit, because of the CSP).
 4. **Trust model** – `propagate_local` by default; `quorum` available for
    environments where agents are less trusted.

@@ -127,6 +127,28 @@ impl Store {
         Ok(out)
     }
 
+    /// Newest first, at most `limit` decisions matching `filter`.
+    pub fn history(
+        &self,
+        filter: impl Fn(&Decision) -> bool,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Decision>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(DECISIONS)?;
+        let mut out = Vec::new();
+        for item in t.iter()?.rev() {
+            let (_, v) = item?;
+            let d: Decision = serde_json::from_slice(v.value())?;
+            if filter(&d) {
+                out.push(d);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Calls `f` for every decision in order (startup replay).
     pub fn for_each(&self, mut f: impl FnMut(Decision)) -> anyhow::Result<()> {
         let tx = self.db.begin_read()?;

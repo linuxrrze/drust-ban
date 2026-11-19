@@ -3,17 +3,20 @@
 //! Implemented: internal CA, enrollment, `AgentService` over mutual TLS 1.3
 //! (heartbeats, ban reports, decision log with resumable subscriptions),
 //! `propagate_local` policy, authenticated REST API over HTTPS (API tokens
-//! with roles, manual ban/unban, agents, audit log).
+//! with roles, manual ban/unban, agents, audit log), web UI with local users
+//! and live updates (SSE).
 //!
-//! TODO: browser sessions + web UI, observation rollups and correlation
-//! policies, sqlx storage, log compaction.
+//! TODO: OIDC, observation rollups and correlation policies, sqlx storage,
+//! log compaction.
 
 mod api;
 mod files;
 mod grpc;
 mod https;
+mod session;
 mod state;
 mod store;
+mod ui;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -60,7 +63,7 @@ struct ServeArgs {
     #[arg(long, env = "DF2B_GRPC_LISTEN", default_value = "[::]:7443")]
     grpc_listen: SocketAddr,
 
-    /// Address for the REST API (HTTPS, API tokens).
+    /// Address for the REST API and web UI (HTTPS).
     #[arg(long, env = "DF2B_HTTPS_LISTEN", default_value = "[::]:7444")]
     https_listen: SocketAddr,
 
@@ -110,6 +113,35 @@ enum Cmd {
     /// Manage REST API tokens.
     #[command(subcommand)]
     ApiToken(ApiTokenCmd),
+    /// Manage web UI users. Run as the controller's user: the files are
+    /// private (mode 0600).
+    #[command(subcommand)]
+    User(UserCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum UserCmd {
+    /// Create a user; asks for the password (or reads one line from stdin).
+    Add {
+        name: String,
+        #[arg(long, value_enum)]
+        role: Role,
+    },
+    /// Set a new password; the user's sessions end.
+    Passwd {
+        name: String,
+    },
+    /// Change a user's role (effective on their next request).
+    SetRole {
+        name: String,
+        #[arg(value_enum)]
+        role: Role,
+    },
+    List,
+    /// Delete a user; their sessions end immediately.
+    Delete {
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -163,6 +195,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Cmd::ApiToken(cmd)) => api_token(dir, cmd),
+        Some(Cmd::User(cmd)) => user(dir, cmd),
         Some(Cmd::Serve) | None => tokio::runtime::Runtime::new()?.block_on(serve(args)),
     }
 }
@@ -209,6 +242,68 @@ fn api_token(dir: &std::path::Path, cmd: ApiTokenCmd) -> anyhow::Result<()> {
                 bail!("no API token named {name:?}");
             }
             println!("API token {name:?} revoked");
+        }
+    }
+    Ok(())
+}
+
+/// Asks twice on a terminal; otherwise reads one line from stdin.
+fn read_password(prompt: &str) -> anyhow::Result<String> {
+    if std::io::stdin().is_terminal() {
+        let p = rpassword::prompt_password(format!("{prompt}: "))?;
+        if rpassword::prompt_password("repeat: ")? != p {
+            bail!("passwords differ");
+        }
+        Ok(p)
+    } else {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+    }
+}
+
+fn user(dir: &std::path::Path, cmd: UserCmd) -> anyhow::Result<()> {
+    match cmd {
+        UserCmd::Add { name, role } => {
+            let pw = read_password(&format!(
+                "password for {name} (at least {} characters)",
+                files::MIN_PASSWORD_LEN
+            ))?;
+            files::create_user(dir, &name, role, &pw)?;
+            println!(
+                "user {name:?} ({}) created",
+                format!("{role:?}").to_lowercase()
+            );
+        }
+        UserCmd::Passwd { name } => {
+            if files::load_user(dir, &name)?.is_none() {
+                bail!("no user {name:?}");
+            }
+            let pw = read_password(&format!("new password for {name}"))?;
+            files::update_user(dir, &name, None, Some(&pw))?;
+            println!("password of {name:?} changed; their sessions have ended");
+        }
+        UserCmd::SetRole { name, role } => {
+            files::update_user(dir, &name, Some(role), None)?;
+            println!("{name:?} is now {}", format!("{role:?}").to_lowercase());
+        }
+        UserCmd::List => {
+            for u in files::list_users(dir)? {
+                println!(
+                    "{:<24} {:<9} created {}  password changed {}",
+                    u.name,
+                    format!("{:?}", u.role).to_lowercase(),
+                    u.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    u.password_changed_at
+                        .to_rfc3339_opts(SecondsFormat::Secs, true),
+                );
+            }
+        }
+        UserCmd::Delete { name } => {
+            if !files::delete_user(dir, &name)? {
+                bail!("no user {name:?}");
+            }
+            println!("user {name:?} deleted");
         }
     }
     Ok(())
@@ -278,7 +373,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     info!(
         addr = %a.https_listen,
         certificate = if a.https_cert.is_some() { "operator" } else { "internal CA" },
-        "REST API listening (HTTPS, TLS 1.3)"
+        "REST API and web UI listening (HTTPS, TLS 1.3)"
     );
     let rest = https::serve(
         https_listener,

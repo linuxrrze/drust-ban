@@ -5,6 +5,7 @@
 //! <state_dir>/enroll-tokens/<sha256(secret)>.json   pending one-time tokens
 //! <state_dir>/revoked/<agent-id>    revoked agents
 //! <state_dir>/api-tokens/<sha256(secret)>.json      REST API tokens
+//! <state_dir>/users/<name>.json      web UI users (argon2id hash, 0600)
 //! <state_dir>/controller.redb       agents + decision log (see store.rs)
 //! ```
 //!
@@ -30,6 +31,10 @@ const CA_KEY: &str = "ca.key";
 const TOKENS: &str = "enroll-tokens";
 const REVOKED: &str = "revoked";
 const API_TOKENS: &str = "api-tokens";
+const USERS: &str = "users";
+
+/// Shortest accepted password.
+pub const MIN_PASSWORD_LEN: usize = 12;
 
 /// Writes `data` atomically (temp file + rename) with `mode`.
 pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
@@ -208,6 +213,9 @@ pub fn create_api_token(
     if list_api_tokens(dir)?.iter().any(|t| t.name == name) {
         bail!("an API token named {name:?} exists already (revoke it first)");
     }
+    if user_path(dir, name).exists() {
+        bail!("{name:?} is a user name; API tokens and users share one namespace (audit log)");
+    }
     let token = ApiToken::generate();
     let now = Utc::now();
     let file = ApiTokenFile {
@@ -255,6 +263,154 @@ pub fn lookup_api_token(dir: &Path, token: &ApiToken) -> Option<ApiTokenFile> {
         .join(format!("{}.json", token.secret_hash()));
     let t: ApiTokenFile = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     t.expires_at.map_or(true, |e| e > Utc::now()).then_some(t)
+}
+
+// -------------------------------------------------------------------- users
+
+/// A web UI user. Created, changed and deleted on the controller host
+/// (`df2b-controller user ...`); read on every request, so deletion and role
+/// or password changes take effect immediately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserFile {
+    pub name: String,
+    pub role: Role,
+    /// argon2id, PHC string format
+    pub password_hash: String,
+    pub created_at: DateTime<Utc>,
+    /// Sessions created before this are invalid.
+    pub password_changed_at: DateTime<Utc>,
+}
+
+fn user_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(USERS).join(format!("{name}.json"))
+}
+
+fn hash_password(password: &str) -> anyhow::Result<String> {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        bail!("password must have at least {MIN_PASSWORD_LEN} characters");
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("hashing password: {e}"))?
+        .to_string())
+}
+
+/// Constant work whether or not `hash` belongs to a real user.
+pub fn verify_password(hash: Option<&str>, password: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let dummy = DUMMY.get_or_init(|| {
+        hash_password(&df2b_tls::hex(&df2b_tls::random_bytes::<16>())).expect("hashing")
+    });
+    let (hash, real) = match hash {
+        Some(h) => (h, true),
+        None => (dummy.as_str(), false),
+    };
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    let ok = argon2::Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok();
+    ok && real
+}
+
+fn write_user(dir: &Path, u: &UserFile) -> anyhow::Result<()> {
+    let udir = dir.join(USERS);
+    fs::create_dir_all(&udir)?;
+    fs::set_permissions(&udir, fs::Permissions::from_mode(0o700))?;
+    // the hash allows offline guessing: readable by the controller only
+    write_atomic(
+        &user_path(dir, &u.name),
+        &serde_json::to_vec_pretty(u)?,
+        0o600,
+    )?;
+    Ok(())
+}
+
+pub fn create_user(dir: &Path, name: &str, role: Role, password: &str) -> anyhow::Result<()> {
+    if !valid_name(name) {
+        bail!("invalid user name {name:?} (allowed: letters, digits, - _ . @)");
+    }
+    if user_path(dir, name).exists() {
+        bail!("user {name:?} exists already");
+    }
+    if list_api_tokens(dir)?.iter().any(|t| t.name == name) {
+        bail!(
+            "{name:?} is an API token name; API tokens and users share one namespace (audit log)"
+        );
+    }
+    let now = Utc::now();
+    write_user(
+        dir,
+        &UserFile {
+            name: name.to_owned(),
+            role,
+            password_hash: hash_password(password)?,
+            created_at: now,
+            password_changed_at: now,
+        },
+    )
+}
+
+/// The user, if `name` is valid and exists.
+pub fn load_user(dir: &Path, name: &str) -> anyhow::Result<Option<UserFile>> {
+    if !valid_name(name) {
+        return Ok(None);
+    }
+    match fs::read(user_path(dir, name)) {
+        Ok(d) => Ok(Some(serde_json::from_slice(&d)?)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading user {name:?}")),
+    }
+}
+
+pub fn list_users(dir: &Path) -> anyhow::Result<Vec<UserFile>> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(dir.join(USERS)) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for e in entries.flatten() {
+        if e.path().extension().is_some_and(|x| x == "json") {
+            out.push(serde_json::from_slice::<UserFile>(&fs::read(e.path())?)?);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Sets a new password and/or role; a new password ends all sessions.
+pub fn update_user(
+    dir: &Path,
+    name: &str,
+    role: Option<Role>,
+    password: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut u = load_user(dir, name)?.with_context(|| format!("no user {name:?}"))?;
+    if let Some(r) = role {
+        u.role = r;
+    }
+    if let Some(p) = password {
+        u.password_hash = hash_password(p)?;
+        u.password_changed_at = Utc::now();
+    }
+    write_user(dir, &u)
+}
+
+/// False if there is no such user.
+pub fn delete_user(dir: &Path, name: &str) -> anyhow::Result<bool> {
+    if !valid_name(name) {
+        return Ok(false);
+    }
+    match fs::remove_file(user_path(dir, name)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn valid_agent_id(id: &str) -> bool {
@@ -347,6 +503,55 @@ mod tests {
         assert!(!revoke_api_token(&dir, "alice").unwrap());
         assert!(lookup_api_token(&dir, &t).is_none());
         assert!(Role::Admin > Role::Operator && Role::Operator > Role::Viewer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn users() {
+        let dir = tmp("users");
+        assert!(create_user(&dir, "alice", Role::Admin, "short").is_err());
+        create_user(&dir, "alice", Role::Admin, "correct horse battery").unwrap();
+        assert!(create_user(&dir, "alice", Role::Viewer, "another long password").is_err());
+        assert!(create_user(&dir, "../x", Role::Viewer, "another long password").is_err());
+        create_api_token(&dir, "ci", Role::Viewer, None).unwrap();
+        assert!(create_user(&dir, "ci", Role::Viewer, "another long password").is_err());
+        assert!(create_api_token(&dir, "alice", Role::Viewer, None).is_err());
+
+        let u = load_user(&dir, "alice").unwrap().unwrap();
+        assert!(u.password_hash.starts_with("$argon2id$"));
+        let mode = fs::metadata(user_path(&dir, "alice"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(verify_password(
+            Some(&u.password_hash),
+            "correct horse battery"
+        ));
+        assert!(!verify_password(
+            Some(&u.password_hash),
+            "wrong horse battery"
+        ));
+        assert!(!verify_password(None, "correct horse battery"));
+        assert!(load_user(&dir, "../../etc/passwd").unwrap().is_none());
+
+        update_user(
+            &dir,
+            "alice",
+            Some(Role::Viewer),
+            Some("a new long password"),
+        )
+        .unwrap();
+        let v = load_user(&dir, "alice").unwrap().unwrap();
+        assert_eq!(v.role, Role::Viewer);
+        assert!(v.password_changed_at > u.password_changed_at);
+        assert!(verify_password(
+            Some(&v.password_hash),
+            "a new long password"
+        ));
+        assert_eq!(list_users(&dir).unwrap().len(), 1);
+        assert!(delete_user(&dir, "alice").unwrap());
+        assert!(!delete_user(&dir, "alice").unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

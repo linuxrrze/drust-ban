@@ -5,8 +5,13 @@ A distributed fail2ban replacement written in Rust. See [DESIGN.md](DESIGN.md).
 ## Build
 
 ```sh
+# web UI first (Node.js 20+); it is embedded into the controller binary.
+# Without it the controller serves a short notice instead of the UI.
+npm --prefix web ci && npm --prefix web run build
+
 cargo build --workspace
 cargo test --workspace
+npm --prefix web run check      # type-check the UI
 # without journald support (libsystemd is loaded at runtime, so this is
 # only needed to drop the dependency entirely):
 cargo build -p df2b-agent --no-default-features
@@ -70,6 +75,22 @@ cargo run -p df2bctl -- audit
 curl --cacert /tmp/df2b-ctl/ca.pem --resolve df2b-controller:7444:127.0.0.1 \
     -H "Authorization: Bearer df2bapi1.…" https://df2b-controller:7444/api/v1/status
 ```
+
+### Web UI (same port, 7444)
+
+```sh
+# On the controller host, as the controller's user (the files are 0600):
+cargo run -p df2b-controller -- --state-dir /tmp/df2b-ctl user add ada --role admin
+#   asks for the password (min. 12 characters); or pipe it on stdin
+# also: user list, user passwd ada, user set-role ada viewer, user delete ada
+```
+
+Then open `https://<controller>:7444/`. With the internal CA the browser warns
+until you trust `<state-dir>/ca.pem` and use the name `df2b-controller` (or a
+`--name`); for a public name use `--https-cert/--https-key`.
+
+UI development with hot reload against a running controller:
+`DF2B_CONTROLLER=https://127.0.0.1:7444 npm --prefix web run dev`.
 
 With systemd, put `DF2B_ENROLL_TOKEN=df2b1.…` into `/etc/df2b/agent.env` for
 the first start (the unit reads it); the token is useless afterwards.
