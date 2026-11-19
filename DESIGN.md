@@ -48,14 +48,28 @@ Why not peer-to-peer gossip:
 
 ### 2.1 journald
 
-- Use `libsystemd` (`sd-journal`) via FFI behind the cargo feature `journald`.
+- Use `libsystemd`'s `sd-journal` API, **loaded at runtime** (`dlopen` of
+  `libsystemd.so.0`). Building needs no systemd headers, the feature
+  `journald` is on by default, and the same binary runs on hosts without
+  systemd (a journald source then fails at startup with a clear error).
   Never spawn `journalctl`.
-- Apply journal matches at the source (`_SYSTEMD_UNIT=sshd.service`,
-  `SYSLOG_IDENTIFIER=…`) so filtering happens inside the journal library.
-- Integrate `sd_journal_get_fd()` with tokio's `AsyncFd`: no polling thread.
-- Persist the journal **cursor**: restarts resume exactly, without gaps or
-  re-reading.
-- Timestamps come from `__REALTIME_TIMESTAMP`; no date parsing needed.
+- Apply journal matches at the source so filtering happens inside libsystemd.
+  `journalctl` semantics: same field = OR, different fields = AND, a `"+"`
+  term starts a new OR group.
+- **One dedicated OS thread per journald source.** An `sd_journal` handle is
+  not thread-safe and must stay on the thread that opened it, so the thread
+  reads entries as fast as the journal yields them and blocks in
+  `sd_journal_wait` once caught up (with a short timeout to notice shutdown).
+  This is simpler and faster than an `AsyncFd` integration, which would still
+  have to call back into the handle from one fixed thread.
+- Per entry only `MESSAGE` and `__REALTIME_TIMESTAMP` are read (no date
+  parsing), with a data threshold so oversized messages are not fully
+  decompressed. The **cursor** is fetched once per batch, not per entry, and
+  travels with the batch so it can be persisted; restarts then resume
+  exactly. Without a cursor, `start` selects `tail` (default), `head` or a
+  look-back duration.
+- Configuration errors (missing libsystemd, invalid match, unreadable
+  `directory`) surface when the agent starts, not later on the thread.
 
 ### 2.2 Files
 
@@ -82,8 +96,18 @@ uses a three-stage matcher:
 
 `fancy-regex` is available as an opt-in for filters that need lookaround.
 
-Matching runs on a worker pool fed by bounded channels; a full channel applies
-back-pressure to the sources instead of growing memory without limit.
+Sources send **batches** of up to 1024 lines, each tagged with the source
+position (journal cursor or file offset) after its last line. Batching
+amortizes channel synchronization, and the agent applies all bans that result
+from one batch in a single firewall transaction. The channel is bounded (in
+batches), so a slow engine applies back-pressure to the sources instead of
+growing memory without limit.
+
+Measured on one core (release build, 2M syslog lines, 5% sshd failures):
+the matcher alone handles ~3.1M lines/s; the whole agent pipeline
+(file source → batches → engine → dry-run bans) ~3M lines/s. The engine
+currently runs on one task; sharding jails across a worker pool is the next
+step if a single host ever exceeds that.
 
 Filter authors should anchor patterns at the end of the line (`$`) and use a
 greedy `.*` before the host, so that attacker-controlled text (e.g. user names
@@ -233,7 +257,8 @@ allowlist = ["127.0.0.0/8", "::1/128"]
 [[source]]
 name = "sshd"
 type = "journald"
-matches = ["_SYSTEMD_UNIT=sshd.service"]
+matches = ["_SYSTEMD_UNIT=sshd.service", "_SYSTEMD_UNIT=ssh.service"]
+start = "10m"                  # "tail" (default), "head", or a look-back
 
 [[source]]
 name = "nginx"
@@ -314,7 +339,7 @@ their tracker counters for that key.
 crates/
   df2b-core/        IpKey/prefix normalization, Decision model, allowlist, ban-time escalation
   df2b-proto/       protobuf definitions + tonic codegen (vendored protoc)
-  df2b-sources/     file tailer, journald (feature `journald`)
+  df2b-sources/     file tailer, journald (feature `journald`, libsystemd via dlopen)
   df2b-matcher/     filter definitions, literal prefilter, RegexSet matching
   df2b-firewall/    FirewallBackend trait, nftables, dry-run
   df2b-agent/       agent binary (config, tracker, engine)
@@ -349,8 +374,8 @@ systemd hardening.
 | `IpKey`, decisions, ban time | implemented + tests                              |
 | Matcher (prefilter/RegexSet) | implemented + tests                              |
 | File tailer                  | polling implementation; inotify, globs, persisted offsets TODO |
-| journald                     | stub behind feature `journald`                   |
-| Tracker / engine             | implemented + tests                              |
+| journald                     | implemented (dlopen, dedicated thread, batches, cursors); cursor persistence TODO |
+| Tracker / engine             | implemented + tests; one firewall transaction per batch |
 | nftables backend             | via `nft -f -`; netlink + reconcile loop TODO    |
 | Agent state (redb)           | TODO                                             |
 | `df2bctl filter test`        | implemented; other commands are stubs            |

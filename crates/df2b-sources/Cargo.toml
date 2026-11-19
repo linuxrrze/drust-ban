@@ -6,12 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-# journald via libsystemd (currently a stub, see src/journald.rs)
-journald = []
+# journald via libsystemd, loaded at runtime (no build-time dependency)
+journald = ["dep:libloading"]
 
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+libloading = { workspace = true, optional = true }
 memchr.workspace = true
 tokio.workspace = true
 tracing.workspace = true

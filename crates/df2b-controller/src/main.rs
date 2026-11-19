@@ -7,6 +7,7 @@
 //! - REST API (utoipa OpenAPI), SSE live updates, auth (argon2 / OIDC),
 //! - embedded web UI (rust-embed of web/build).
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 
 use axum::routing::get;
@@ -38,6 +39,8 @@ fn router() -> Router {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        // no color codes in files or the journal
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )

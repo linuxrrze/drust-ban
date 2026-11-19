@@ -23,7 +23,12 @@ allowlist = ["127.0.0.0/8", "::1/128"]
 [[source]]
 name = "sshd-journal"
 type = "journald"
-matches = ["_SYSTEMD_UNIT=sshd.service"]
+# journalctl-style matches; same field = OR, different fields = AND,
+# "+" starts a new OR group. Filtering happens inside libsystemd.
+matches = ["_SYSTEMD_UNIT=sshd.service", "_SYSTEMD_UNIT=ssh.service"]
+# "tail" (default), "head", or a duration: start that long ago
+start = "10m"
+# directory = "/var/log/journal/<machine-id>"   # instead of the system journal
 
 [[source]]
 name = "auth-log"

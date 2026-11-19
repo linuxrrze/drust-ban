@@ -68,10 +68,43 @@ pub enum SourceKind {
         start_at_end: bool,
     },
     Journald {
-        /// journal matches, e.g. "_SYSTEMD_UNIT=sshd.service"
+        /// journalctl-style matches, e.g. "_SYSTEMD_UNIT=sshd.service";
+        /// "+" starts a new OR group.
         #[serde(default)]
         matches: Vec<String>,
+        /// Read journal files from this directory instead of the system journal.
+        #[serde(default)]
+        directory: Option<PathBuf>,
+        /// Where to start without a saved cursor: "tail" (default), "head",
+        /// or a duration such as "10m" (start that long ago).
+        #[serde(default)]
+        start: JournalStart,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum JournalStart {
+    #[default]
+    Tail,
+    Head,
+    Since(Duration),
+}
+
+impl TryFrom<String> for JournalStart {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "tail" => Ok(Self::Tail),
+            "head" => Ok(Self::Head),
+            other => humantime::parse_duration(other)
+                .map(Self::Since)
+                .map_err(|_| {
+                    format!("start must be \"tail\", \"head\" or a duration, got {other:?}")
+                }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,7 +206,13 @@ mod tests {
         let cfg: AgentConfig = toml::from_str(text).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.jail[0].findtime, Duration::from_secs(600));
-        assert!(matches!(cfg.source[0].kind, SourceKind::Journald { .. }));
+        assert!(matches!(
+            cfg.source[0].kind,
+            SourceKind::Journald {
+                start: JournalStart::Since(d),
+                ..
+            } if d == Duration::from_secs(600)
+        ));
         assert!(matches!(cfg.source[1].kind, SourceKind::File { .. }));
     }
 

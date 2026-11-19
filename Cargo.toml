@@ -23,6 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
 humantime-serde = "1"
+libloading = "0.8"
 ipnet = { version = "2", features = ["serde"] }
 memchr = "2"
 prost = "0.13"
