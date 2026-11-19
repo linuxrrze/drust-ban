@@ -496,7 +496,9 @@ df2bctl config check | reload
   and bulk unban), agents (state, details, revoke, enrollment token dialog),
   address lookup (active bans, decision timeline, ban/unban), audit log
   (admin, paged). Operator/admin actions are hidden for lower roles; the API
-  enforces them regardless.
+  enforces them regardless. The admin pages (users, API tokens, sessions,
+  audit log) sit in an "Admin" menu (disclosure pattern: Escape, outside
+  click and leaving it with Tab close it; shown inline on phones).
 - **OIDC** (`--oidc-config`, see `config/oidc.example.toml`; crate
   `openidconnect` 4 on the controller's rustls/reqwest stack, no redirects
   followed): authorization code flow with PKCE (S256), `state` and `nonce`.

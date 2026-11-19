@@ -3,6 +3,7 @@
   import { liveConnected, startLive, stopLive } from './lib/live.svelte';
   import { href, route } from './lib/router.svelte';
   import { can, session } from './lib/session.svelte';
+  import NavGroup from './components/NavGroup.svelte';
   import Toasts from './components/Toasts.svelte';
   import Agents from './pages/Agents.svelte';
   import Audit from './pages/Audit.svelte';
@@ -30,18 +31,20 @@
   });
 
   const page = $derived(route.parts[0] ?? '');
-  const nav = $derived([
-    { id: '', label: 'Overview', show: true },
-    { id: 'bans', label: 'Bans', show: true },
-    { id: 'agents', label: 'Agents', show: true },
-    { id: 'ip', label: 'Address lookup', show: true },
-    { id: 'users', label: 'Users', show: can('admin') },
-    { id: 'tokens', label: 'API tokens', show: can('admin') },
-    { id: 'sessions', label: 'Sessions', show: can('admin') },
-    { id: 'audit', label: 'Audit log', show: can('admin') },
-  ]);
+  const nav = [
+    { id: '', label: 'Overview' },
+    { id: 'bans', label: 'Bans' },
+    { id: 'agents', label: 'Agents' },
+    { id: 'ip', label: 'Address lookup' },
+  ];
+  const adminNav = [
+    { id: 'users', label: 'Users' },
+    { id: 'tokens', label: 'API tokens' },
+    { id: 'sessions', label: 'Sessions' },
+    { id: 'audit', label: 'Audit log' },
+  ];
   let menuOpen = $state(false);
-  const adminPages = ['users', 'tokens', 'sessions', 'audit'];
+  const adminPages = adminNav.map((n) => n.id);
 </script>
 
 {#if !session.checked}
@@ -66,9 +69,12 @@
       </a>
       <button class="menu-btn" aria-expanded={menuOpen} aria-controls="nav" onclick={() => (menuOpen = !menuOpen)}>Menu</button>
       <nav id="nav" class:open={menuOpen}>
-        {#each nav.filter((n) => n.show) as n (n.id)}
+        {#each nav as n (n.id)}
           <a href={href(...(n.id ? [n.id] : []))} class:active={page === n.id} aria-current={page === n.id ? 'page' : undefined} onclick={() => (menuOpen = false)}>{n.label}</a>
         {/each}
+        {#if can('admin')}
+          <NavGroup label="Admin" items={adminNav} {page} onnavigate={() => (menuOpen = false)} />
+        {/if}
       </nav>
       <span class="spacer"></span>
       <span class="live" title={liveConnected() ? 'Receiving live updates' : 'Live updates disconnected, reconnecting'}>
@@ -118,7 +124,7 @@
   }
   .brand { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 700; font-size: 15px; }
   .brand:hover { text-decoration: none; }
-  nav { display: flex; gap: 2px; }
+  nav { display: flex; gap: 2px; align-items: center; }
   nav a { color: var(--text-2); padding: 6px 10px; border-radius: 8px; font-weight: 550; }
   nav a:hover { background: var(--surface-2); text-decoration: none; }
   nav a.active { color: var(--text); background: var(--surface-2); }
@@ -140,7 +146,7 @@
     .spacer { display: none; }
     .live { margin-left: auto; }
     .live-text, .user .faint { display: none; }
-    nav { order: 10; width: 100%; flex-direction: column; display: none; }
+    nav { order: 10; width: 100%; flex-direction: column; align-items: stretch; display: none; }
     nav.open { display: flex; }
   }
 </style>
