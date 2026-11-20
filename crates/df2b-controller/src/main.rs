@@ -176,12 +176,11 @@ enum Cmd {
 
 #[derive(Debug, Subcommand)]
 enum OidcNameCmd {
+    /// Bound names with their account (issuer and subject).
     List,
     /// Free a name for another account (after a rename or deletion at the
     /// identity provider); the next login with it binds it again.
-    Release {
-        name: String,
-    },
+    Release { name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,20 +192,17 @@ enum UserCmd {
         role: Role,
     },
     /// Set a new password; the user's sessions end.
-    Passwd {
-        name: String,
-    },
+    Passwd { name: String },
     /// Change a user's role (effective on their next request).
     SetRole {
         name: String,
         #[arg(value_enum)]
         role: Role,
     },
+    /// Users, roles and when their passwords were changed.
     List,
     /// Delete a user; their sessions end immediately.
-    Delete {
-        name: String,
-    },
+    Delete { name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -225,11 +221,10 @@ enum ApiTokenCmd {
         #[arg(long, default_value = "https://<controller-host>:7444")]
         url: String,
     },
+    /// Token names, roles and expiry (never the secrets).
     List,
     /// Delete a token by name (takes effect immediately).
-    Revoke {
-        name: String,
-    },
+    Revoke { name: String },
 }
 
 /// `--generate-man <DIR>` as the only arguments (hidden, for the package

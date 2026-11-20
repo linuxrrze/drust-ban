@@ -159,12 +159,9 @@ enum RedactionCmd {
         disabled: bool,
     },
     /// Add a preset (ssh-user, auth-header, email, url-query) under its name.
-    Preset {
-        name: String,
-    },
-    Rm {
-        name: String,
-    },
+    Preset { name: String },
+    /// Delete a redaction rule (admin).
+    Rm { name: String },
     /// Show what lines look like after the current rules (and --pattern).
     Test {
         lines: Vec<String>,
@@ -177,19 +174,15 @@ enum RedactionCmd {
 
 #[derive(Debug, Subcommand)]
 enum AgentsCmd {
+    /// Enrolled agents and their status.
     List,
-    Show {
-        id: String,
-    },
-    Revoke {
-        id: String,
-    },
+    /// One agent: host name, group, last heartbeat, version and status.
+    Show { id: String },
+    /// Revoke an agent (admin): its connections are closed and refused.
+    Revoke { id: String },
     /// Move an agent to another group (admin): bans of the old group are
     /// removed from it, those of the new group applied.
-    SetGroup {
-        id: String,
-        group: String,
-    },
+    SetGroup { id: String, group: String },
     /// Create a one-time enrollment token.
     EnrollToken {
         #[arg(long, default_value = "default")]
@@ -201,6 +194,7 @@ enum AgentsCmd {
 
 #[derive(Debug, Subcommand)]
 enum BansCmd {
+    /// Active bans (--jail: only those of one jail).
     List {
         #[arg(long)]
         jail: Option<String>,
@@ -373,9 +367,8 @@ enum CorrelationCmd {
         #[arg(long)]
         disabled: bool,
     },
-    Rm {
-        name: String,
-    },
+    /// Delete a correlation rule (admin).
+    Rm { name: String },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
