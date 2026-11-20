@@ -408,6 +408,12 @@ can do is bounded (security review 2026-11-19, regression tests for each):
   logins per client and 100 per network; 10 event streams per caller;
   filter tests off the async workers, two at a time; user text cleaned of
   control characters before it reaches decisions, the audit log or logs.
+- **systemd units**: both services run sandboxed (ProtectSystem=strict,
+  no new privileges, only the capabilities they need) with a system call
+  filter: `@system-service` without `@privileged` and `@resources`, other
+  calls fail with EPERM. CI installs the packages on a runner and runs
+  enrollment and bans through nftables and ipset under these units
+  (`packaging/test/systemd-e2e.sh`).
 - **Local**: the agent's state is private (0600, unit UMask 0077), the
   control socket is 0600 with SO_PEERCRED; log lines over 16 KiB are cut
   and their rest skipped, live lines cannot claim old time stamps; sshd

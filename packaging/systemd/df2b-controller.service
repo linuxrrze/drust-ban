@@ -38,6 +38,13 @@ RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# System calls: what services need (systemd's @system-service), without
+# @privileged and @resources; anything else fails with EPERM. Action
+# programs (--actions) inherit this. Checked with strace and, in CI, under
+# systemd (packaging/test/systemd-e2e.sh).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

@@ -209,11 +209,32 @@ jobs:
           path: target/generate-rpm/*.rpm
           if-no-files-found: error
 
+  # the packaged services under real systemd (sandboxing, system call
+  # filter) with real nftables and ipset/iptables: a GitHub runner is a VM
+  # with systemd as PID 1, so no container here
+  systemd:
+    name: systemd services (amd64)
+    needs: deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: debs-amd64
+          path: debs
+
+      - name: End-to-end test
+        run: sudo packaging/test/systemd-e2e.sh debs
+
   # one release job for both package formats (no two jobs racing to create
   # the same release)
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [deb, rpm]
+    needs: [deb, rpm, systemd]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

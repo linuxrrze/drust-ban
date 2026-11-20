@@ -51,6 +51,15 @@ RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# System calls: what services need (systemd's @system-service), without
+# @privileged and @resources; anything else fails with EPERM. Programs the
+# agent starts (nft, ipset, iptables, firewall_exec) inherit this; for an
+# exec program that needs more, add e.g. SystemCallFilter=@privileged in a
+# drop-in. Checked with strace and, in CI, under systemd with the nftables
+# and ipset backends (packaging/test/systemd-e2e.sh).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
