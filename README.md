@@ -116,8 +116,11 @@ hand) and saves modified configuration files as `*.rpmsave`.
 ## Containers
 
 `Containerfile` builds one image with all three programs (Debian trixie,
-with nft and libsystemd); `packaging/container/compose.yaml` runs the
-controller and an agent on one host:
+with nft and libsystemd). Releases publish it for amd64 and arm64 as
+`ghcr.io/linuxrrze/drust-ban:<version>` (and `:latest`).
+`packaging/container/compose.yaml` runs the controller and an agent on one
+host, with the image built from the source tree or, with
+`DF2B_IMAGE=ghcr.io/linuxrrze/drust-ban:<version>`, the released one:
 
 ```sh
 cd packaging/container

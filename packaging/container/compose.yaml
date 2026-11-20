@@ -6,6 +6,10 @@
 #   DF2B_ENROLL_TOKEN=df2b1.… docker compose up -d agent
 #   docker compose exec agent df2bctl --local status
 #
+# The image is built from the source tree, unless DF2B_IMAGE names a
+# released one (pulled when missing), e.g.
+#   DF2B_IMAGE=ghcr.io/linuxrrze/drust-ban:0.1.2 docker compose up -d …
+#
 # The token is only needed for the first start (the agent's certificate is
 # then kept in its volume). Other hosts run just the agent service, with
 # `controller` in agent.toml pointing to this host.
@@ -18,7 +22,7 @@
 name: df2b
 
 x-image: &image
-  image: df2b:latest
+  image: ${DF2B_IMAGE:-df2b:latest}
   build:
     context: ../..
     dockerfile: Containerfile
