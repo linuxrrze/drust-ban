@@ -721,8 +721,15 @@ df2bctl config check | reload
   `groups_claim` (dotted paths such as `realm_access.roles`), both completed
   from userinfo when missing (same `sub` required). The highest role whose
   group list matches wins, else `default_role`, else access is refused. The
-  name must be valid and must not belong to a local user or API token. The
-  result is an ordinary session (role fixed for `session_lifetime`, default
+  name must be valid and must not belong to a local user or API token. It
+  is bound to the account (issuer + `sub`) that used it first
+  (`<state_dir>/oidc-names/`): `preferred_username` can often be changed by
+  the user at the provider, and without the binding a renamed account would
+  appear under another user's name in sessions and the audit log. A name
+  bound to another account is refused (`conflict`); after a rename or
+  deletion at the provider the admin frees it with `df2b-controller
+  oidc-name release <name>` (`oidc-name list` shows the bindings). Local
+  users and API tokens cannot take a bound name either. The result is an ordinary session (role fixed for `session_lifetime`, default
   8 h; idle limit 4 h), audited with method, issuer, subject and role.
   Logout returns the provider's `end_session_endpoint` (RP-initiated logout)
   for the UI to open. `disable_password_login` leaves only SSO in the UI.

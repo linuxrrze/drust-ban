@@ -657,6 +657,42 @@ async fn roles_names_and_userinfo() {
             .await;
         assert_eq!(loc, "/#/login-error/conflict", "{n}");
     }
+
+    // a name is bound to the account that used it first ("olga" is
+    // user-1's): another account renamed to it at the provider is refused
+    *e.mock.userinfo.lock().unwrap() = json!({ "sub": "user-3" });
+    let takeover = json!({
+        "sub": "user-3", "preferred_username": "olga", "realm_access": { "roles": ["noc"] }
+    });
+    let (loc, _) = e.login(takeover.clone()).await;
+    assert_eq!(loc, "/#/login-error/conflict");
+    // nor can the name be taken by a local user or token now
+    assert!(crate::files::create_user(
+        &e.dir,
+        "olga",
+        crate::files::Role::Viewer,
+        "correct horse battery"
+    )
+    .is_err());
+    assert!(
+        crate::files::create_api_token(&e.dir, "olga", crate::files::Role::Viewer, None).is_err()
+    );
+    let bound = crate::files::list_oidc_names(&e.dir).unwrap();
+    assert!(bound
+        .iter()
+        .any(|n| n.name == "olga" && n.subject == "user-1"));
+    // released by the admin: the next account to log in gets it
+    assert!(crate::files::release_oidc_name(&e.dir, "olga").unwrap());
+    let (loc, cookie) = e.login(takeover).await;
+    assert_eq!(loc, "/");
+    assert_eq!(
+        e.get("/api/v1/whoami", &cookie.unwrap()).await.1["name"],
+        "olga"
+    );
+    let bound = crate::files::list_oidc_names(&e.dir).unwrap();
+    assert!(bound
+        .iter()
+        .any(|n| n.name == "olga" && n.subject == "user-3"));
     let _ = std::fs::remove_dir_all(&e.dir);
 }
 

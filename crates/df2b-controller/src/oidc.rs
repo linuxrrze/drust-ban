@@ -767,8 +767,9 @@ fn describe<E: std::error::Error>(e: &E) -> String {
     s
 }
 
-/// Name check shared with local users and API tokens (one name space).
-pub fn check_name(dir: &Path, name: &str) -> Result<(), LoginError> {
+/// Name check shared with local users and API tokens (one name space); the
+/// name is bound to the account (issuer + subject) that used it first.
+pub fn check_name(dir: &Path, name: &str, issuer: &str, subject: &str) -> Result<(), LoginError> {
     if !files::valid_name(name) {
         return Err(LoginError::Conflict(format!(
             "user name {name:?} from the identity provider is not allowed \
@@ -785,7 +786,16 @@ pub fn check_name(dir: &Path, name: &str) -> Result<(), LoginError> {
             "{name:?} is also a local user or API token name"
         )));
     }
-    Ok(())
+    match files::bind_oidc_name(dir, name, issuer, subject).map_err(LoginError::Failed)? {
+        None => Ok(()),
+        Some(owner) => Err(LoginError::Conflict(format!(
+            "{name:?} belongs to another account at the identity provider \
+             (subject {:?}, since {}); if that account was renamed or deleted: \
+             df2b-controller oidc-name release {name}",
+            owner.subject,
+            owner.bound_at.to_rfc3339()
+        ))),
+    }
 }
 
 /// Binding cookie for a login in progress.

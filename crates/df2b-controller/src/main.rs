@@ -167,6 +167,21 @@ enum Cmd {
     /// private (mode 0600).
     #[command(subcommand)]
     User(UserCmd),
+    /// Single sign-on user names: each is bound to the account (issuer and
+    /// subject) that logged in with it first, so a name changed at the
+    /// identity provider cannot take over another user's name.
+    #[command(subcommand)]
+    OidcName(OidcNameCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum OidcNameCmd {
+    List,
+    /// Free a name for another account (after a rename or deletion at the
+    /// identity provider); the next login with it binds it again.
+    Release {
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -246,6 +261,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::ApiToken(cmd)) => api_token(dir, cmd),
         Some(Cmd::User(cmd)) => user(dir, cmd),
+        Some(Cmd::OidcName(cmd)) => oidc_name(dir, cmd),
         Some(Cmd::Serve) | None => tokio::runtime::Runtime::new()?.block_on(serve(args)),
     }
 }
@@ -355,6 +371,29 @@ fn user(dir: &std::path::Path, cmd: UserCmd) -> anyhow::Result<()> {
                 bail!("no user {name:?}");
             }
             println!("user {name:?} deleted");
+        }
+    }
+    Ok(())
+}
+
+fn oidc_name(dir: &std::path::Path, cmd: OidcNameCmd) -> anyhow::Result<()> {
+    match cmd {
+        OidcNameCmd::List => {
+            for n in files::list_oidc_names(dir)? {
+                println!(
+                    "{:<24} since {}  {} {}",
+                    n.name,
+                    n.bound_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    n.issuer,
+                    n.subject,
+                );
+            }
+        }
+        OidcNameCmd::Release { name } => {
+            if !files::release_oidc_name(dir, &name)? {
+                bail!("{name:?} is not bound");
+            }
+            println!("{name:?} released");
         }
     }
     Ok(())

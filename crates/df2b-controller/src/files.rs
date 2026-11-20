@@ -6,6 +6,8 @@
 //! <state_dir>/revoked/<agent-id>    revoked agents
 //! <state_dir>/api-tokens/<sha256(secret)>.json      REST API tokens
 //! <state_dir>/users/<name>.json      web UI users (argon2id hash, 0600)
+//! <state_dir>/oidc-names/<name>.json OIDC user names, bound to the account
+//!                                    (issuer + subject) that used them first
 //! <state_dir>/controller.redb       agents + decision log (see store.rs)
 //! ```
 //!
@@ -32,6 +34,7 @@ const TOKENS: &str = "enroll-tokens";
 const REVOKED: &str = "revoked";
 const API_TOKENS: &str = "api-tokens";
 const USERS: &str = "users";
+const OIDC_NAMES: &str = "oidc-names";
 
 /// Shortest accepted password.
 pub const MIN_PASSWORD_LEN: usize = 12;
@@ -258,6 +261,9 @@ pub fn create_api_token_by(
     if user_path(dir, name).exists() {
         bail!("{name:?} is a user name; API tokens and users share one namespace (audit log)");
     }
+    if oidc_name_path(dir, name).exists() {
+        bail!("{name:?} is the name of a single sign-on user (one namespace, audit log)");
+    }
     let token = ApiToken::generate();
     let now = Utc::now();
     let file = ApiTokenFile {
@@ -422,6 +428,9 @@ pub fn create_user_with(
             "{name:?} is an API token name; API tokens and users share one namespace (audit log)"
         );
     }
+    if oidc_name_path(dir, name).exists() {
+        bail!("{name:?} is the name of a single sign-on user (one namespace, audit log)");
+    }
     check_password(name, password)?;
     let now = Utc::now();
     write_user(
@@ -510,6 +519,114 @@ pub fn delete_user(dir: &Path, name: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
     match fs::remove_file(user_path(dir, name)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// An OIDC user name and the account it belongs to. The name comes from a
+/// claim the user may be able to change at the provider
+/// (`preferred_username`); without the binding, renaming oneself there
+/// would make one's actions appear under somebody else's name in the
+/// audit log and the session list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OidcNameFile {
+    pub name: String,
+    pub issuer: String,
+    pub subject: String,
+    pub bound_at: DateTime<Utc>,
+}
+
+fn oidc_name_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(OIDC_NAMES).join(format!("{name}.json"))
+}
+
+/// Binds `name` to the account at its first login. `Ok(None)`: the name is
+/// (now) this account's; `Ok(Some(owner))`: it belongs to another account.
+/// The binding is created without overwriting (a hard link of a complete
+/// file), so of two concurrent first logins only one wins.
+pub fn bind_oidc_name(
+    dir: &Path,
+    name: &str,
+    issuer: &str,
+    subject: &str,
+) -> anyhow::Result<Option<OidcNameFile>> {
+    if !valid_name(name) {
+        bail!("invalid name {name:?}");
+    }
+    let path = oidc_name_path(dir, name);
+    let read = |path: &Path| -> anyhow::Result<Option<OidcNameFile>> {
+        match fs::read(path) {
+            Ok(d) => Ok(Some(
+                serde_json::from_slice(&d).with_context(|| format!("{}", path.display()))?,
+            )),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("{}", path.display())),
+        }
+    };
+    let owner_check = |f: OidcNameFile| {
+        if f.issuer == issuer && f.subject == subject {
+            None
+        } else {
+            Some(f)
+        }
+    };
+    if let Some(f) = read(&path)? {
+        return Ok(owner_check(f));
+    }
+    let ndir = dir.join(OIDC_NAMES);
+    fs::create_dir_all(&ndir)?;
+    let file = OidcNameFile {
+        name: name.to_owned(),
+        issuer: issuer.to_owned(),
+        subject: subject.to_owned(),
+        bound_at: Utc::now(),
+    };
+    let tmp = ndir.join(format!(
+        ".{name}.tmp-{}",
+        df2b_tls::hex(&df2b_tls::random_bytes::<8>())
+    ));
+    write_atomic(&tmp, &serde_json::to_vec_pretty(&file)?, 0o644)?;
+    let linked = fs::hard_link(&tmp, &path);
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(None),
+        // lost a race: whoever won owns it
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Ok(read(&path)?.and_then(owner_check))
+        }
+        Err(e) => Err(e).with_context(|| format!("{}", path.display())),
+    }
+}
+
+pub fn list_oidc_names(dir: &Path) -> anyhow::Result<Vec<OidcNameFile>> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(dir.join(OIDC_NAMES)) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        let hidden = p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if !hidden && p.extension().is_some_and(|x| x == "json") {
+            out.push(serde_json::from_slice::<OidcNameFile>(&fs::read(&p)?)?);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Frees a name (the account was renamed or deleted at the provider);
+/// false if it was not bound.
+pub fn release_oidc_name(dir: &Path, name: &str) -> anyhow::Result<bool> {
+    if !valid_name(name) {
+        return Ok(false);
+    }
+    match fs::remove_file(oidc_name_path(dir, name)) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.into()),

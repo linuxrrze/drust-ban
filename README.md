@@ -187,6 +187,10 @@ offers "Sign in with …". Also register
 logout URL, so logging out or disabling a user at the provider ends their
 controller sessions at once (providers without it: front-channel logout
 URL `…/api/v1/oidc/frontchannel-logout`, with "session required").
+A single sign-on user name stays with the account that first logged in with
+it: an account renamed to that name at the provider is refused. Free a name
+after a rename or deletion there with `df2b-controller oidc-name release
+<name>` (as the controller's user, like `user add`).
 
 ASN and country of banned addresses (Overview, Bans, address page,
 `df2bctl lookup`): start the controller with `--geoip` and MaxMind DB

@@ -2487,8 +2487,16 @@ async fn oidc_callback(
         }
     };
     let dir = ctl.settings.state_dir.clone();
-    let name = ident.name.clone();
-    match tokio::task::spawn_blocking(move || crate::oidc::check_name(&dir, &name)).await {
+    let (name, issuer, subject) = (
+        ident.name.clone(),
+        ident.issuer.clone(),
+        ident.subject.clone(),
+    );
+    match tokio::task::spawn_blocking(move || {
+        crate::oidc::check_name(&dir, &name, &issuer, &subject)
+    })
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             warn!(%addr, error = ?format!("{e:#}"), "OIDC login refused");
