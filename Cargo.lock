@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "df2b-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "df2b-controller"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "df2b-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "ipnet",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "df2b-firewall"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "df2b-matcher"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aho-corasick",
  "regex",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "df2b-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "df2b-core",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "df2b-sources"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "df2b-tls"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "df2bctl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
