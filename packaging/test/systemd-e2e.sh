@@ -187,6 +187,46 @@ ipset list df2b4
 active df2b-controller df2b-agent
 end
 
+step "action secrets as systemd credentials"
+# root-only files, handed to the controller's dynamic user with
+# LoadCredential= (README.md); the action program finds its secret through
+# $CREDENTIALS_DIRECTORY and leaves the secret's checksum as proof
+head -c 32 /dev/urandom | base64 > /etc/df2b/hook-token
+chmod 600 /etc/df2b/hook-token
+install -m 0600 /dev/stdin /etc/df2b/actions.toml <<'TOML'
+[[exec]]
+name = "ci"
+command = ["/usr/local/bin/df2b-test-action"]
+origins = ["user"]
+events = ["ban"]
+timeout = "10s"
+TOML
+install -m 0755 /dev/stdin /usr/local/bin/df2b-test-action <<'SH'
+#!/bin/sh
+sha256sum < "$CREDENTIALS_DIRECTORY/hook-token" > /var/lib/df2b-controller/action-saw
+SH
+mkdir -p /etc/systemd/system/df2b-controller.service.d
+cat > /etc/systemd/system/df2b-controller.service.d/credentials.conf <<'INI'
+[Service]
+LoadCredential=actions.toml:/etc/df2b/actions.toml
+LoadCredential=hook-token:/etc/df2b/hook-token
+Environment=DF2B_ACTIONS=%d/actions.toml
+INI
+systemctl daemon-reload
+systemctl restart df2b-controller
+wait_for 30 df2bctl agents list || fail "controller not answering with the credentials drop-in"
+df2bctl ban 203.0.113.50 --reason ci > /dev/null
+saw=/var/lib/private/df2b-controller/action-saw
+wait_for 30 test -s "$saw" || fail "the action did not run or could not read its credential"
+[[ $(cat "$saw") == "$(sha256sum < /etc/df2b/hook-token)" ]] \
+    || fail "the action read something else than the credential"
+df2bctl unban 203.0.113.50 > /dev/null
+if journalctl -b --no-pager -u df2b-controller | grep -q 'readable by everyone'; then
+    fail "the controller warned about a readable actions file"
+fi
+active df2b-controller df2b-agent
+end
+
 step "no sandbox violations"
 if journalctl -b --no-pager -u df2b-agent -u df2b-controller \
     | grep -Ei 'operation not permitted|permission denied|seccomp|bad system call'; then

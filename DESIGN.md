@@ -418,6 +418,11 @@ can do is bounded (security review 2026-11-19, regression tests for each):
   calls fail with EPERM. CI installs the packages on a runner and runs
   enrollment and bans through nftables and ipset under these units
   (`packaging/test/systemd-e2e.sh`).
+- **Secrets of the controller** (actions file, webhook `secret_file`, OIDC
+  client secret) stay root-only and reach the service as systemd
+  credentials (`LoadCredential=`, readable only by the service); action
+  programs get `$CREDENTIALS_DIRECTORY` and nothing else of the
+  controller's environment. CI checks this path end to end.
 - **Local**: the agent's state is private (0600, unit UMask 0077), the
   control socket is 0600 with SO_PEERCRED; log lines over 16 KiB are cut
   and their rest skipped, live lines cannot claim old time stamps; sshd

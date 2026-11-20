@@ -270,7 +270,11 @@ impl ActionsConfig {
         let meta =
             std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
         if meta.permissions().mode() & 0o004 != 0 {
-            warn!(path = %path.display(), "the actions file is readable by everyone; it may contain secrets");
+            warn!(
+                path = %path.display(),
+                "the actions file is readable by everyone; it may contain secrets \
+                 (pass it as a systemd credential instead, see README.md)"
+            );
         }
         let text = std::fs::read_to_string(path)?;
         let cfg: Self =
@@ -446,6 +450,9 @@ impl Exec {
                 "PATH",
                 "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             )
+            // systemd credentials (LoadCredential=): only the directory, the
+            // secrets stay in their files
+            .envs(std::env::var_os("CREDENTIALS_DIRECTORY").map(|d| ("CREDENTIALS_DIRECTORY", d)))
             .env("DF2B_EVENT", e.name())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())

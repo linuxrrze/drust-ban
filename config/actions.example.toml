@@ -1,5 +1,7 @@
 # External actions of df2b-controller (--actions FILE / DF2B_ACTIONS).
-# The file may contain secrets: make it readable for the controller only.
+# The file may contain secrets: keep it root-only (0600) and pass it to the
+# controller as a systemd credential (LoadCredential=, see README.md); the
+# same for secret_file below.
 #
 # Events: "ban", "unban", "expire" (a ban ran out). For unban and expire,
 # "still_banned" says whether another active ban covers the same target.
@@ -11,7 +13,8 @@
 name = "chat"
 url = "https://hooks.example.org/df2b"
 # HMAC-SHA256 signature: X-Df2b-Signature: sha256=<hex> over
-# "<X-Df2b-Timestamp>.<body>"; or secret_file = "/etc/df2b/webhook.secret"
+# "<X-Df2b-Timestamp>.<body>"; or (LoadCredential=webhook.secret:...)
+# secret_file = "/run/credentials/df2b-controller.service/webhook.secret"
 secret = "change me"
 events = ["ban", "unban"]
 origins = ["correlation", "user"]
@@ -21,7 +24,8 @@ origins = ["correlation", "user"]
 
 # A program per event (no shell; absolute path; cleared environment).
 # Event JSON on stdin; DF2B_EVENT, DF2B_TARGET, DF2B_SCOPE,
-# DF2B_EXPIRES_AT, DF2B_STILL_BANNED in the environment. Also a "sync"
+# DF2B_EXPIRES_AT, DF2B_STILL_BANNED and, under systemd with
+# LoadCredential=, CREDENTIALS_DIRECTORY (secrets) in the environment. Also a "sync"
 # event with all active bans at start and every sync_interval.
 # Example: BGP remotely triggered black hole via GoBGP (contrib/).
 [[exec]]

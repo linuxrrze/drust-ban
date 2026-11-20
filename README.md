@@ -59,6 +59,31 @@ sudo systemd-run --pty --quiet -p DynamicUser=yes -p User=df2b-controller \
     /usr/bin/df2b-controller user add ada --role admin
 ```
 
+Files with secrets (the actions file with webhook secrets or
+authorization headers, webhook `secret_file`s, the OIDC client secret):
+the dynamic user cannot read root's private files, and making them
+world-readable exposes the secrets. Keep them root-only (0600) and hand
+them to the service as systemd credentials, which only the service can
+read:
+
+```sh
+sudo systemctl edit df2b-controller
+```
+```ini
+[Service]
+LoadCredential=actions.toml:/etc/df2b/actions.toml
+LoadCredential=webhook.secret:/etc/df2b/webhook.secret
+LoadCredential=oidc-client-secret:/etc/df2b/oidc-client-secret
+Environment=DF2B_ACTIONS=%d/actions.toml
+```
+
+`%d` is the credentials directory,
+`/run/credentials/df2b-controller.service`; use that path in the files
+(`secret_file = "/run/credentials/df2b-controller.service/webhook.secret"`,
+`client_secret_file = ...`). Action programs get `$CREDENTIALS_DIRECTORY`
+in their environment and read their own secrets from there (e.g. an API
+key for a cloud firewall).
+
 `apt remove` and `apt purge` keep the state in `/var/lib/df2b` and
 `/var/lib/private/df2b-controller` (agent keys, controller CA, users and
 tokens: a reinstalled controller keeps its agents). Delete it by hand to

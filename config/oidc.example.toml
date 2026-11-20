@@ -14,7 +14,10 @@
 
 issuer = "https://sso.example.org/realms/main"
 client_id = "df2b"
-client_secret_file = "/etc/df2b/oidc-client-secret"   # or client_secret = "…"
+# /etc/df2b/oidc-client-secret (root, 0600) passed as a systemd credential:
+# LoadCredential=oidc-client-secret:/etc/df2b/oidc-client-secret (README.md)
+client_secret_file = "/run/credentials/df2b-controller.service/oidc-client-secret"
+# or client_secret = "…" (then keep this file private the same way)
 redirect_url = "https://df2b.example.org:7444/api/v1/oidc/callback"
 post_logout_redirect_url = "https://df2b.example.org:7444/"
 
