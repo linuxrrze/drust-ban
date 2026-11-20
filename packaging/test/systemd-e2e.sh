@@ -81,9 +81,12 @@ end
 step "enroll the agent"
 token=$(as_controller enroll-token --group web | head -n1)
 [[ $token == df2b1.* ]] || fail "no enrollment token: $token"
-as_controller api-token create --name ci --role admin --url https://127.0.0.1:7444 \
+# (the df2bctl configuration comes on stderr; neither goes to the log)
+umask 077
+as_controller api-token create --name ci --role admin --url https://127.0.0.1:7444 2>&1 \
     | sed -n '/^controller = /,$p' > "$work/df2bctl.toml"
-chmod 600 "$work/df2bctl.toml"
+umask 022
+grep -q '^token = ' "$work/df2bctl.toml" || fail "no df2bctl configuration from api-token create"
 export DF2B_CTL_CONFIG="$work/df2bctl.toml"
 
 install -m 0640 -g adm /dev/null /var/log/df2b-test.log
