@@ -5,7 +5,9 @@
 //!
 //! Runtime status (last heartbeat, open streams) is kept in memory only: it
 //! changes every few seconds per agent and is worthless after a restart.
-//! TODO: SQLite/PostgreSQL via sqlx (DESIGN.md §6), log compaction.
+//! Ended decisions are compacted after `--log-retention` (the audit log
+//! is kept).
+//! TODO: PostgreSQL storage for several controllers (DESIGN.md §6).
 
 use std::path::Path;
 use std::sync::Arc;

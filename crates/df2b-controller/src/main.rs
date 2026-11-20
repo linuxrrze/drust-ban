@@ -8,7 +8,7 @@
 //!
 //! Also: central policies and jails, correlation rules with escalation.
 //!
-//! TODO: sqlx storage, log compaction.
+//! TODO: PostgreSQL storage for several controllers (DESIGN.md §6).
 
 mod actions;
 mod api;
