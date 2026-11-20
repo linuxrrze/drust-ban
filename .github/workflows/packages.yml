@@ -239,6 +239,10 @@ jobs:
   # a container (host network, NET_ADMIN only) must change the host's
   # nftables ruleset. Built natively per architecture; for a tag, the
   # tested image goes to the release job, which pushes it to ghcr.io.
+  # Trivy scans the image (Debian packages) and the lockfiles (Rust crates,
+  # web UI packages) for HIGH/CRITICAL vulnerabilities with a fix: on a tag
+  # a finding fails the job and so blocks the release; on other pushes it
+  # is a warning, so it shows before the next tag.
   container:
     name: container (${{ matrix.arch }})
     strategy:
@@ -247,8 +251,12 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
+            trivy: Linux-64bit
+            trivy_sha256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
           - arch: arm64
             runner: ubuntu-24.04-arm
+            trivy: Linux-ARM64
+            trivy_sha256: ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     defaults:
@@ -263,6 +271,38 @@ jobs:
         env:
           VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
         run: docker compose build --build-arg "VERSION=${VERSION#v}" controller
+
+      # the release binary, checked against the checksum pinned above (not
+      # trivy-action: a mutable third-party action with access to the job)
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: 0.76.2
+          FILE: trivy_0.76.2_${{ matrix.trivy }}.tar.gz
+          SHA256: ${{ matrix.trivy_sha256 }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/$FILE" \
+            "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/$FILE"
+          echo "$SHA256  $RUNNER_TEMP/$FILE" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$FILE" -C "$RUNNER_TEMP" trivy
+          sudo install -m 0755 "$RUNNER_TEMP/trivy" /usr/local/bin/trivy
+          trivy --version
+
+      - name: Vulnerability scan (Trivy)
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          TRIVY_SCANNERS: vuln
+          TRIVY_SEVERITY: HIGH,CRITICAL
+          TRIVY_IGNORE_UNFIXED: 'true'
+          TRIVY_EXIT_CODE: '1'
+        run: |
+          status=0
+          trivy image df2b:latest || status=1
+          # svelte & co. are dev dependencies but end up in the web UI bundle
+          trivy fs --include-dev-deps ../.. || status=1
+          if [[ $status != 0 ]]; then
+            echo "::error::Trivy found HIGH/CRITICAL vulnerabilities with a fix (see above)"
+          fi
+          exit "$status"
 
       - name: Controller and enrolled agent
         run: |
