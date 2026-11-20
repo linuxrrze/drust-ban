@@ -52,9 +52,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # --- runtime ---
 FROM ${RUNTIME_IMAGE}
-# nftables: the agent's default firewall backend (nft); libsystemd0: the
-# journald source (loaded at runtime); ca-certificates: OIDC, webhooks
+# Security updates published after the base image was built (upgrade),
+# then nftables: the agent's default firewall backend (nft); libsystemd0:
+# the journald source (loaded at runtime); ca-certificates: OIDC, webhooks
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates libsystemd0 nftables \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --user-group --no-create-home \
