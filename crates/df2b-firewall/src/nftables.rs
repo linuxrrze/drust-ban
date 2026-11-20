@@ -12,6 +12,12 @@
 //! resolved against it (covered entries skipped, narrower elements
 //! replaced by a wider new one, in one transaction).
 //!
+//! The drop rules hook prerouting at raw priority (-300), before
+//! conntrack and NAT: they catch traffic to the host and traffic that is
+//! forwarded, such as ports published by Docker or other container
+//! runtimes (DNAT in prerouting, then the forward path, which an input
+//! hook never sees).
+//!
 //! TODO: talk netlink directly (rustables).
 
 use std::fmt::Write as _;
@@ -68,8 +74,8 @@ impl Nftables {
              table inet {t} {{\n\
              \tset ban_v4 {{ type ipv4_addr; flags interval, timeout; }}\n\
              \tset ban_v6 {{ type ipv6_addr; flags interval, timeout; }}\n\
-             \tchain input {{\n\
-             \t\ttype filter hook input priority -10; policy accept;\n\
+             \tchain prerouting {{\n\
+             \t\ttype filter hook prerouting priority -300; policy accept;\n\
              \t\tip saddr @ban_v4 drop\n\
              \t\tip6 saddr @ban_v6 drop\n\
              \t}}\n\
@@ -196,12 +202,12 @@ impl FirewallBackend for Nftables {
         Ok(Some(out))
     }
 
-    /// The input chain (with its table and sets) must still exist.
+    /// The prerouting chain (with its table and sets) must still exist.
     fn check(&self) -> anyhow::Result<()> {
-        let out = self.query(&["list", "chain", "inet", &self.table, "input"])?;
+        let out = self.query(&["list", "chain", "inet", &self.table, "prerouting"])?;
         if !out.contains("@ban_v4") || !out.contains("@ban_v6") {
             bail!(
-                "nftables chain inet {} input lost its drop rules",
+                "nftables chain inet {} prerouting lost its drop rules",
                 self.table
             );
         }
@@ -301,7 +307,11 @@ mod tests {
             nft.unban_script(&["203.0.113.7/32".parse().unwrap()]),
             "delete element inet df2b ban_v4 { 203.0.113.7/32 }\n"
         );
-        assert!(nft.setup_script().contains("ip6 saddr @ban_v6 drop"));
+        let setup = nft.setup_script();
+        assert!(setup.contains("ip6 saddr @ban_v6 drop"));
+        // before NAT, so forwarded (e.g. published container) ports too
+        assert!(setup.contains("type filter hook prerouting priority -300;"));
+        assert!(!setup.contains("hook input"));
     }
 
     /// A stand-in `nft` that prints `out` (exit 0) or fails.
@@ -317,10 +327,10 @@ mod tests {
     fn check() {
         let ok = fake_nft(
             "ok",
-            "echo 'table inet df2b { chain input { ip saddr @ban_v4 drop; ip6 saddr @ban_v6 drop } }'",
+            "echo 'table inet df2b { chain prerouting { ip saddr @ban_v4 drop; ip6 saddr @ban_v6 drop } }'",
         );
         assert!(Nftables::new("df2b", &ok).check().is_ok());
-        let flushed = fake_nft("flushed", "echo 'table inet df2b { chain input { } }'");
+        let flushed = fake_nft("flushed", "echo 'table inet df2b { chain prerouting { } }'");
         assert!(Nftables::new("df2b", &flushed).check().is_err());
         let gone = fake_nft("gone", "echo 'No such file or directory' >&2; exit 1");
         let e = Nftables::new("df2b", &gone)

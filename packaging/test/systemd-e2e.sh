@@ -8,14 +8,16 @@
 #
 # It installs the packages, enrolls the agent, feeds failed logins through
 # the journal (as a unit, like sshd) and a log file, and checks that the
-# bans reach the firewall and the controller. Then it does the same with
-# firewall = "ipset". Any unit that dies or logs a seccomp/permission
+# bans reach the firewall and the controller. A ban must also stop
+# forwarded traffic to a DNATed port, the way Docker publishes container
+# ports (client and server in network namespaces). Then it does the same
+# with firewall = "ipset". Any unit that dies or logs a seccomp/permission
 # problem fails the test.
 set -euo pipefail
 
 debs=$(realpath "${1:?usage: $0 <directory with the .deb files>}")
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work"; [[ -z $httpd ]] || kill "$httpd" 2> /dev/null || true' EXIT
 
 step() { echo "::group::$*"; }
 end() { echo "::endgroup::"; }
@@ -66,6 +68,60 @@ journal_failure() {
 file_failure() {
     echo "$(date '+%b %e %H:%M:%S') host sshd[123]: Failed password for root from $1 port 22 ssh2" \
         >> /var/log/df2b-test.log
+}
+
+# A "published container port": a client namespace (10.99.1.2) reaches
+# port 8080 on the host (10.99.1.1), which is DNATed to a web server in a
+# second namespace (10.99.2.2:80), so the packets are forwarded and never
+# pass the host's input hook.
+httpd=
+forward_setup() {
+    ip netns add df2bc
+    ip netns add df2bs
+    ip link add c1 type veth peer name c0 netns df2bc
+    ip link add s1 type veth peer name s0 netns df2bs
+    ip addr add 10.99.1.1/24 dev c1
+    ip addr add 10.99.2.1/24 dev s1
+    ip link set c1 up
+    ip link set s1 up
+    ip -n df2bc addr add 10.99.1.2/24 dev c0
+    ip -n df2bs addr add 10.99.2.2/24 dev s0
+    for ns in df2bc df2bs; do
+        ip -n "$ns" link set lo up
+    done
+    ip -n df2bc link set c0 up
+    ip -n df2bs link set s0 up
+    ip -n df2bc route add default via 10.99.1.1
+    ip -n df2bs route add default via 10.99.2.1
+    sysctl -qw net.ipv4.ip_forward=1
+    nft -f - <<'NFT'
+table ip df2btest {
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+        iifname "c1" tcp dport 8080 dnat to 10.99.2.2:80
+    }
+}
+NFT
+    # Docker on the runner sets the FORWARD policy to DROP
+    iptables -I FORWARD 1 -i c1 -o s1 -j ACCEPT
+    iptables -I FORWARD 1 -i s1 -o c1 -j ACCEPT
+    ip netns exec df2bs python3 -m http.server 80 --bind 10.99.2.2 > /dev/null 2>&1 &
+    httpd=$!
+}
+reach() {
+    ip netns exec df2bc curl -s -o /dev/null --max-time 3 http://10.99.1.1:8080/
+}
+unreachable() { ! reach; }
+# $1: backend, $2…: command that succeeds once 10.99.1.2 is in its set
+forwarded_ban() {
+    local backend=$1
+    shift
+    wait_for 15 reach || fail "forwarded port not reachable before the ban ($backend)"
+    df2bctl ban 10.99.1.2 --reason ci > /dev/null
+    wait_for 30 "$@" || fail "forwarded-port ban not in the firewall ($backend)"
+    wait_for 10 unreachable || fail "a ban did not stop forwarded (DNAT) traffic ($backend)"
+    df2bctl unban 10.99.1.2 > /dev/null
+    wait_for 30 reach || fail "forwarded port not reachable after the unban ($backend)"
 }
 
 step "install"
@@ -159,6 +215,8 @@ wait_for 30 in_set ban_v4 203.0.113.30 || fail "controller ban not in nftables"
 df2bctl unban 203.0.113.30 > /dev/null
 wait_for 30 sh -c '! nft list set inet df2b ban_v4 | grep -q 203.0.113.30' \
     || fail "controller unban not applied"
+forward_setup
+forwarded_ban nftables in_set ban_v4 10.99.1.2
 systemctl reload df2b-agent
 sleep 2
 active df2b-controller df2b-agent
@@ -182,7 +240,8 @@ done
 wait_for 30 sh -c 'ipset list df2b4 | grep -q 198.51.100.40' || fail "ban not in ipset"
 # active bans are re-applied to the new backend
 wait_for 30 sh -c 'ipset list df2b4 | grep -q 192.0.2.10' || fail "active ban not re-applied"
-iptables -S | grep -q df2b4 || fail "no iptables rule for the set"
+iptables -t raw -S PREROUTING | grep -q df2b4 || fail "no iptables rule for the set"
+forwarded_ban ipset ipset test df2b4 10.99.1.2
 ipset list df2b4
 active df2b-controller df2b-agent
 end

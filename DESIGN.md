@@ -328,7 +328,7 @@ Rules:
   and file backlog (bytes written but not read) in that interval, and the
   error that stopped it (a file of it, or a central source that failed to
   start). Firewall: the last ban/unban/setup failure (until one succeeds)
-  and a check every minute (nftables: the input chain with its drop rules
+  and a check every minute (nftables: the prerouting chain with its drop rules
   still exists); `firewall_error` says what failed. The UI shows sources
   on the agent page (lag ≥ 10 s and backlog ≥ 1 MiB highlighted) and
   lists agents with a stopped source on the dashboard.
@@ -448,13 +448,21 @@ over netlink (`rustables`).
 table inet df2b {
   set ban_v4 { type ipv4_addr; flags interval, timeout; }
   set ban_v6 { type ipv6_addr; flags interval, timeout; }
-  chain input {
-    type filter hook input priority -10; policy accept;
+  chain prerouting {
+    type filter hook prerouting priority -300; policy accept;
     ip  saddr @ban_v4 drop
     ip6 saddr @ban_v6 drop
   }
 }
 ```
+
+- **Prerouting, raw priority**: the drop rules run before conntrack and
+  NAT, so they cover traffic to the host *and* forwarded traffic. Ports
+  that Docker or other container runtimes publish are DNATed in
+  prerouting and then take the forward path, which an `input` hook never
+  sees (versions up to 0.1.1 hooked `input` and did not protect them).
+  Dropping before conntrack also keeps banned sources out of the
+  connection tracking table.
 
 - **Kernel-side timeouts**: set elements expire in the kernel even if the daemon
   crashes.
@@ -480,7 +488,9 @@ table inet df2b {
   is recreated and re-populated from persisted state.
 - Further backends behind the `FirewallBackend` trait (`firewall = …`):
   - `ipset`: `hash:net` sets `df2b4`/`df2b6` with timeouts and one DROP
-    rule each at the top of INPUT (iptables/ip6tables `-m set`); batches
+    rule each at the top of PREROUTING in the raw table (iptables/ip6tables
+    `-t raw -m set`, for the same reason; a rule in INPUT from older
+    versions is removed on setup); batches
     via `ipset restore`; no overlap conflicts. ipset timeouts end at
     2147483 s (~24.8 days): longer bans go in without one and the reconcile
     loop removes them when they expire. `list` reads `ipset save`, `check`

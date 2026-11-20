@@ -1,8 +1,11 @@
 //! ipset + iptables backend, for hosts without nftables.
 //!
 //! Two `hash:net` sets with timeouts (`df2b4`, `df2b6`) and one DROP rule
-//! per family at the top of INPUT (`iptables`/`ip6tables -m set`). Changes
-//! go through `ipset restore` (one batch per call); `hash:net` stores
+//! per family at the top of PREROUTING in the raw table (`iptables`/
+//! `ip6tables -t raw -m set`): before conntrack and NAT, so forwarded
+//! traffic (ports published by container runtimes) is dropped too, not
+//! only traffic to the host. A DROP rule in INPUT, where versions before
+//! 0.1.2 put it, is removed on setup. Changes go through `ipset restore` (one batch per call); `hash:net` stores
 //! nested prefixes side by side, so there are no overlap conflicts.
 //!
 //! ipset timeouts are at most 2147483 s (~24.8 days): longer bans are added
@@ -119,7 +122,7 @@ impl Ipset {
         Self::run(&self.ipset, &["restore"], Some(script)).map(|_| ())
     }
 
-    /// The INPUT rule for one family: (binary, set name).
+    /// The DROP rule for one family: (binary, set name).
     fn rules(&self) -> [(&PathBuf, String); 2] {
         [
             (&self.iptables, format!("{}4", self.prefix)),
@@ -128,12 +131,27 @@ impl Ipset {
     }
 
     fn rule_args<'a>(op: &'a str, set: &'a str) -> Vec<&'a str> {
-        let mut v = vec![op, "INPUT"];
+        let mut v = vec!["-t", "raw", op, "PREROUTING"];
         if op == "-I" {
             v.push("1");
         }
         v.extend(["-m", "set", "--match-set", set, "src", "-j", "DROP"]);
         v
+    }
+
+    /// The rule as versions before 0.1.2 inserted it (filter table, INPUT).
+    fn legacy_rule_args<'a>(op: &'a str, set: &'a str) -> Vec<&'a str> {
+        vec![
+            op,
+            "INPUT",
+            "-m",
+            "set",
+            "--match-set",
+            set,
+            "src",
+            "-j",
+            "DROP",
+        ]
     }
 }
 
@@ -153,6 +171,14 @@ impl FirewallBackend for Ipset {
         for (bin, set) in self.rules() {
             if Self::run(bin, &Self::rule_args("-C", &set), None).is_err() {
                 Self::run(bin, &Self::rule_args("-I", &set), None)?;
+            }
+            // (bounded: a failing -D must not loop forever)
+            for _ in 0..8 {
+                if Self::run(bin, &Self::legacy_rule_args("-C", &set), None).is_err()
+                    || Self::run(bin, &Self::legacy_rule_args("-D", &set), None).is_err()
+                {
+                    break;
+                }
             }
         }
         Ok(())
@@ -258,7 +284,7 @@ mod tests {
     }
 
     /// Stand-ins for ipset/iptables that log their calls; iptables -C
-    /// fails until -I was called.
+    /// fails until -I was called (per table and chain), -D removes.
     #[test]
     fn setup_ban_check_list_with_stand_ins() {
         let dir = std::env::temp_dir().join(format!("df2b-ipset-{}", std::process::id()));
@@ -283,14 +309,18 @@ mod tests {
                 name,
                 format!(
                     "echo \"{name} $*\" >> {log}\n\
-                     if [ \"$1\" = -C ]; then [ -f {d}/{name}.rule ] || exit 1; fi\n\
-                     if [ \"$1\" = -I ]; then touch {d}/{name}.rule; fi",
+                     t=filter; if [ \"$1\" = -t ]; then t=$2; shift 2; fi\n\
+                     r={d}/{name}.$t.$2\n\
+                     case $1 in -C) [ -f $r ] || exit 1;; -I) touch $r;; \
+                     -D) [ -f $r ] || exit 1; rm $r;; esac",
                     log = log.display(),
                     d = dir.display()
                 ),
             )
         };
         let b = Ipset::new("df2b", ipset, tables("iptables"), tables("ip6tables"));
+        // an IPv4 rule in INPUT from an older version
+        std::fs::write(dir.join("iptables.filter.INPUT"), "").unwrap();
         assert!(b.check().is_err(), "no rules yet");
         b.ensure_setup().unwrap();
         b.ensure_setup().unwrap(); // rules not inserted twice
@@ -304,15 +334,24 @@ mod tests {
         assert_eq!(listed.len(), 2, "one per set from the stand-in");
         let log = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
-            log.matches("iptables -I INPUT 1 -m set --match-set df2b4 src -j DROP")
+            log.matches("iptables -t raw -I PREROUTING 1 -m set --match-set df2b4 src -j DROP")
                 .count(),
             1
         );
         assert_eq!(
-            log.matches("ip6tables -I INPUT 1 -m set --match-set df2b6 src -j DROP")
+            log.matches("ip6tables -t raw -I PREROUTING 1 -m set --match-set df2b6 src -j DROP")
                 .count(),
             1
         );
+        // the old INPUT rule is gone, and none was ever added there
+        assert_eq!(
+            log.matches("iptables -D INPUT -m set --match-set df2b4 src -j DROP")
+                .count(),
+            1
+        );
+        assert!(!dir.join("iptables.filter.INPUT").exists());
+        assert!(!log.contains("ip6tables -D"), "no old rule for IPv6");
+        assert!(!log.contains("-I INPUT"));
         assert!(log.contains("create df2b6 hash:net family inet6 timeout 0 maxelem 1000000 -exist"));
         assert!(log.contains("add df2b4 192.0.2.7/32 timeout 60 -exist"));
         let _ = std::fs::remove_dir_all(&dir);
