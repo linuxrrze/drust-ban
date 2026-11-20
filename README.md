@@ -59,8 +59,10 @@ sudo systemd-run --pty --quiet -p DynamicUser=yes -p User=df2b-controller \
     /usr/bin/df2b-controller user add ada --role admin
 ```
 
-`apt purge` also removes `/var/lib/df2b` and `/var/lib/df2b-controller`
-(agent keys, controller CA, users and tokens).
+`apt remove` and `apt purge` keep the state in `/var/lib/df2b` and
+`/var/lib/private/df2b-controller` (agent keys, controller CA, users and
+tokens: a reinstalled controller keeps its agents). Delete it by hand to
+start over.
 
 ## RPM packages
 
@@ -78,17 +80,13 @@ The packages and files are those of the Debian packages (units in
 sudo dnf install ./df2b-agent-*.rpm ./df2bctl-*.rpm   # pulls in nftables
 ```
 
-Following the Fedora/RHEL convention, installation applies the systemd
-presets (by default: disabled) and starts nothing; upgrades restart running
-services. Configure the agent as above, then:
-
-```sh
-sudo systemctl enable --now df2b-agent        # or df2b-controller
-```
+As with the Debian packages, installation enables and starts the services
+(not the Fedora/RHEL convention of starting nothing), and upgrades restart
+running services. Configure the agent as above.
 
 `dnf remove` stops and disables the services but keeps the state in
-`/var/lib/df2b` and `/var/lib/private/df2b-controller` (RPM has no purge;
-delete them by hand) and saves modified configuration files as `*.rpmsave`.
+`/var/lib/df2b` and `/var/lib/private/df2b-controller` (delete them by
+hand) and saves modified configuration files as `*.rpmsave`.
 
 ## Try it
 

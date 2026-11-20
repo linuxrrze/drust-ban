@@ -3,10 +3,8 @@ set -e
 
 #DEBHELPER#
 
-if [ "$1" = "purge" ]; then
-    # offender database, positions, the agent's TLS key and certificate
-    rm -rf /var/lib/df2b
-    # the df2b user is kept (files elsewhere may still belong to it)
-fi
+# The state in /var/lib is kept on removal and on purge: it holds keys
+# and certificates (the controller's CA, enrolled agents' identities),
+# users and tokens that cannot be recreated. Delete it by hand.
 
 exit 0

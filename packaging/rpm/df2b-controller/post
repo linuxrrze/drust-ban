@@ -3,7 +3,8 @@
 # (DynamicUser=yes: no user to create)
 
 if [ "$1" -eq 1 ]; then
-    # like %systemd_post: enable according to the systemd presets
-    # (Fedora/RHEL default: disabled), never start on installation
-    systemctl --no-reload preset df2b-controller.service >/dev/null 2>&1 || :
+    # enabled and started on installation, like the Debian package
+    # (not the Fedora/RHEL preset convention: the project's choice)
+    systemctl daemon-reload >/dev/null 2>&1 || :
+    systemctl enable --now df2b-controller.service >/dev/null 2>&1 || :
 fi

@@ -3,10 +3,8 @@ set -e
 
 #DEBHELPER#
 
-if [ "$1" = "purge" ]; then
-    # the controller's CA, database and tokens (DynamicUser=yes keeps the
-    # StateDirectory under /var/lib/private with a symlink in /var/lib)
-    rm -rf /var/lib/private/df2b-controller /var/lib/df2b-controller
-fi
+# The state in /var/lib is kept on removal and on purge: it holds keys
+# and certificates (the controller's CA, enrolled agents' identities),
+# users and tokens that cannot be recreated. Delete it by hand.
 
 exit 0

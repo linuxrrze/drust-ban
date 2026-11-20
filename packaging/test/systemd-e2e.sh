@@ -196,4 +196,13 @@ if journalctl -b -k --no-pager | grep -E 'audit.*(type=1326|SECCOMP).*df2b'; the
     fail "seccomp denials in the kernel log"
 fi
 end
+step "purge keeps the state"
+DEBIAN_FRONTEND=noninteractive apt-get purge -y -q df2b-agent df2b-controller df2bctl
+for u in df2b-controller df2b-agent; do
+    ! systemctl is-active --quiet "$u" || fail "$u still running after the purge"
+done
+test -d /var/lib/df2b || fail "purge removed /var/lib/df2b"
+test -d /var/lib/private/df2b-controller || fail "purge removed the controller state"
+ls -la /var/lib/df2b /var/lib/private/df2b-controller
+end
 echo "systemd end-to-end test passed"
