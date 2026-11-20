@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get } from '../lib/api';
-  import { dateTime, geoLong, geoMatches, geoShort, origin, relative, remaining, scope, target } from '../lib/format';
+  import { dateTime, geoLong, geoShort, origin, relative, remaining, scope, target } from '../lib/format';
   import { onChange } from '../lib/live.svelte';
   import { href } from '../lib/router.svelte';
   import { can } from '../lib/session.svelte';
@@ -11,7 +11,19 @@
   // a search preset from the URL (#/bans/as:64500, from the overview)
   let { filter = '' }: { filter?: string } = $props();
 
+  interface Page {
+    decisions: Decision[];
+    geo?: Record<string, GeoInfo>;
+    total: number;
+    active: number;
+    jails: (string | null)[];
+  }
+
+  // the server filters, sorts and pages (there may be 100 000 bans)
   let decisions = $state<Decision[]>([]);
+  let total = $state(0);
+  let active = $state(0);
+  let jails = $state<(string | null)[]>([]);
   let geo = $state<Record<string, GeoInfo>>({});
   let loaded = $state(false);
   let error = $state('');
@@ -21,28 +33,51 @@
   let jail = $state('');
   let family = $state('');
   let sort = $state<'new' | 'expires' | 'target'>('new');
-  let selected = $state<Set<string>>(new Set());
+  // selected bans: id -> target (also those scrolled out of the page)
+  let selected = $state<Map<string, string>>(new Map());
   let banOpen = $state(false);
   let unbanOpen = $state(false);
   let unbanTargets = $state<string[]>([]);
   let limit = $state(200);
+  // the newest request wins (typing sends one per pause)
+  let generation = 0;
 
   async function load() {
+    const mine = ++generation;
+    const p = new URLSearchParams({ sort, limit: String(limit) });
+    if (query.trim()) p.set('q', query.trim());
+    if (jail) p.set('jail', jail);
+    if (family) p.set('family', family);
     try {
-      const r = await get<{ decisions: Decision[]; geo?: Record<string, GeoInfo> }>('/decisions');
+      const r = await get<Page>(`/decisions?${p}`);
+      if (mine !== generation) return;
       decisions = r.decisions;
       geo = r.geo ?? {};
+      total = r.total;
+      active = r.active;
+      jails = r.jails;
       error = '';
       now = Date.now();
-      // forget selections that are gone
-      const ids = new Set(decisions.map((d) => d.id));
-      selected = new Set([...selected].filter((id) => ids.has(id)));
     } catch (e) {
+      if (mine !== generation) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
       loaded = true;
     }
   }
+
+  // filters: reload (search after a short pause); back to the first page
+  let first = true;
+  $effect(() => {
+    void [query, jail, family, sort];
+    if (first) {
+      first = false;
+      return;
+    }
+    limit = 200;
+    const t = setTimeout(load, 250);
+    return () => clearTimeout(t);
+  });
 
   $effect(() => {
     load();
@@ -54,41 +89,26 @@
     };
   });
 
-  const jails = $derived([...new Set(decisions.map((d) => d.jail ?? ''))].sort());
-  const filtered = $derived.by(() => {
-    const q = query.trim().toLowerCase();
-    const out = decisions.filter(
-      (d) =>
-        (!jail || (d.jail ?? '') === jail) &&
-        (!family || (family === '6') === d.target.includes(':')) &&
-        (!q ||
-          d.target.includes(q) ||
-          (d.jail ?? 'manual').toLowerCase().includes(q) ||
-          origin(d.origin).toLowerCase().includes(q) ||
-          d.reason.toLowerCase().includes(q) ||
-          scope(d.scope).toLowerCase().includes(q) ||
-          geoShort(geo[d.target]).toLowerCase().includes(q) ||
-          geoMatches(geo[d.target], q)),
-    );
-    const exp = (d: Decision) => (d.expires_at ? Date.parse(d.expires_at) : Infinity);
-    if (sort === 'new') out.sort((a, b) => b.seq - a.seq);
-    if (sort === 'expires') out.sort((a, b) => exp(a) - exp(b));
-    if (sort === 'target') out.sort((a, b) => a.target.localeCompare(b.target, undefined, { numeric: true }));
-    return out;
-  });
-  const page = $derived(filtered.slice(0, limit));
-  const hasGeo = $derived(Object.keys(geo).length > 0);
-  const allSelected = $derived(page.length > 0 && page.every((d) => selected.has(d.id)));
+  // the server sends at most 10 000 at a time
+  const MAX_PAGE = 10_000;
 
-  function toggle(id: string) {
-    const s = new Set(selected);
-    if (s.has(id)) s.delete(id);
-    else s.add(id);
+  function more() {
+    limit = Math.min(limit + 500, MAX_PAGE);
+    load();
+  }
+
+  const hasGeo = $derived(Object.keys(geo).length > 0);
+  const allSelected = $derived(decisions.length > 0 && decisions.every((d) => selected.has(d.id)));
+
+  function toggle(d: Decision) {
+    const s = new Map(selected);
+    if (s.has(d.id)) s.delete(d.id);
+    else s.set(d.id, d.target);
     selected = s;
   }
 
   function toggleAll() {
-    selected = allSelected ? new Set() : new Set(page.map((d) => d.id));
+    selected = allSelected ? new Map() : new Map(decisions.map((d) => [d.id, d.target]));
   }
 
   function unban(targets: string[]) {
@@ -99,11 +119,11 @@
 
 <div class="page-head">
   <h1>Bans</h1>
-  <span class="faint">{decisions.length.toLocaleString()} active</span>
+  <span class="faint">{active.toLocaleString()} active</span>
   <span class="spacer"></span>
   {#if can('operator')}
     {#if selected.size > 0}
-      <button class="danger" onclick={() => unban(decisions.filter((d) => selected.has(d.id)).map((d) => d.target))}>
+      <button class="danger" onclick={() => unban([...selected.values()])}>
         Unban {selected.size} selected
       </button>
     {/if}
@@ -116,7 +136,7 @@
     <input type="search" class="grow" placeholder={hasGeo ? 'Search address, jail, origin, reason, AS (as:64500), country (country:de)' : 'Search address, jail, origin, reason'} bind:value={query} aria-label="Search bans" />
     <select bind:value={jail} aria-label="Jail">
       <option value="">all jails</option>
-      {#each jails as j (j)}<option value={j}>{j || 'manual'}</option>{/each}
+      {#each jails as j (j)}<option value={j ?? '-'}>{j ?? 'manual'}</option>{/each}
     </select>
     <select bind:value={family} aria-label="Address family">
       <option value="">IPv4 + IPv6</option>
@@ -125,6 +145,7 @@
     </select>
     <select bind:value={sort} aria-label="Sort">
       <option value="new">newest first</option>
+      <option value="old">oldest first</option>
       <option value="expires">expiring first</option>
       <option value="target">by address</option>
     </select>
@@ -132,8 +153,8 @@
 
   {#if error}<div class="error-box">{error}</div>{/if}
 
-  {#if loaded && filtered.length === 0}
-    <div class="empty">{decisions.length === 0 ? 'No active bans.' : 'No bans match the filter.'}</div>
+  {#if loaded && total === 0}
+    <div class="empty">{active === 0 ? 'No active bans.' : 'No bans match the filter.'}</div>
   {:else}
     <div class="table-wrap">
       <table>
@@ -147,10 +168,10 @@
           </tr>
         </thead>
         <tbody>
-          {#each page as d (d.id)}
+          {#each decisions as d (d.id)}
             <tr class:selected={selected.has(d.id)}>
               {#if can('operator')}
-                <td class="check"><input type="checkbox" checked={selected.has(d.id)} onchange={() => toggle(d.id)} aria-label="Select {d.target}" /></td>
+                <td class="check"><input type="checkbox" checked={selected.has(d.id)} onchange={() => toggle(d)} aria-label="Select {d.target}" /></td>
               {/if}
               <td class="mono"><a href={href('ip', d.target)}>{target(d.target)}</a></td>
               {#if hasGeo}<td class="muted nowrap" title={geoLong(geo[d.target])}>{geoShort(geo[d.target])}</td>{/if}
@@ -168,17 +189,17 @@
         </tbody>
       </table>
     </div>
-    {#if filtered.length > limit}
+    {#if total > decisions.length}
       <div class="more">
-        Showing {limit.toLocaleString()} of {filtered.length.toLocaleString()}.
-        <button class="link" onclick={() => (limit += 500)}>Show more</button>
+        Showing {decisions.length.toLocaleString()} of {total.toLocaleString()}.
+        {#if limit < MAX_PAGE}<button class="link" onclick={more}>Show more</button>{:else}Narrow the search to see the rest.{/if}
       </div>
     {/if}
   {/if}
 </div>
 
 <BanDialog bind:open={banOpen} ondone={load} />
-<UnbanDialog bind:open={unbanOpen} targets={unbanTargets} ondone={() => { selected = new Set(); load(); }} />
+<UnbanDialog bind:open={unbanOpen} targets={unbanTargets} ondone={() => { selected = new Map(); load(); }} />
 
 <style>
   .filters { margin-bottom: 12px; }

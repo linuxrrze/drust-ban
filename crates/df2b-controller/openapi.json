@@ -1344,7 +1344,7 @@
         "tags": [
           "decisions"
         ],
-        "description": "Requires role viewer or higher.\n\nNo paging: all active decisions matching the filters.",
+        "description": "Requires role viewer or higher.\n\nFiltered, sorted and paged on the controller: at most `limit` (default 1000, at most 10 000) decisions from `offset`; `total` is how many match.",
         "x-required-role": "viewer",
         "security": [
           {
@@ -1368,9 +1368,71 @@
             "name": "jail",
             "in": "query",
             "required": false,
-            "description": "Only decisions of this jail.",
+            "description": "Only decisions of this jail; \"-\": only those without one (manual bans).",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Free text, case-insensitive: address, jail (\"manual\": none), origin (agent:<id>, correlation:<rule>, user:<name>), reason, scope; with GeoIP also \"as:64500\", \"country:de\", AS organisation and country names. At most 256 characters.",
+            "schema": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          {
+            "name": "family",
+            "in": "query",
+            "required": false,
+            "description": "Address family.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "4",
+                "6"
+              ]
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "description": "old: oldest first (default); new: newest first; expires: ending soonest first, permanent last; target: by address.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "old",
+                "new",
+                "expires",
+                "target"
+              ],
+              "default": "old"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "description": "Skip this many matching decisions.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "default": 1000
             }
           }
         ],
@@ -1393,12 +1455,41 @@
                       "additionalProperties": {
                         "$ref": "#/components/schemas/GeoInfo"
                       },
-                      "description": "Target (CIDR) -> GeoIP data; targets the databases do not know are left out; empty without GeoIP."
+                      "description": "Target (CIDR) -> GeoIP data for the decisions on this page; targets the databases do not know are left out; empty without GeoIP."
+                    },
+                    "total": {
+                      "type": "integer",
+                      "description": "decisions matching the filters"
+                    },
+                    "offset": {
+                      "type": "integer"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "active": {
+                      "type": "integer",
+                      "description": "all active decisions"
+                    },
+                    "jails": {
+                      "type": "array",
+                      "items": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "description": "jails of all active decisions (null: manual), for a filter list"
                     }
                   },
                   "required": [
                     "decisions",
-                    "geo"
+                    "geo",
+                    "total",
+                    "offset",
+                    "limit",
+                    "active",
+                    "jails"
                   ]
                 }
               }

@@ -24,13 +24,13 @@
         get<Status>('/status'),
         get<Stats>('/stats'),
         get<{ agents: Agent[] }>('/agents'),
-        get<{ decisions: Decision[] }>('/decisions'),
+        get<{ decisions: Decision[] }>('/decisions?sort=new&limit=8'),
       ]);
       breaker = s.breaker_tripped ? (await get<{ breaker: Breaker }>('/breaker')).breaker : null;
       status = s;
       stats = st;
       agents = a.agents;
-      recent = d.decisions.slice(-8).reverse();
+      recent = d.decisions;
       error = '';
       now = Date.now();
     } catch (e) {

@@ -78,15 +78,3 @@ export function geoLong(g: import('./types').GeoInfo | null | undefined): string
   return [as, c].filter(Boolean).join(' · ');
 }
 
-/** Whether a ban-list search term (lower case) matches this address's
- * ASN/country: "as:64500" / "as64500", "country:de", or text in the AS
- * name or country name. */
-export function geoMatches(g: import('./types').GeoInfo | null | undefined, q: string): boolean {
-  if (!g) return false;
-  const m = /^as:?\s*(\d+)$/.exec(q);
-  if (m) return g.asn === Number(m[1]);
-  if (q.startsWith('country:')) return (g.country ?? '').toLowerCase() === q.slice(8).trim();
-  return (
-    (g.as_org ?? '').toLowerCase().includes(q) || (g.country_name ?? '').toLowerCase().includes(q)
-  );
-}

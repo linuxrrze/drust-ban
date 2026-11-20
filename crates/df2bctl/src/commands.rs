@@ -359,7 +359,32 @@ pub async fn bans_list(
     if let Some(j) = jail {
         q.push(("jail", j));
     }
+    // all pages (the controller sends at most 10 000 at a time)
+    const PAGE: usize = 10_000;
+    q.push(("limit", PAGE.to_string()));
     let mut v = c.get_query("/api/v1/decisions", &q).await?;
+    loop {
+        let have = v["decisions"].as_array().map_or(0, Vec::len);
+        // an older controller sends everything and no total
+        let total = v["total"].as_u64().map_or(have, |t| t as usize);
+        if have >= total || have == 0 || have % PAGE != 0 {
+            break;
+        }
+        let mut next = q.clone();
+        next.push(("offset", have.to_string()));
+        let more = c.get_query("/api/v1/decisions", &next).await?;
+        let (Some(list), Some(add)) = (v["decisions"].as_array_mut(), more["decisions"].as_array())
+        else {
+            break;
+        };
+        if add.is_empty() {
+            break;
+        }
+        list.extend(add.iter().cloned());
+        if let (Some(geo), Some(add)) = (v["geo"].as_object_mut(), more["geo"].as_object()) {
+            geo.extend(add.iter().map(|(k, x)| (k.clone(), x.clone())));
+        }
+    }
     if let Some(a) = agent {
         // client-side: bans reported by this agent
         let want = format!("agent:{a}");

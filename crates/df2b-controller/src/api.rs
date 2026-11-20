@@ -3000,11 +3000,80 @@ async fn enroll_token(
     ))
 }
 
+/// Default and maximum page size of `GET /api/v1/decisions`.
+const DECISIONS_PAGE: usize = 1000;
+const MAX_DECISIONS_PAGE: usize = 10_000;
+
 #[derive(Deserialize)]
 struct DecisionQuery {
     /// Address or prefix; matches decisions overlapping it.
     target: Option<String>,
+    /// Only this jail; "-": only decisions without one (manual bans).
     jail: Option<String>,
+    /// Free text (case-insensitive): address, jail, origin, reason, scope,
+    /// AS/country ("as:64500", "country:de") with GeoIP.
+    q: Option<String>,
+    /// "4" or "6"
+    family: Option<String>,
+    /// "old" (default, oldest first), "new", "expires", "target"
+    sort: Option<String>,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+/// Whether a decision matches the free-text search `q` (lower case), like
+/// the web UI's search did when it filtered on its own.
+fn decision_matches(d: &df2b_core::Decision, q: &str, geo: Option<&crate::geo::GeoInfo>) -> bool {
+    let low = |s: &str| s.to_lowercase();
+    let origin = match &d.origin {
+        Origin::Agent(a) => format!("agent:{}", a.0),
+        Origin::Correlation(r) => format!("correlation:{r}"),
+        Origin::User(u) => format!("user:{u}"),
+    };
+    let scope = match &d.scope {
+        Scope::Global => "global".to_owned(),
+        Scope::Group(g) => format!("group {g}"),
+        Scope::Agents(a) => format!(
+            "agent {}",
+            a.iter()
+                .map(|i| i.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    if d.target.to_string().contains(q)
+        || low(d.jail.as_deref().unwrap_or("manual")).contains(q)
+        || low(&origin).contains(q)
+        || low(&d.reason).contains(q)
+        || low(&scope).contains(q)
+    {
+        return true;
+    }
+    let Some(g) = geo else { return false };
+    if let Some(n) = q
+        .strip_prefix("as")
+        .map(|r| r.strip_prefix(':').unwrap_or(r).trim())
+        .and_then(|r| r.parse::<u32>().ok())
+    {
+        return g.asn == Some(n);
+    }
+    if let Some(c) = q.strip_prefix("country:") {
+        return g.country.as_deref().map(low).as_deref() == Some(c.trim());
+    }
+    let short = [
+        g.asn.map(|a| format!("as{a}")),
+        g.country.as_deref().map(low),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    short.contains(q)
+        || g.as_org.as_deref().is_some_and(|o| low(o).contains(q))
+        || g.country_name
+            .as_deref()
+            .is_some_and(|c| low(c).contains(q))
 }
 
 fn target(s: &str) -> Result<IpNet, ApiError> {
@@ -3018,15 +3087,99 @@ async fn decisions(
 ) -> ApiResult {
     caller.require(Role::Viewer)?;
     let t = q.target.as_deref().map(target).transpose()?;
-    let list: Vec<_> = ctl
-        .active_decisions()
-        .into_iter()
-        .filter(|d| t.map_or(true, |t| d.target.contains(&t) || t.contains(&d.target)))
-        .filter(|d| q.jail.as_ref().map_or(true, |j| d.jail.as_ref() == Some(j)))
-        .collect();
-    // ASN/country by target, when GeoIP databases are configured
-    let geo = geo_map(&ctl.geo, list.iter().map(|d| &d.target));
-    Ok(Json(json!({ "decisions": list, "geo": geo })))
+    let limit = q.limit.unwrap_or(DECISIONS_PAGE);
+    if limit == 0 || limit > MAX_DECISIONS_PAGE {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_DECISIONS_PAGE}"
+        )));
+    }
+    let family = match q.family.as_deref() {
+        None | Some("") => None,
+        Some("4") => Some(false),
+        Some("6") => Some(true),
+        Some(_) => return Err(ApiError::bad_request("family must be 4 or 6")),
+    };
+    let search =
+        q.q.as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty());
+    if search.as_ref().is_some_and(|s| s.len() > 256) {
+        return Err(ApiError::bad_request("q: at most 256 characters"));
+    }
+    #[derive(Clone, Copy)]
+    enum Sort {
+        Old,
+        New,
+        Expires,
+        Target,
+    }
+    let sort = match q.sort.as_deref() {
+        None | Some("") | Some("old") => Sort::Old,
+        Some("new") => Sort::New,
+        Some("expires") => Sort::Expires,
+        Some("target") => Sort::Target,
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "sort must be old, new, expires or target",
+            ))
+        }
+    };
+    let ctl2 = ctl.clone();
+    let (page, total, active, jails) = blocking(move || {
+        let all = ctl2.active_decisions();
+        let active = all.len();
+        let mut jails: Vec<Option<String>> = all.iter().map(|d| d.jail.clone()).collect();
+        jails.sort();
+        jails.dedup();
+        let mut list: Vec<df2b_core::Decision> = all
+            .into_iter()
+            .filter(|d| t.map_or(true, |t| d.target.contains(&t) || t.contains(&d.target)))
+            .filter(|d| match q.jail.as_deref() {
+                None | Some("") => true,
+                Some("-") => d.jail.is_none(),
+                Some(j) => d.jail.as_deref() == Some(j),
+            })
+            .filter(|d| family.map_or(true, |v6| matches!(d.target, IpNet::V6(_)) == v6))
+            .filter(|d| {
+                search.as_deref().map_or(true, |s| {
+                    let g = if ctl2.geo.enabled() {
+                        ctl2.geo.lookup_net(&d.target)
+                    } else {
+                        None
+                    };
+                    decision_matches(d, s, g.as_ref())
+                })
+            })
+            .collect();
+        // active_decisions() is by sequence number
+        match sort {
+            Sort::Old => {}
+            Sort::New => list.reverse(),
+            Sort::Expires => list.sort_by_key(|d| (d.expires_at.is_none(), d.expires_at, d.seq)),
+            Sort::Target => list.sort_by(|a, b| {
+                (a.target.addr(), a.target.prefix_len(), a.seq).cmp(&(
+                    b.target.addr(),
+                    b.target.prefix_len(),
+                    b.seq,
+                ))
+            }),
+        }
+        let total = list.len();
+        let page: Vec<df2b_core::Decision> = list.into_iter().skip(q.offset).take(limit).collect();
+        Ok((page, total, active, jails))
+    })
+    .await?;
+    // ASN/country of the page's targets, when GeoIP databases are configured
+    let geo = geo_map(&ctl.geo, page.iter().map(|d| &d.target));
+    Ok(Json(json!({
+        "decisions": page,
+        "geo": geo,
+        "total": total,
+        "offset": q.offset,
+        "limit": limit,
+        "active": active,
+        "jails": jails,
+    })))
 }
 
 /// "global", "group:<name>" or "agent:<id>[,<id>...]"
@@ -4443,6 +4596,130 @@ mod tests {
             !v.to_string().contains("df2bapi1."),
             "no secrets in the audit log"
         );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn decisions_are_paged_filtered_and_sorted() {
+        let env = Env::new("paging").await;
+        let viewer = env.token("vic", Role::Viewer);
+        let now = Utc::now();
+        // 30 bans: v4 from agents (sshd), v6 from a rule (nginx), one manual
+        let mut new: Vec<crate::state::NewDecision> = (0..20u32)
+            .map(|i| crate::state::NewDecision {
+                kind: DecisionKind::Ban,
+                target: IpNet::from(std::net::IpAddr::V4((0xcb00_7100 + i).into())),
+                scope: Scope::Global,
+                jail: Some("sshd".into()),
+                // the later, the sooner it ends
+                expires_at: Some(now + chrono::Duration::hours(100 - i64::from(i))),
+                origin: Origin::Agent(AgentId("web-1".into())),
+                reason: format!("local ban on web-1: {i} failures"),
+            })
+            .collect();
+        new.extend((0..9u16).map(|i| crate::state::NewDecision {
+            kind: DecisionKind::Ban,
+            target: format!("2001:db8::{:x}/128", 9 - i).parse().unwrap(),
+            scope: Scope::Group("web".into()),
+            jail: Some("nginx".into()),
+            expires_at: None,
+            origin: Origin::Correlation("Scanners".into()),
+            reason: "correlation".into(),
+        }));
+        new.push(crate::state::NewDecision {
+            kind: DecisionKind::Ban,
+            target: "198.51.100.0/24".parse().unwrap(),
+            scope: Scope::Global,
+            jail: None,
+            expires_at: None,
+            origin: Origin::User("ada".into()),
+            reason: "Known botnet".into(),
+        });
+        assert_eq!(env.ctl.append(new).unwrap().len(), 30);
+        let get = |q: &str| {
+            let (env, viewer, q) = (&env, viewer.clone(), q.to_owned());
+            async move {
+                let (st, v) = env
+                    .call(
+                        "GET",
+                        &format!("/api/v1/decisions{q}"),
+                        &viewer,
+                        Value::Null,
+                    )
+                    .await;
+                assert_eq!(st, S::OK, "{q}: {v}");
+                v
+            }
+        };
+        let targets = |v: &Value| -> Vec<String> {
+            v["decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["target"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // default: everything (up to 1000), oldest first
+        let v = get("").await;
+        assert_eq!(
+            (v["total"].as_u64(), v["active"].as_u64()),
+            (Some(30), Some(30))
+        );
+        assert_eq!(v["limit"], 1000);
+        assert_eq!(targets(&v)[0], "203.0.113.0/32");
+        assert_eq!(v["jails"], json!([null, "nginx", "sshd"]));
+        // pages
+        let v = get("?limit=10&offset=25").await;
+        assert_eq!(targets(&v).len(), 5);
+        assert_eq!(v["total"], 30);
+        assert_eq!(targets(&v)[4], "198.51.100.0/24");
+        let v = get("?sort=new&limit=1").await;
+        assert_eq!(targets(&v), ["198.51.100.0/24"]);
+        // filters: family, jail, manual, text (case-insensitive)
+        assert_eq!(get("?family=6").await["total"], 9);
+        assert_eq!(get("?family=4&jail=sshd").await["total"], 20);
+        assert_eq!(targets(&get("?jail=-").await), ["198.51.100.0/24"]);
+        assert_eq!(get("?q=SCANNERS").await["total"], 9, "origin");
+        assert_eq!(get("?q=group%20web").await["total"], 9, "scope");
+        assert_eq!(get("?q=botnet").await["total"], 1, "reason");
+        assert_eq!(get("?q=manual").await["total"], 1, "no jail");
+        assert_eq!(get("?q=203.0.113.1").await["total"], 11, "address text");
+        assert_eq!(get("?q=%20%20").await["total"], 30, "blank: no filter");
+        // sorts
+        let v = get("?sort=expires&family=4&limit=2").await;
+        assert_eq!(targets(&v), ["203.0.113.19/32", "203.0.113.18/32"]);
+        let v = get("?sort=expires").await;
+        assert_eq!(
+            v["decisions"][29]["expires_at"],
+            Value::Null,
+            "permanent last"
+        );
+        let v = get("?sort=target&family=6&limit=3").await;
+        assert_eq!(
+            targets(&v),
+            ["2001:db8::1/128", "2001:db8::2/128", "2001:db8::3/128"]
+        );
+        let v = get("?sort=target&family=4").await;
+        assert_eq!(targets(&v)[0], "198.51.100.0/24");
+        assert_eq!(targets(&v)[3], "203.0.113.2/32", "numeric, not text order");
+        // bad parameters
+        for q in [
+            "?limit=0",
+            "?limit=10001",
+            "?family=5",
+            "?sort=random",
+            "?offset=-1",
+        ] {
+            let (st, _) = env
+                .call(
+                    "GET",
+                    &format!("/api/v1/decisions{q}"),
+                    &viewer,
+                    Value::Null,
+                )
+                .await;
+            assert_eq!(st, S::BAD_REQUEST, "{q}");
+        }
         let _ = std::fs::remove_dir_all(&env.dir);
     }
 
