@@ -394,7 +394,11 @@ can do is bounded (security review 2026-11-19, regression tests for each):
   streams per agent, streams close when the certificate expires.
 - **Controller decisions** (agent): bans overlapping the agent's own or the
   central allowlist, wider than /8 resp. /16, or covering the controller's
-  address are refused; central jails and policies with findtime > 7 days
+  address are refused; decisions name their origin agent (its host name)
+  and carry the reason only for the agent that made them, the others see
+  just "agent", "correlation" or "user" (a compromised agent cannot map
+  the other groups' hosts from the bans it receives); central jails and
+  policies with findtime > 7 days
   or ban times > 10 years are dropped; central file paths must really be
   below `central_paths` (no glob or symlink tricks, regular files only);
   filters are bounded (100 patterns each, 4 KiB per pattern, 2 MiB per

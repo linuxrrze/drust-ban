@@ -566,14 +566,18 @@ impl AgentService for Service {
                 Initial::Snapshot { seq, active } => {
                     let snap = v1::Snapshot {
                         seq,
-                        active: active.iter().map(Into::into).collect(),
+                        active: active.iter().map(|d| for_agent(d, &id)).collect(),
                     };
                     let _ = tx.send(Ok(event(Event::Snapshot(snap)))).await;
                     seq
                 }
                 Initial::Backlog { seq, decisions } => {
                     for d in &decisions {
-                        if tx.send(Ok(event(Event::Decision(d.into())))).await.is_err() {
+                        if tx
+                            .send(Ok(event(Event::Decision(for_agent(d, &id)))))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -683,7 +687,7 @@ impl AgentService for Service {
                             if d.seq <= last || !applies(&d, &record) {
                                 continue;
                             }
-                            if tx.send(Ok(event(Event::Decision((&*d).into())))).await.is_err() {
+                            if tx.send(Ok(event(Event::Decision(for_agent(&d, &id))))).await.is_err() {
                                 break;
                             }
                         }
@@ -723,6 +727,27 @@ impl AgentService for Service {
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+/// A decision as sent to agent `me`. Agents of every group receive each
+/// other's bans; the origin's agent id (its host name) and the reason
+/// (failure counts, correlation rules naming agents, an operator's note)
+/// are only for the agent that made the ban, the API and the audit log.
+/// Others get the kind of origin ("agent", "correlation", "user"), which is
+/// all an agent uses besides recognising its own bans.
+fn for_agent(d: &df2b_core::Decision, me: &str) -> v1::Decision {
+    let mut m = v1::Decision::from(d);
+    let own = matches!(&d.origin, Origin::Agent(a) if a.0 == me);
+    if !own {
+        m.origin = match &d.origin {
+            Origin::Agent(_) => "agent",
+            Origin::Correlation(_) => "correlation",
+            Origin::User(_) => "user",
+        }
+        .to_owned();
+        m.reason.clear();
+    }
+    m
 }
 
 #[cfg(test)]
@@ -980,6 +1005,46 @@ mod tests {
             assert_eq!(ctl.agent(&id).unwrap().status.redaction_version, v);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decisions_for_other_agents_do_not_name_the_origin() {
+        let d = |origin: Origin, reason: &str| df2b_core::Decision {
+            seq: 1,
+            id: uuid::Uuid::new_v4(),
+            kind: DecisionKind::Ban,
+            target: "203.0.113.7/32".parse().unwrap(),
+            scope: Scope::Global,
+            jail: Some("sshd".into()),
+            created_at: Utc::now(),
+            expires_at: None,
+            origin,
+            reason: reason.into(),
+        };
+        let local = d(
+            Origin::Agent(AgentId("web-01-a1b2c3".into())),
+            "local ban on web-01-a1b2c3: 5 failures",
+        );
+        // its own ban: everything (it recognises it by the origin)
+        let own = for_agent(&local, "web-01-a1b2c3");
+        assert_eq!(own.origin, "agent:web-01-a1b2c3");
+        assert_eq!(own.reason, "local ban on web-01-a1b2c3: 5 failures");
+        // any other agent: neither the host name nor the reason
+        for (dec, kind) in [
+            (local, "agent"),
+            (
+                d(
+                    Origin::Correlation("distributed".into()),
+                    "correlation rule distributed: 4 failures from 2 agents (web-01-a1b2c3, db-02-d4e5f6)",
+                ),
+                "correlation",
+            ),
+            (d(Origin::User("ada".into()), "ticket 4711"), "user"),
+        ] {
+            let m = for_agent(&dec, "db-02-d4e5f6");
+            assert_eq!((m.origin.as_str(), m.reason.as_str()), (kind, ""));
+            assert_eq!((m.target.as_str(), m.seq), ("203.0.113.7/32", 1));
+        }
     }
 
     #[tokio::test]

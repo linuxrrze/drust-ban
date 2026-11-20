@@ -170,7 +170,9 @@ message Decision {
   int64 expires_unix_ms = 7;
   // For UNBAN: id of the revoked decision.
   string revokes = 8;
-  // "agent:<id>", "correlation:<rule>" or "user:<name>"
+  // "agent:<id>", "correlation:<rule>" or "user:<name>". Sent in full only
+  // to the agent that made the ban; other agents get "agent",
+  // "correlation" or "user" and no reason.
   string origin = 9;
   string reason = 10;
 }
