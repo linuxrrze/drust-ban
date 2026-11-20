@@ -113,6 +113,36 @@ running services. Configure the agent as above.
 `/var/lib/df2b` and `/var/lib/private/df2b-controller` (delete them by
 hand) and saves modified configuration files as `*.rpmsave`.
 
+## Containers
+
+`Containerfile` builds one image with all three programs (Debian trixie,
+with nft and libsystemd); `packaging/container/compose.yaml` runs the
+controller and an agent on one host:
+
+```sh
+cd packaging/container
+docker compose up -d controller
+docker compose exec controller df2b-controller enroll-token --group web
+DF2B_ENROLL_TOKEN=df2b1.… docker compose up -d agent
+docker compose exec agent df2bctl --local status
+```
+
+The controller needs no privileges (unprivileged user, no capabilities,
+read-only root file system); its state is in the `controller` volume, and
+its management commands run with `docker compose exec controller
+df2b-controller …`.
+
+The agent changes the host's firewall, so it shares the host's network
+(`network_mode: host`) and has `NET_ADMIN` as its only capability; it
+reads the host's `/var/log` (with the journal) read-only. Its
+configuration is `packaging/container/agent.toml`, its state (bans,
+certificate) the `agent` volume: without it, a new container loses its
+enrollment. Rootless Docker or Podman cannot work, since a user namespace
+cannot change the host's ruleset. Bans drop in `prerouting`, so ports
+that Docker publishes for other containers are protected too. To watch
+other containers' logs, give them the journald log driver (the default
+json-file driver wraps each line in JSON) and match on `CONTAINER_NAME=`.
+
 ## Try it
 
 ```sh

@@ -1,0 +1,51 @@
+# dist-f2b agent in a container (compose.yaml next to this file). All
+# options: config/agent.example.toml in the source tree, or
+# /etc/df2b/agent.toml inside the image. Validate with:
+#   docker compose run --rm --no-deps agent df2b-agent --config /etc/df2b/agent.toml --check
+
+[agent]
+# The controller from compose.yaml on this host (the agent shares the
+# host's network); on other hosts its name or address.
+controller = "https://127.0.0.1:7443"
+
+# filters shipped in the image
+filter_dir = "/etc/df2b/filters"
+state_dir = "/var/lib/df2b"
+
+# The host's ruleset: table inet df2b, dropping in prerouting (before
+# NAT), so ports published by Docker are covered too.
+firewall = "nftables"
+
+# Never ban these. Docker's networks: with its userland proxy (IPv6
+# published ports without ip6tables, hairpin traffic) applications log
+# the bridge gateway instead of the client; better: "userland-proxy":
+# false in /etc/docker/daemon.json.
+allowlist = ["127.0.0.0/8", "::1/128", "172.16.0.0/12"]
+
+# central jails may only read the host's /var/log (mounted read-only)
+# central_paths = ["/var/log"]
+
+[[source]]
+name = "sshd-journal"
+type = "journald"
+matches = ["_SYSTEMD_UNIT=sshd.service", "_SYSTEMD_UNIT=ssh.service"]
+start = "10m"
+
+# Logs of other containers: their json-file logs wrap each line in JSON,
+# which the filters do not match. Use the journald log driver for them
+# (--log-driver=journald or "log-driver": "journald" in daemon.json) and
+# match on the container name:
+# [[source]]
+# name = "web-journal"
+# type = "journald"
+# matches = ["CONTAINER_NAME=web"]
+
+[[jail]]
+name = "sshd"
+sources = ["sshd-journal"]
+filter = "sshd"
+maxretry = 5
+findtime = "10m"
+bantime = "1h"
+bantime_factor = 2.0
+max_bantime = "30d"

@@ -1,0 +1,9 @@
+# build context for Containerfile: sources only (the image builds the web
+# UI and the binaries itself)
+.git
+.github
+target
+web/node_modules
+web/dist
+packaging/deb/generated
+**/*.docx

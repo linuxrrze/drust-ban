@@ -1,0 +1,79 @@
+# dist-f2b with Docker Compose (or podman-compose, rootful): the controller
+# and an agent on one host. In this directory:
+#
+#   docker compose up -d controller
+#   docker compose exec controller df2b-controller enroll-token --group web
+#   DF2B_ENROLL_TOKEN=df2b1.… docker compose up -d agent
+#   docker compose exec agent df2bctl --local status
+#
+# The token is only needed for the first start (the agent's certificate is
+# then kept in its volume). Other hosts run just the agent service, with
+# `controller` in agent.toml pointing to this host.
+#
+# The agent changes the host's firewall: it shares the host's network
+# namespace and has NET_ADMIN, nothing more (no --privileged). Rootless
+# Docker/Podman cannot work: a user namespace cannot change the host's
+# nftables ruleset.
+
+name: df2b
+
+x-image: &image
+  image: df2b:latest
+  build:
+    context: ../..
+    dockerfile: Containerfile
+
+services:
+  controller:
+    <<: *image
+    restart: unless-stopped
+    ports:
+      - "7443:7443"   # agents (mutual TLS)
+      - "7444:7444"   # REST API and web UI (HTTPS)
+    volumes:
+      - controller:/var/lib/df2b-controller
+    # options: see `df2b-controller --help`
+    # environment:
+    #   DF2B_LOG_RETENTION: 90d
+    #   DF2B_ACTIONS: /run/secrets/actions.toml
+    # secret files must not be readable by everyone (the controller warns):
+    # mount them owned by uid 10001, mode 0400
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  agent:
+    <<: *image
+    command: ["df2b-agent", "--config", "/etc/df2b/agent.toml"]
+    restart: unless-stopped
+    # the host's firewall, the host's log files: see agent.toml
+    network_mode: host
+    # root in the container, with NET_ADMIN as its only capability (nft
+    # inherits it). Without CAP_DAC_OVERRIDE root reads root's files only:
+    # the adm group (gid 4 on Debian/Ubuntu) adds /var/log/auth.log & co.
+    user: root
+    group_add: [adm]
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    init: true
+    stop_signal: SIGTERM
+    environment:
+      DF2B_ENROLL_TOKEN: ${DF2B_ENROLL_TOKEN:-}
+    volumes:
+      # offenders, queued reports, active bans, certificate, control socket
+      - agent:/var/lib/df2b
+      - ./agent.toml:/etc/df2b/agent.toml:ro
+      # log files and the persistent journal; libsystemd finds this host's
+      # journal by its machine id
+      - /var/log:/var/log:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      # hosts with a volatile journal (no /var/log/journal) also need:
+      # - /run/log/journal:/run/log/journal:ro
+
+volumes:
+  controller:
+  agent:
