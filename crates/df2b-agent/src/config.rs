@@ -34,6 +34,13 @@ pub struct AgentSection {
     pub ipv4_prefix: u8,
     #[serde(default = "default_v6_prefix")]
     pub ipv6_prefix: u8,
+    /// Widening: once a jail has banned this many IPv6 prefixes inside one
+    /// `ipv6_widen_prefix` block at the same time, it bans the whole block
+    /// (attackers with a /48 rotate through its /64s). 0 = off.
+    #[serde(default)]
+    pub ipv6_widen_after: u32,
+    #[serde(default = "default_widen_prefix")]
+    pub ipv6_widen_prefix: u8,
     #[serde(default = "default_filter_dir")]
     pub filter_dir: PathBuf,
     #[serde(default = "default_state_dir")]
@@ -192,6 +199,9 @@ fn default_v4_prefix() -> u8 {
 fn default_v6_prefix() -> u8 {
     64
 }
+fn default_widen_prefix() -> u8 {
+    48
+}
 fn default_filter_dir() -> PathBuf {
     "/etc/df2b/filters".into()
 }
@@ -234,6 +244,17 @@ impl AgentConfig {
         }
         if self.agent.ipv6_prefix == 0 || self.agent.ipv6_prefix > 128 {
             bail!("ipv6_prefix must be 1..=128");
+        }
+        if self.agent.ipv6_widen_after > 0 {
+            if !(2..=1000).contains(&self.agent.ipv6_widen_after) {
+                bail!("ipv6_widen_after must be 0 (off) or 2..=1000");
+            }
+            // the controller takes nothing wider than a /48 from an agent
+            if self.agent.ipv6_widen_prefix < 48
+                || self.agent.ipv6_widen_prefix >= self.agent.ipv6_prefix
+            {
+                bail!("ipv6_widen_prefix must be 48 or longer and shorter than ipv6_prefix");
+            }
         }
         match (self.agent.firewall, self.agent.firewall_exec.is_empty()) {
             (FirewallKind::Exec, true) => bail!("firewall = \"exec\" needs firewall_exec"),

@@ -148,9 +148,14 @@ containing `from 1.2.3.4`) cannot inject a different IP.
 
 - **Key normalization**: IPv4 is tracked as `/32`. IPv6 is aggregated to a
   configurable prefix (default `/64`) because attackers trivially rotate
-  addresses inside a /64. Optional escalation to `/56` or `/48` when several
-  /64s from the same block misbehave. IPv4-mapped IPv6 addresses are treated
-  as IPv4.
+  addresses inside a /64. Optional widening (`ipv6_widen_after`, off by
+  default): once a jail has banned that many prefixes inside one block
+  (`ipv6_widen_prefix`, /48 by default, /56 possible) at the same time, it
+  bans the block - with the jail's ban time, escalated for repeat blocks -
+  and stops banning further prefixes inside it while that lasts. A block
+  overlapping the allowlist is never banned; the wider ban reaches the
+  controller like any local ban (which accepts nothing wider than /48 from
+  an agent). IPv4-mapped IPv6 addresses are treated as IPv4.
 - **Tracker**: per (jail, key) a small ring of timestamps forms a sliding
   `findtime` window. Memory is bounded per jail (`max_tracked` keys,
   default 100 000): when full, expired entries are pruned (at most once a

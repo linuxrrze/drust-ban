@@ -13,6 +13,11 @@
 # Prefix lengths used to aggregate offenders.
 ipv4_prefix = 32
 ipv6_prefix = 64
+# Ban the whole /48 once a jail has banned this many /64s inside it at the
+# same time (with the jail's ban time and escalation; 0 = off). The wider ban
+# is reported to the controller like any local ban.
+# ipv6_widen_after = 3
+# ipv6_widen_prefix = 48             # 48..ipv6_prefix-1
 
 # Relative paths are resolved against this file's directory.
 filter_dir = "../filters"

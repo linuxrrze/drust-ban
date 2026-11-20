@@ -202,7 +202,25 @@ pub struct Engine {
     /// The controller's allowlist (replaced on every update).
     central: Allowlist,
     prefix: PrefixPolicy,
+    /// IPv6 widening: (banned prefixes, block prefix length).
+    widen: Option<(u32, u8)>,
     offense_memory: TimeDelta,
+}
+
+fn widen(cfg: &crate::config::AgentSection) -> Option<(u32, u8)> {
+    (cfg.ipv6_widen_after > 0).then_some((cfg.ipv6_widen_after, cfg.ipv6_widen_prefix))
+}
+
+/// The `len` block around an IPv6 key (None for IPv4 or keys that are
+/// already that wide).
+fn block(key: &IpKey, len: u8) -> Option<IpKey> {
+    match key.net() {
+        IpNet::V6(n) if n.prefix_len() > len => Some(IpKey::from_addr(
+            std::net::IpAddr::V6(n.network()),
+            PrefixPolicy { v4: 32, v6: len },
+        )),
+        _ => None,
+    }
 }
 
 /// Local (configuration) or central (controller) allowlist.
@@ -281,6 +299,7 @@ impl Engine {
         self.allowlist = Allowlist::new(cfg.agent.allowlist.iter().copied());
         self.offense_memory =
             TimeDelta::from_std(cfg.agent.offense_memory).unwrap_or(TimeDelta::MAX);
+        self.widen = widen(&cfg.agent);
         Ok(out)
     }
 
@@ -302,6 +321,7 @@ impl Engine {
                 v4: cfg.agent.ipv4_prefix,
                 v6: cfg.agent.ipv6_prefix,
             },
+            widen: widen(&cfg.agent),
             offense_memory: TimeDelta::from_std(cfg.agent.offense_memory).unwrap_or(TimeDelta::MAX),
         })
     }
@@ -354,10 +374,12 @@ impl Engine {
                 continue;
             };
             let key = IpKey::from_addr(m.ip, self.prefix);
-            if jail
-                .offenders
-                .get(&key)
-                .is_some_and(|o| o.banned_until > now)
+            let wide = self.widen.and_then(|(_, len)| block(&key, len));
+            // banned itself, or its whole block is
+            if [Some(key), wide]
+                .into_iter()
+                .flatten()
+                .any(|k| jail.offenders.get(&k).is_some_and(|o| o.banned_until > now))
             {
                 continue;
             }
@@ -412,6 +434,49 @@ impl Engine {
                 offense,
                 until,
                 failures: jail.maxretry,
+                sample: line.line.clone(),
+            });
+            // several prefixes of one block banned at once: the block
+            let (Some((after, _)), Some(wide)) = (self.widen, wide) else {
+                continue;
+            };
+            let inside = jail
+                .offenders
+                .iter()
+                .filter(|(k, o)| o.banned_until > now && wide.net().contains(&k.net()))
+                .count();
+            if inside < after as usize {
+                continue;
+            }
+            if allowed(
+                &self.allowlist,
+                &self.central,
+                &wide.net().network(),
+                &wide.net(),
+            ) {
+                debug!(block = %wide, jail = %jail.name, "block overlaps the allowlist, not widening");
+                continue;
+            }
+            let offense = jail.offenders.get(&wide).map_or(0, |o| o.offenses) + 1;
+            let duration = escalated_bantime(jail.bantime, jail.factor, jail.max_bantime, offense);
+            let until = TimeDelta::from_std(duration)
+                .ok()
+                .and_then(|d| now.checked_add_signed(d))
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            jail.offenders.insert(
+                wide,
+                Offender {
+                    offenses: offense,
+                    banned_until: until,
+                },
+            );
+            actions.push(BanAction {
+                jail: jail.name.clone(),
+                key: wide,
+                duration,
+                offense,
+                until,
+                failures: u32::try_from(inside).unwrap_or(u32::MAX),
                 sample: line.line.clone(),
             });
         }
@@ -1227,6 +1292,70 @@ mod tests {
         .unwrap();
         cfg.agent.filter_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../filters").into();
         cfg
+    }
+
+    /// Several /64s of one /48 banned at once: the /48 is banned, and
+    /// further /64s inside it are not banned again.
+    #[test]
+    fn ipv6_widening() {
+        let c = cfg("ipv6_widen_after = 3\nallowlist = [\"2001:db8:aaaa:1::/64\"]");
+        c.validate().unwrap();
+        let mut e = Engine::from_config(&c).unwrap();
+        let now = Utc::now();
+        let hit = |e: &mut Engine, ip: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                out.extend(
+                    e.process(&line("auth", ip), now)
+                        .into_iter()
+                        .map(|a| format!("{} {} {}", a.key, a.offense, a.duration.as_secs())),
+                );
+            }
+            out
+        };
+        assert_eq!(hit(&mut e, "2001:db8:1:1::5"), ["2001:db8:1:1::/64 1 3600"]);
+        assert_eq!(hit(&mut e, "2001:db8:1:2::5"), ["2001:db8:1:2::/64 1 3600"]);
+        // other /48: counted on its own
+        assert_eq!(hit(&mut e, "2001:db8:2:1::5"), ["2001:db8:2:1::/64 1 3600"]);
+        // the third /64 of 2001:db8:1::/48
+        assert_eq!(
+            hit(&mut e, "2001:db8:1:3::5"),
+            ["2001:db8:1:3::/64 1 3600", "2001:db8:1::/48 1 3600"]
+        );
+        // inside the banned block: nothing more
+        assert!(hit(&mut e, "2001:db8:1:4::5").is_empty());
+        // IPv4 is never widened
+        for i in 1..=4 {
+            assert_eq!(hit(&mut e, &format!("192.0.2.{i}")).len(), 1);
+        }
+        // a block overlapping the allowlist is not banned
+        for b in 2..=4 {
+            assert_eq!(hit(&mut e, &format!("2001:db8:aaaa:{b}::1")).len(), 1);
+        }
+        // when the bans have run out and it starts again: escalated
+        let later = now + TimeDelta::hours(2);
+        let mut acts = Vec::new();
+        for b in 5..=7 {
+            for _ in 0..3 {
+                acts.extend(e.process(&line("auth", &format!("2001:db8:1:{b}::1")), later));
+            }
+        }
+        let wide: Vec<_> = acts
+            .iter()
+            .filter(|a| a.key.to_string() == "2001:db8:1::/48")
+            .collect();
+        assert_eq!((wide.len(), wide[0].offense), (1, 2));
+        // validation
+        for bad in [
+            "ipv6_widen_after = 1",
+            "ipv6_widen_after = 3\nipv6_widen_prefix = 40",
+            "ipv6_widen_after = 3\nipv6_widen_prefix = 64",
+        ] {
+            assert!(cfg(bad).validate().is_err(), "{bad}");
+        }
+        assert!(cfg("ipv6_widen_after = 3\nipv6_widen_prefix = 56")
+            .validate()
+            .is_ok());
     }
 
     #[test]
