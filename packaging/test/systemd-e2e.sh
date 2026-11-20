@@ -262,7 +262,10 @@ timeout = "10s"
 TOML
 install -m 0755 /dev/stdin /usr/local/bin/df2b-test-action <<'SH'
 #!/bin/sh
-sha256sum < "$CREDENTIALS_DIRECTORY/hook-token" > /var/lib/df2b-controller/action-saw
+# atomically: the test may read while another run of the action writes
+d=/var/lib/df2b-controller
+sha256sum < "$CREDENTIALS_DIRECTORY/hook-token" > "$d/action-saw.$$"
+mv "$d/action-saw.$$" "$d/action-saw"
 SH
 mkdir -p /etc/systemd/system/df2b-controller.service.d
 cat > /etc/systemd/system/df2b-controller.service.d/credentials.conf <<'INI'
@@ -278,7 +281,7 @@ df2bctl ban 203.0.113.50 --reason ci > /dev/null
 saw=/var/lib/private/df2b-controller/action-saw
 wait_for 30 test -s "$saw" || fail "the action did not run or could not read its credential"
 [[ $(cat "$saw") == "$(sha256sum < /etc/df2b/hook-token)" ]] \
-    || fail "the action read something else than the credential"
+    || fail "the action read something else than the credential: '$(cat "$saw")'"
 df2bctl unban 203.0.113.50 > /dev/null
 if journalctl -b --no-pager -u df2b-controller | grep -q 'readable by everyone'; then
     fail "the controller warned about a readable actions file"
