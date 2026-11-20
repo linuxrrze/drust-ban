@@ -26,6 +26,7 @@ ipnet.workspace = true
 maintainer = "Marcel Ritter <marcel@linux-ng.de>"
 copyright = "2026 Marcel Ritter"
 license-file = ["../../packaging/deb/generated/LICENSE.dep5", "2"]
+changelog = "../../packaging/deb/generated/df2bctl.changelog"
 section = "net"
 priority = "optional"
 extended-description = """\
