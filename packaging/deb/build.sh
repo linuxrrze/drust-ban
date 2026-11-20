@@ -35,6 +35,14 @@ mv packaging/deb/generated/THIRD-PARTY-LICENSES.tmp packaging/deb/generated/THIR
 
 cargo build --release --locked -p df2b-agent -p df2b-controller -p df2bctl
 
+# manual pages from the command line definitions (one per subcommand),
+# compressed reproducibly
+rm -rf packaging/deb/generated/man
+for bin in df2b-agent df2b-controller df2bctl; do
+    "target/release/$bin" --generate-man "packaging/deb/generated/man/$bin"
+done
+gzip -9n packaging/deb/generated/man/*/*.1
+
 version=${DEB_VERSION:-$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)-1}
 for pkg in df2b-agent df2b-controller df2bctl; do
     # /usr/share/doc/<package>/changelog.Debian.gz, from git

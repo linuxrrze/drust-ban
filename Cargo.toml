@@ -26,6 +26,7 @@ base64 = "0.22"
 glob = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+clap_mangen = "0.2"
 humantime = "2"
 humantime-serde = "1"
 hyper = "1"

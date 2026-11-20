@@ -13,6 +13,7 @@ axum.workspace = true
 chrono.workspace = true
 glob.workspace = true
 clap.workspace = true
+clap_mangen.workspace = true
 df2b-core.workspace = true
 df2b-matcher.workspace = true
 df2b-proto.workspace = true
@@ -64,6 +65,7 @@ maintainer-scripts = "../../packaging/deb/df2b-controller/"
 systemd-units = { unit-scripts = "../../packaging/systemd", enable = true, start = true }
 assets = [
     ["target/release/df2b-controller", "usr/bin/", "755"],
+    ["../../packaging/deb/generated/man/df2b-controller/*", "usr/share/man/man1/", "644"],
     ["../../packaging/deb/generated/THIRD-PARTY-LICENSES", "usr/share/doc/df2b-controller/", "644"],
     ["../../README.md", "usr/share/doc/df2b-controller/README.md", "644"],
     ["../../config/oidc.example.toml", "usr/share/doc/df2b-controller/examples/oidc.example.toml", "644"],
@@ -76,6 +78,7 @@ assets = [
 release = "1"
 assets = [
     { source = "target/rpm/bin/df2b-controller", dest = "/usr/bin/df2b-controller", mode = "755" },
+    { source = "target/rpm/man/df2b-controller/*", dest = "/usr/share/man/man1/", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/licenses/df2b-controller/LICENSE", mode = "644", doc = true },
     { source = "target/rpm/THIRD-PARTY-LICENSES", dest = "/usr/share/licenses/df2b-controller/THIRD-PARTY-LICENSES", mode = "644", doc = true },
     { source = "packaging/systemd/df2b-controller.service", dest = "/usr/lib/systemd/system/df2b-controller.service", mode = "644" },

@@ -487,8 +487,32 @@ fn parse_target(s: &str) -> Result<IpNet, String> {
     df2b_core::parse_target(s)
 }
 
+/// `--generate-man <DIR>` as the only arguments (hidden, for the package
+/// builds): writes the manual pages of the command and its subcommands to
+/// DIR instead of running.
+fn generate_man() -> Option<anyhow::Result<()>> {
+    use clap::CommandFactory;
+    let mut args = std::env::args_os().skip(1);
+    if args.next()? != "--generate-man" {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(args.next()?);
+    Some((|| {
+        std::fs::create_dir_all(&dir)?;
+        clap_mangen::generate_to(Cli::command(), &dir)?;
+        Ok(())
+    })())
+}
+
 #[tokio::main]
 async fn main() {
+    if let Some(r) = generate_man() {
+        if let Err(e) = r {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = run().await {
         eprintln!("error: {e:#}");
         std::process::exit(1);

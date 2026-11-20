@@ -14,6 +14,7 @@ journald = ["df2b-sources/journald"]
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_mangen.workspace = true
 df2b-core.workspace = true
 df2b-firewall.workspace = true
 df2b-matcher.workspace = true
@@ -56,6 +57,7 @@ maintainer-scripts = "../../packaging/deb/df2b-agent/"
 systemd-units = { unit-scripts = "../../packaging/systemd", enable = true, start = true }
 assets = [
     ["target/release/df2b-agent", "usr/bin/", "755"],
+    ["../../packaging/deb/generated/man/df2b-agent/*", "usr/share/man/man1/", "644"],
     ["../../packaging/deb/generated/THIRD-PARTY-LICENSES", "usr/share/doc/df2b-agent/", "644"],
     ["../../packaging/deb/generated/agent.toml", "etc/df2b/agent.toml", "644"],
     ["../../filters/*.toml", "etc/df2b/filters/", "644"],
@@ -72,6 +74,7 @@ assets = [
 release = "1"
 assets = [
     { source = "target/rpm/bin/df2b-agent", dest = "/usr/bin/df2b-agent", mode = "755" },
+    { source = "target/rpm/man/df2b-agent/*", dest = "/usr/share/man/man1/", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/licenses/df2b-agent/LICENSE", mode = "644", doc = true },
     { source = "target/rpm/THIRD-PARTY-LICENSES", dest = "/usr/share/licenses/df2b-agent/THIRD-PARTY-LICENSES", mode = "644", doc = true },
     { source = "target/rpm/agent.toml", dest = "/etc/df2b/agent.toml", mode = "644", config = "noreplace" },

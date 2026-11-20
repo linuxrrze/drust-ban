@@ -20,6 +20,7 @@ df2b-core.workspace = true
 df2b-matcher.workspace = true
 humantime.workspace = true
 ipnet.workspace = true
+clap_mangen.workspace = true
 
 # Debian package (cargo-deb); build with packaging/deb/build.sh.
 [package.metadata.deb]
@@ -35,6 +36,7 @@ Command line tool for dist-f2b: talks to the controller's REST API, or with \
 depends = "$auto"
 assets = [
     ["target/release/df2bctl", "usr/bin/", "755"],
+    ["../../packaging/deb/generated/man/df2bctl/*", "usr/share/man/man1/", "644"],
     ["../../packaging/deb/generated/THIRD-PARTY-LICENSES", "usr/share/doc/df2bctl/", "644"],
 ]
 
@@ -43,6 +45,7 @@ assets = [
 release = "1"
 assets = [
     { source = "target/rpm/bin/df2bctl", dest = "/usr/bin/df2bctl", mode = "755" },
+    { source = "target/rpm/man/df2bctl/*", dest = "/usr/share/man/man1/", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/licenses/df2bctl/LICENSE", mode = "644", doc = true },
     { source = "target/rpm/THIRD-PARTY-LICENSES", dest = "/usr/share/licenses/df2bctl/THIRD-PARTY-LICENSES", mode = "644", doc = true },
 ]

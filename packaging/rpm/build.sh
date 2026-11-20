@@ -46,6 +46,14 @@ mv target/rpm/THIRD-PARTY-LICENSES.tmp target/rpm/THIRD-PARTY-LICENSES
 
 cargo build --release --locked -p df2b-agent -p df2b-controller -p df2bctl
 
+# manual pages from the command line definitions (one per subcommand),
+# compressed reproducibly
+rm -rf target/rpm/man
+for bin in df2b-agent df2b-controller df2bctl; do
+    "target/release/$bin" --generate-man "target/rpm/man/$bin"
+done
+gzip -9n target/rpm/man/*/*.1
+
 # cargo-generate-rpm does not strip (cargo-deb does): package stripped copies
 for bin in df2b-agent df2b-controller df2bctl; do
     cp "target/release/$bin" "target/rpm/bin/$bin"

@@ -69,8 +69,28 @@ struct Args {
     enroll_token: Option<String>,
 }
 
+/// `--generate-man <DIR>` as the only arguments (hidden, for the package
+/// builds): writes the manual pages of the command and its subcommands to
+/// DIR instead of running.
+fn generate_man() -> Option<anyhow::Result<()>> {
+    use clap::CommandFactory;
+    let mut args = std::env::args_os().skip(1);
+    if args.next()? != "--generate-man" {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(args.next()?);
+    Some((|| {
+        std::fs::create_dir_all(&dir)?;
+        clap_mangen::generate_to(Args::command(), &dir)?;
+        Ok(())
+    })())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(r) = generate_man() {
+        return r;
+    }
     tracing_subscriber::fmt()
         // no color codes in files or the journal
         .with_ansi(std::io::stdout().is_terminal())
