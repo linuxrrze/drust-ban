@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { get } from '../lib/api';
+  import { ApiError, get, post } from '../lib/api';
+  import { can } from '../lib/session.svelte';
+  import { notify } from '../lib/toast.svelte';
   import { origin, relative, target } from '../lib/format';
   import { onChange } from '../lib/live.svelte';
   import { href } from '../lib/router.svelte';
-  import type { Agent, Decision, Stats, Status } from '../lib/types';
+  import type { Agent, Breaker, Decision, Stats, Status } from '../lib/types';
   import HourlyChart from '../components/HourlyChart.svelte';
   import TopList from '../components/TopList.svelte';
 
@@ -11,6 +13,8 @@
   let stats = $state<Stats | null>(null);
   let agents = $state<Agent[]>([]);
   let recent = $state<Decision[]>([]);
+  let breaker = $state<Breaker | null>(null);
+  let resetting = $state(false);
   let error = $state('');
   let now = $state(Date.now());
 
@@ -22,6 +26,7 @@
         get<{ agents: Agent[] }>('/agents'),
         get<{ decisions: Decision[] }>('/decisions'),
       ]);
+      breaker = s.breaker_tripped ? (await get<{ breaker: Breaker }>('/breaker')).breaker : null;
       status = s;
       stats = st;
       agents = a.agents;
@@ -43,6 +48,20 @@
     };
   });
 
+  async function resetBreaker() {
+    if (!confirm('Make automatic bans again? Make sure whatever caused the flood is fixed first.')) return;
+    resetting = true;
+    try {
+      const r = await post<{ held: number }>('/breaker/reset');
+      notify(`Circuit breaker reset (${r.held} bans had been held back)`);
+      load();
+    } catch (e) {
+      notify(e instanceof ApiError ? e.message : String(e), 'error');
+    } finally {
+      resetting = false;
+    }
+  }
+
   const problems = $derived(
     agents.filter(
       (a) => !a.revoked && (!a.connected || !a.status.firewall_healthy || sourceError(a) || certSoon(a)),
@@ -61,6 +80,28 @@
 <div class="page-head"><h1>Overview</h1></div>
 
 {#if error}<div class="error-box">{error}</div>{/if}
+
+{#if breaker?.tripped}
+  <div class="card breaker">
+    <h2>Automatic bans are on hold</h2>
+    <p>
+      More than {breaker.limit.max} automatic bans within {breaker.limit.window}: the circuit breaker tripped
+      {relative(breaker.tripped.at, now)}. Since then {breaker.tripped.held} bans from agents and correlation
+      rules were held back (agents still enforce their own local bans). Bans made here are not affected.
+    </p>
+    {#if breaker.tripped.samples.length}
+      <p class="muted small">Latest held back:
+        {#each breaker.tripped.samples.slice(0, 8) as h, i (i)}
+          {i ? ', ' : ''}<span class="mono">{h.target}</span> ({h.origin}){/each}
+      </p>
+    {/if}
+    {#if can('admin')}
+      <button class="primary" onclick={resetBreaker} disabled={resetting}>Reset circuit breaker…</button>
+    {:else}
+      <p class="muted small">An admin can reset it once the cause is fixed.</p>
+    {/if}
+  </div>
+{/if}
 
 {#if status && stats}
   <div class="tiles">
@@ -180,6 +221,8 @@
 {/if}
 
 <style>
+  .breaker { border-left: 4px solid var(--bad); margin-bottom: 16px; }
+  .breaker h2 { color: var(--bad); margin-top: 0; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 16px; margin-bottom: 16px; }
   .tile { display: grid; gap: 4px; color: inherit; text-decoration: none; }
   a.tile:hover { text-decoration: none; border-color: var(--accent); }

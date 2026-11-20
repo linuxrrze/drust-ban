@@ -375,6 +375,8 @@ pub fn router_with_limit(ctl: Arc<Controller>, limit: crate::ratelimit::ApiLimit
             "/api/v1/policies/propagate",
             axum::routing::put(set_propagate),
         )
+        .route("/api/v1/breaker", get(breaker))
+        .route("/api/v1/breaker/reset", post(reset_breaker))
         .route(
             "/api/v1/jails/:name/policy",
             axum::routing::put(set_jail_policy).delete(delete_jail_policy),
@@ -1324,6 +1326,37 @@ async fn set_propagate(
     })
     .await?;
     Ok(Json(json!({ "propagate": req.propagate, "previous": old })))
+}
+
+/// The circuit breaker for automatic bans: its limit, the current count
+/// and, if tripped, since when and what it held back.
+async fn breaker(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Viewer)?;
+    Ok(Json(json!({ "breaker": ctl.breaker() })))
+}
+
+/// Admin: closes the tripped circuit breaker; automatic bans are made
+/// again (the held-back ones are not: agents report them again only if
+/// the addresses keep failing).
+async fn reset_breaker(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult {
+    caller.require(Role::Admin)?;
+    let c = ctl.clone();
+    let was = blocking(move || {
+        let was = c.reset_breaker()?;
+        if let Some(t) = &was {
+            c.audit(
+                &caller.name,
+                caller.addr(),
+                "breaker.reset",
+                json!({ "tripped_at": t.at, "held": t.held }),
+            )?;
+        }
+        Ok(was)
+    })
+    .await?;
+    Ok(Json(
+        json!({ "reset": was.is_some(), "held": was.map_or(0, |t| t.held) }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -2797,6 +2830,7 @@ async fn status(caller: Caller, State(ctl): State<Arc<Controller>>) -> ApiResult
         "active_decisions": ctl.active_decisions().len(),
         "last_seq": ctl.last_seq(),
         "propagate": ctl.propagate(),
+        "breaker_tripped": ctl.breaker().tripped.map(|t| t.at),
         "allowlist": ctl.allowlist().iter().map(|e| e.net).collect::<Vec<_>>(),
         "allowlist_version": ctl.allowlist_version(),
         "redaction_version": ctl.redaction_version(),
@@ -4408,6 +4442,66 @@ mod tests {
         assert!(
             !v.to_string().contains("df2bapi1."),
             "no secrets in the audit log"
+        );
+        let _ = std::fs::remove_dir_all(&env.dir);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker() {
+        let env = Env::new("breaker").await;
+        let viewer = env.token("vic", Role::Viewer);
+        let op = env.token("olga", Role::Operator);
+        let admin = env.token("ada", Role::Admin);
+        let (st, v) = env.call("GET", "/api/v1/breaker", &viewer, json!({})).await;
+        assert_eq!(st, S::OK);
+        assert_eq!(v["breaker"]["limit"]["max"], 1000);
+        assert_eq!(v["breaker"]["limit"]["window"], "10m");
+        assert!(v["breaker"]["tripped"].is_null());
+        // a runaway: 1001 automatic bans at once
+        let bans = (0..1001u32)
+            .map(|i| crate::state::NewDecision {
+                kind: DecisionKind::Ban,
+                target: IpNet::from(std::net::IpAddr::V4((0xcb00_7100 + i).into())),
+                scope: Scope::Global,
+                jail: None,
+                expires_at: None,
+                origin: Origin::Correlation("oops".into()),
+                reason: String::new(),
+            })
+            .collect();
+        assert_eq!(env.ctl.append(bans).unwrap().len(), 1000);
+        let (_, v) = env.call("GET", "/api/v1/status", &viewer, json!({})).await;
+        assert!(v["breaker_tripped"].is_string(), "{v}");
+        let (_, v) = env.call("GET", "/api/v1/breaker", &viewer, json!({})).await;
+        assert_eq!(v["breaker"]["tripped"]["held"], 1);
+        assert_eq!(v["breaker"]["tripped"]["samples"][0]["origin"], "rule:oops");
+        // only admins reset it
+        for t in [&viewer, &op] {
+            assert_eq!(
+                env.call("POST", "/api/v1/breaker/reset", t, json!({}))
+                    .await
+                    .0,
+                S::FORBIDDEN
+            );
+        }
+        let (st, v) = env
+            .call("POST", "/api/v1/breaker/reset", &admin, json!({}))
+            .await;
+        assert_eq!((st, &v), (S::OK, &json!({ "reset": true, "held": 1 })));
+        let (_, v) = env
+            .call("POST", "/api/v1/breaker/reset", &admin, json!({}))
+            .await;
+        assert_eq!(v, json!({ "reset": false, "held": 0 }));
+        let (_, v) = env.call("GET", "/api/v1/audit", &admin, json!({})).await;
+        let actions: Vec<&str> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["action"].as_str())
+            .collect();
+        assert!(
+            actions.contains(&"breaker.trip") && actions.contains(&"breaker.reset"),
+            "{actions:?}"
         );
         let _ = std::fs::remove_dir_all(&env.dir);
     }

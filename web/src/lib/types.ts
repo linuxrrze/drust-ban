@@ -82,12 +82,25 @@ export interface Status {
   active_decisions: number;
   last_seq: number;
   propagate: string;
+  /** when the circuit breaker for automatic bans tripped; null: it did not */
+  breaker_tripped: string | null;
   allowlist: string[];
   allowlist_version: string;
   redaction_version: string;
   sessions: number;
   /** configured GeoIP databases */
   geoip: { path: string; database_type: string; build: string | null; error?: string }[];
+}
+
+/** Circuit breaker for automatic bans (GET /breaker) */
+export interface Breaker {
+  limit: { max: number; window: string };
+  recent: number;
+  tripped: null | {
+    at: string;
+    held: number;
+    samples: { target: string; origin: string; at: string }[];
+  };
 }
 
 /** ASN/country of an address (GeoIP databases on the controller) */

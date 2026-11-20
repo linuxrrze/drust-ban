@@ -12,6 +12,7 @@
 
 mod actions;
 mod api;
+mod breaker;
 mod central;
 mod correlation;
 mod files;
@@ -132,6 +133,16 @@ struct ServeArgs {
     /// REST API requests per client at once.
     #[arg(long, env = "DF2B_API_BURST", default_value_t = 200)]
     api_burst: u32,
+
+    /// Circuit breaker: more automatic bans (agent propagation, correlation
+    /// rules) than this within --breaker-window hold back all further ones
+    /// until an admin resets it; 0 = no breaker.
+    #[arg(long, env = "DF2B_BREAKER_MAX", default_value_t = 1000)]
+    breaker_max: u32,
+
+    /// Circuit breaker window, e.g. 10m.
+    #[arg(long, env = "DF2B_BREAKER_WINDOW", default_value = "10m", value_parser = humantime::parse_duration)]
+    breaker_window: Duration,
 }
 
 #[derive(Debug, Subcommand)]
@@ -380,6 +391,9 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     let ca = files::load_or_create_ca(&dir)?;
     let store = store::Store::open(&dir)?;
     let geo = geo::Geo::open(&a.geoip)?;
+    if a.breaker_max > 0 && a.breaker_window < Duration::from_secs(1) {
+        bail!("--breaker-window must be at least 1s");
+    }
     let ctl = Arc::new(
         Controller::open(
             Settings {
@@ -393,7 +407,11 @@ async fn serve(args: Args) -> anyhow::Result<()> {
             ca,
             store,
         )?
-        .with_geo(geo),
+        .with_geo(geo)
+        .with_breaker(breaker::BreakerLimit {
+            max: a.breaker_max,
+            window: a.breaker_window,
+        }),
     );
     if let Some(p) = a.propagate {
         if ctl.propagate() != p {

@@ -3842,6 +3842,14 @@
                     "propagate": {
                       "$ref": "#/components/schemas/Propagate"
                     },
+                    "breaker_tripped": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time",
+                      "description": "when the circuit breaker tripped (GET /api/v1/breaker); null: not tripped"
+                    },
                     "allowlist": {
                       "type": "array",
                       "items": {
@@ -3920,6 +3928,7 @@
                     "active_decisions",
                     "last_seq",
                     "propagate",
+                    "breaker_tripped",
                     "allowlist",
                     "allowlist_version",
                     "redaction_version",
@@ -4447,6 +4456,109 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Whoami"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/breaker": {
+      "get": {
+        "operationId": "getBreaker",
+        "summary": "Circuit breaker state",
+        "tags": [
+          "policies"
+        ],
+        "description": "Requires role viewer.",
+        "x-required-role": "viewer",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "breaker": {
+                      "$ref": "#/components/schemas/Breaker"
+                    }
+                  },
+                  "required": [
+                    "breaker"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/breaker/reset": {
+      "post": {
+        "operationId": "resetBreaker",
+        "summary": "Reset the tripped circuit breaker",
+        "tags": [
+          "policies"
+        ],
+        "description": "Requires role admin. Automatic bans are made again; the held-back ones are not.",
+        "x-required-role": "admin",
+        "security": [
+          {
+            "bearerToken": []
+          },
+          {
+            "sessionCookie": [],
+            "csrfToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "reset": {
+                      "type": "boolean",
+                      "description": "false: it was not tripped"
+                    },
+                    "held": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "reset",
+                    "held"
+                  ]
                 }
               }
             }
@@ -6276,6 +6388,88 @@
           "target"
         ],
         "additionalProperties": false
+      },
+      "Breaker": {
+        "type": "object",
+        "description": "Circuit breaker for automatic bans (agent propagation, correlation rules). Tripped when more than limit.max arrive within limit.window; then further automatic bans are held back until an admin resets it.",
+        "properties": {
+          "limit": {
+            "type": "object",
+            "properties": {
+              "max": {
+                "type": "integer",
+                "description": "0: no breaker"
+              },
+              "window": {
+                "type": "string",
+                "description": "duration, e.g. \"10m\""
+              }
+            },
+            "required": [
+              "max",
+              "window"
+            ]
+          },
+          "recent": {
+            "type": "integer",
+            "description": "automatic bans in the current window"
+          },
+          "tripped": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "at": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "held": {
+                    "type": "integer",
+                    "description": "automatic bans held back since"
+                  },
+                  "samples": {
+                    "type": "array",
+                    "description": "the newest held-back bans (at most 20)",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "target": {
+                          "type": "string"
+                        },
+                        "origin": {
+                          "type": "string",
+                          "description": "agent:<id> or rule:<name>"
+                        },
+                        "at": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      },
+                      "required": [
+                        "target",
+                        "origin",
+                        "at"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "at",
+                  "held",
+                  "samples"
+                ]
+              }
+            ]
+          }
+        },
+        "required": [
+          "limit",
+          "recent",
+          "tripped"
+        ]
       }
     }
   }

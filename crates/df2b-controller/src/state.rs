@@ -217,6 +217,21 @@ pub struct Controller {
     pub geo: crate::geo::Geo,
     /// Delivery counters of the external actions (actions.rs).
     pub actions: crate::actions::Stats,
+    /// Holds automatic bans back when too many come at once (taken while
+    /// holding the state lock, never the other way round).
+    breaker: Mutex<crate::breaker::Breaker>,
+}
+
+/// Setting: the circuit breaker's state while tripped.
+const BREAKER: &str = "breaker";
+
+/// What the API shows of the circuit breaker.
+#[derive(Debug, Clone, Serialize)]
+pub struct BreakerView {
+    pub limit: crate::breaker::BreakerLimit,
+    /// Automatic bans in the current window.
+    pub recent: usize,
+    pub tripped: Option<crate::breaker::Tripped>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -433,6 +448,12 @@ impl Controller {
             tokio::sync::watch::channel(Arc::new(RedactionSnapshot::new(&redaction_rules))).0;
         let redaction = Mutex::new((Arc::new(redaction_rules), Arc::new(redactor)));
         let rules = Mutex::new(Arc::new(rules));
+        let tripped = store
+            .setting::<Option<crate::breaker::Tripped>>(BREAKER)?
+            .flatten();
+        if let Some(t) = &tripped {
+            tracing::error!(since = %t.at, held = t.held, "circuit breaker is tripped: automatic bans are held back until an admin resets it");
+        }
         // a stored change wins over the default; an explicit flag is
         // applied by main.rs with set_propagate
         let propagate = store
@@ -475,6 +496,7 @@ impl Controller {
             actions: Default::default(),
             redaction,
             redaction_tx,
+            breaker: Mutex::new(crate::breaker::Breaker::new(Default::default(), tripped)),
         };
         {
             let entries = this.allow_lock();
@@ -487,6 +509,37 @@ impl Controller {
         self.geo = geo;
         self.refresh_asn_networks();
         self
+    }
+
+    /// Sets the circuit breaker's limit (default: 1000 in 10 minutes).
+    pub fn with_breaker(self, limit: crate::breaker::BreakerLimit) -> Self {
+        self.breaker_lock().limit = limit;
+        self
+    }
+
+    fn breaker_lock(&self) -> MutexGuard<'_, crate::breaker::Breaker> {
+        self.breaker.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn breaker(&self) -> BreakerView {
+        let b = self.breaker_lock();
+        BreakerView {
+            limit: b.limit,
+            recent: b.recent(Utc::now()),
+            tripped: b.tripped.clone(),
+        }
+    }
+
+    /// Closes the circuit breaker (blocking); returns what it held back,
+    /// None if it was not tripped.
+    pub fn reset_breaker(&self) -> anyhow::Result<Option<crate::breaker::Tripped>> {
+        let mut b = self.breaker_lock();
+        if b.tripped.is_none() {
+            return Ok(None);
+        }
+        self.store
+            .put_setting::<Option<crate::breaker::Tripped>>(BREAKER, &None)?;
+        Ok(b.reset())
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -561,6 +614,7 @@ impl Controller {
         let mut inner = self.lock();
         let mut seq = inner.last_seq;
         let mut out: Vec<Decision> = Vec::new();
+        let mut held = false;
         for n in new {
             if matches!(n.kind, DecisionKind::Ban) {
                 let covered = inner
@@ -580,6 +634,38 @@ impl Controller {
                 if covered {
                     continue;
                 }
+                // automatic bans: through the circuit breaker
+                let origin = match &n.origin {
+                    Origin::Agent(a) => Some(format!("agent:{}", a.0)),
+                    Origin::Correlation(r) => Some(format!("rule:{r}")),
+                    Origin::User(_) => None,
+                };
+                if let Some(origin) = origin {
+                    let mut b = self.breaker_lock();
+                    let admit = b.admit(crate::breaker::Held {
+                        target: n.target,
+                        origin,
+                        at: now,
+                    });
+                    if let crate::breaker::Admit::Held(tripped) = admit {
+                        held = true;
+                        if tripped {
+                            tracing::error!(
+                                max = b.limit.max,
+                                window = ?b.limit.window,
+                                "circuit breaker tripped: too many automatic bans, holding back further ones until an admin resets it"
+                            );
+                            drop(b);
+                            let _ = self.audit(
+                                "controller",
+                                None,
+                                "breaker.trip",
+                                serde_json::json!({ "target": n.target }),
+                            );
+                        }
+                        continue;
+                    }
+                }
             }
             seq += 1;
             out.push(Decision {
@@ -594,6 +680,11 @@ impl Controller {
                 origin: n.origin,
                 reason: n.reason,
             });
+        }
+        if held {
+            // the count of held-back bans survives a restart
+            let b = self.breaker_lock();
+            self.store.put_setting(BREAKER, &b.tripped)?;
         }
         if out.is_empty() {
             return Ok(Vec::new());
@@ -1541,6 +1632,83 @@ mod tests {
                 .seq,
             5
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Too many automatic bans at once trip the breaker: further ones are
+    /// held back (also after a restart) until it is reset; bans by people
+    /// always go through.
+    #[test]
+    fn circuit_breaker_holds_automatic_bans() {
+        let (c, dir) = ctl("breaker");
+        let c = c.with_breaker(crate::breaker::BreakerLimit {
+            max: 3,
+            window: Duration::from_secs(600),
+        });
+        let rule = |t: &str| NewDecision {
+            origin: Origin::Correlation("r".into()),
+            ..ban(t, Scope::Global, Some(1))
+        };
+        let out = c
+            .append(vec![
+                ban("192.0.2.1/32", Scope::Global, Some(1)),
+                ban("192.0.2.2/32", Scope::Global, Some(1)),
+                rule("192.0.2.3/32"),
+                // the fourth trips it
+                rule("192.0.2.4/32"),
+                ban("192.0.2.5/32", Scope::Group("web".into()), Some(1)),
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        // duplicates of active bans are not counted
+        assert!(c
+            .append(vec![ban("192.0.2.1/32", Scope::Global, Some(1))])
+            .unwrap()
+            .is_empty());
+        let v = c.breaker();
+        let t = v.tripped.as_ref().expect("tripped");
+        assert_eq!(t.held, 2);
+        assert_eq!(t.samples[0].target.to_string(), "192.0.2.5/32");
+        assert_eq!(t.samples[1].origin, "rule:r");
+        // a person's ban is not held
+        let user = NewDecision {
+            origin: Origin::User("admin".into()),
+            ..ban("198.51.100.1/32", Scope::Global, Some(1))
+        };
+        assert_eq!(c.append(vec![user]).unwrap().len(), 1);
+        assert!(c
+            .audit_log(10, u64::MAX)
+            .unwrap()
+            .iter()
+            .any(|e| e.action == "breaker.trip"));
+        // still tripped after a restart
+        drop(c);
+        let reopen = || {
+            Controller::open(
+                Settings {
+                    state_dir: dir.clone(),
+                    cert_lifetime: Duration::from_secs(1),
+                    propagate: Propagate::Global,
+                    allowlist: Allowlist::default(),
+                    oidc: None,
+                    https_internal_ca: true,
+                },
+                Ca::generate("t").unwrap(),
+                Store::open(&dir).unwrap(),
+            )
+            .unwrap()
+            .with_breaker(crate::breaker::BreakerLimit {
+                max: 3,
+                window: Duration::from_secs(600),
+            })
+        };
+        let c = reopen();
+        assert!(c.append(vec![rule("192.0.2.6/32")]).unwrap().is_empty());
+        assert_eq!(c.reset_breaker().unwrap().unwrap().held, 3);
+        assert!(c.reset_breaker().unwrap().is_none(), "not tripped");
+        assert_eq!(c.append(vec![rule("192.0.2.6/32")]).unwrap().len(), 1);
+        drop(c);
+        assert!(reopen().breaker().tripped.is_none(), "reset is stored");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

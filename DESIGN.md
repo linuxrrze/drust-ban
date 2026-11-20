@@ -408,8 +408,14 @@ can do is bounded (security review 2026-11-19, regression tests for each):
   and their rest skipped, live lines cannot claim old time stamps; sshd
   lines in syslog files are only taken from the sshd program (journald is
   preferred: it knows the sending unit).
-- Not yet: a circuit breaker (global cap on new global bans per minute
-  that needs an operator to confirm).
+- **Circuit breaker** (controller): more than `--breaker-max` (1000)
+  automatic bans - agent propagation and correlation rules, not bans made
+  by people - within `--breaker-window` (10 min) trip it; further
+  automatic bans are then held back (not recorded, so not distributed;
+  agents keep enforcing their local bans) until an admin resets it
+  (`POST /api/v1/breaker/reset`, the overview page). The tripped state,
+  the number of held bans and the latest of them are stored and shown, so
+  a restart does not silently resume; trip and reset are audited.
 
 ---
 
