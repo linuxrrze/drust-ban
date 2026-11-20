@@ -194,6 +194,7 @@ jobs:
         run: |
           dnf install -y target/generate-rpm/*.rpm
           rpm -V df2b-agent df2b-controller df2bctl
+          test -s /usr/share/licenses/df2b-agent/THIRD-PARTY-LICENSES
           id df2b
           grep -q '^filter_dir = "filters"' /etc/df2b/agent.toml
           ls /etc/df2b/filters/*.toml

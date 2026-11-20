@@ -4,6 +4,7 @@ description = "dist-f2b controller: decision log, correlation, REST API and web 
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -49,6 +50,8 @@ uuid.workspace = true
 # in web/dist must be built first, it is embedded into the binary).
 [package.metadata.deb]
 maintainer = "Marcel Ritter <marcel@linux-ng.de>"
+copyright = "2026 Marcel Ritter"
+license-file = ["../../packaging/deb/generated/LICENSE.dep5", "2"]
 section = "net"
 priority = "optional"
 extended-description = """\
@@ -60,6 +63,7 @@ maintainer-scripts = "../../packaging/deb/df2b-controller/"
 systemd-units = { unit-scripts = "../../packaging/systemd", enable = true, start = true }
 assets = [
     ["target/release/df2b-controller", "usr/bin/", "755"],
+    ["../../packaging/deb/generated/THIRD-PARTY-LICENSES", "usr/share/doc/df2b-controller/", "644"],
     ["../../README.md", "usr/share/doc/df2b-controller/README.md", "644"],
     ["../../config/oidc.example.toml", "usr/share/doc/df2b-controller/examples/oidc.example.toml", "644"],
 ]
@@ -68,11 +72,11 @@ assets = [
 # web UI in web/dist must be built first, it is embedded into the binary).
 # Paths are relative to the workspace root.
 [package.metadata.generate-rpm]
-# no license declared for the project yet (RPM requires the tag)
-license = "LicenseRef-Unspecified"
 release = "1"
 assets = [
     { source = "target/rpm/bin/df2b-controller", dest = "/usr/bin/df2b-controller", mode = "755" },
+    { source = "LICENSE", dest = "/usr/share/licenses/df2b-controller/LICENSE", mode = "644", doc = true },
+    { source = "target/rpm/THIRD-PARTY-LICENSES", dest = "/usr/share/licenses/df2b-controller/THIRD-PARTY-LICENSES", mode = "644", doc = true },
     { source = "packaging/systemd/df2b-controller.service", dest = "/usr/lib/systemd/system/df2b-controller.service", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/df2b-controller/README.md", mode = "644", doc = true },
     { source = "config/oidc.example.toml", dest = "/usr/share/doc/df2b-controller/examples/oidc.example.toml", mode = "644", doc = true },

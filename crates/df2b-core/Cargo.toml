@@ -4,6 +4,7 @@ description = "Shared types for dist-f2b: IP keys, decisions, allowlist, ban-tim
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 chrono.workspace = true

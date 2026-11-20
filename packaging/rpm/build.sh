@@ -39,6 +39,11 @@ if ! grep -q '^filter_dir = "filters"' target/rpm/agent.toml; then
     exit 1
 fi
 
+# license texts of the third-party code in the binaries; fails on a
+# dependency whose license is not on the allowed list
+node packaging/third-party-licenses.mjs > target/rpm/THIRD-PARTY-LICENSES.tmp
+mv target/rpm/THIRD-PARTY-LICENSES.tmp target/rpm/THIRD-PARTY-LICENSES
+
 cargo build --release --locked -p df2b-agent -p df2b-controller -p df2bctl
 
 # cargo-generate-rpm does not strip (cargo-deb does): package stripped copies

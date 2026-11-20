@@ -4,6 +4,7 @@ description = "Log sources for dist-f2b: file tailer and journald"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [features]
 # journald via libsystemd, loaded at runtime (no build-time dependency)

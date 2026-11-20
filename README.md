@@ -202,3 +202,19 @@ UI development with hot reload against a running controller:
 
 With systemd, put `DF2B_ENROLL_TOKEN=df2b1.…` into `/etc/df2b/agent.env` for
 the first start (the unit reads it); the token is useless afterwards.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+The binaries also contain third-party code: Rust crates, and the Svelte
+runtime in the controller's web UI. All of it is under permissive licenses
+(MIT, Apache-2.0, BSD, ISC, Unicode-3.0, CDLA-Permissive-2.0 for the Mozilla
+root certificates in `webpki-roots`, ...). Their license texts are installed
+with every package as `THIRD-PARTY-LICENSES`, in `/usr/share/doc/<package>/`
+(deb) or `/usr/share/licenses/<package>/` (rpm). The package builds generate
+that file with `node packaging/third-party-licenses.mjs`. The build fails
+when a dependency's license is not on the script's allow list, so a copyleft
+or unknown license cannot slip in with a new dependency. GeoIP databases are
+not included (their licenses are separate), and `libsystemd` (LGPL-2.1+) is
+loaded at run time, not linked in.

@@ -25,6 +25,14 @@ if ! grep -q '^filter_dir = "filters"' packaging/deb/generated/agent.toml; then
     exit 1
 fi
 
+# debian/copyright (DEP-5): the license text as an indented field
+sed 's/^$/./; s/^/ /' LICENSE > packaging/deb/generated/LICENSE.dep5
+
+# license texts of the third-party code in the binaries; fails on a
+# dependency whose license is not on the allowed list
+node packaging/third-party-licenses.mjs > packaging/deb/generated/THIRD-PARTY-LICENSES.tmp
+mv packaging/deb/generated/THIRD-PARTY-LICENSES.tmp packaging/deb/generated/THIRD-PARTY-LICENSES
+
 cargo build --release --locked -p df2b-agent -p df2b-controller -p df2bctl
 
 for pkg in df2b-agent df2b-controller df2bctl; do

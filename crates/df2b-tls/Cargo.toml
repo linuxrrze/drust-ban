@@ -4,6 +4,7 @@ description = "dist-f2b PKI and transport security: internal CA, enrollment toke
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true

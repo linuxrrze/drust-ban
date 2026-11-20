@@ -4,6 +4,7 @@ description = "Log line matching for dist-f2b: literal prefilter + RegexSet + ho
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 aho-corasick.workspace = true

@@ -4,6 +4,7 @@ description = "dist-f2b agent: log ingestion, detection and local countermeasure
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [features]
 default = ["journald"]
@@ -40,6 +41,8 @@ uuid.workspace = true
 # The df2b user comes from the sysusers.d file (cargo-deb adds the postinst).
 [package.metadata.deb]
 maintainer = "Marcel Ritter <marcel@linux-ng.de>"
+copyright = "2026 Marcel Ritter"
+license-file = ["../../packaging/deb/generated/LICENSE.dep5", "2"]
 section = "net"
 priority = "optional"
 extended-description = """\
@@ -52,6 +55,7 @@ maintainer-scripts = "../../packaging/deb/df2b-agent/"
 systemd-units = { unit-scripts = "../../packaging/systemd", enable = true, start = true }
 assets = [
     ["target/release/df2b-agent", "usr/bin/", "755"],
+    ["../../packaging/deb/generated/THIRD-PARTY-LICENSES", "usr/share/doc/df2b-agent/", "644"],
     ["../../packaging/deb/generated/agent.toml", "etc/df2b/agent.toml", "644"],
     ["../../filters/*.toml", "etc/df2b/filters/", "644"],
     ["../../packaging/deb/df2b-agent.sysusers", "usr/lib/sysusers.d/df2b-agent.conf", "644"],
@@ -64,11 +68,11 @@ assets = [
 # Paths are relative to the workspace root. The df2b user comes from the
 # sysusers.d file (systemd-sysusers in %post).
 [package.metadata.generate-rpm]
-# no license declared for the project yet (RPM requires the tag)
-license = "LicenseRef-Unspecified"
 release = "1"
 assets = [
     { source = "target/rpm/bin/df2b-agent", dest = "/usr/bin/df2b-agent", mode = "755" },
+    { source = "LICENSE", dest = "/usr/share/licenses/df2b-agent/LICENSE", mode = "644", doc = true },
+    { source = "target/rpm/THIRD-PARTY-LICENSES", dest = "/usr/share/licenses/df2b-agent/THIRD-PARTY-LICENSES", mode = "644", doc = true },
     { source = "target/rpm/agent.toml", dest = "/etc/df2b/agent.toml", mode = "644", config = "noreplace" },
     { source = "filters/*.toml", dest = "/etc/df2b/filters/", mode = "644", config = "noreplace" },
     { source = "packaging/systemd/df2b-agent.service", dest = "/usr/lib/systemd/system/df2b-agent.service", mode = "644" },
